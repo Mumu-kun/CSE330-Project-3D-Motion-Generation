@@ -32,7 +32,11 @@ def load_humanml3d(
     """
     Load HumanML3D dataset with dim-263 feature vectors.
     
-    Compatible with MoMask's data format.
+    Expected structure:
+    dataset_path/
+      ├── [split].txt (list of file IDs)
+      ├── new_joint_vecs/ (motion features .npy files)
+      └── texts/ (text description .txt files)
     
     Args:
         dataset_path: Path to HumanML3D dataset directory
@@ -41,28 +45,41 @@ def load_humanml3d(
         
     Returns:
         List of (motion_features, text_description) tuples
-        - motion_features: numpy array of shape (seq_len, 263)
-        - text_description: string description of the motion
     """
-    # TODO: Implement actual data loading
-    # Expected structure:
-    # dataset_path/
-    #   ├── train/
-    #   │   ├── motions/ (numpy files with dim-263 features)
-    #   │   └── texts/ (text descriptions)
-    #   ├── val/
-    #   └── test/
-    
+    id_list_file = dataset_path / f'{split}.txt'
+    if not id_list_file.exists():
+        print(f"Warning: Split file {id_list_file} not found. Returning empty list.")
+        return []
+
+    with open(id_list_file, 'r') as f:
+        file_ids = [line.strip() for line in f.readlines()]
+
     data = []
+    motion_dir = dataset_path / 'new_joint_vecs'
+    text_dir = dataset_path / 'texts'
+
+    print(f"Loading {len(file_ids)} samples for {split} split...")
     
-    # Placeholder implementation
-    # In actual implementation, load from:
-    # - Motion files: .npy files with shape (seq_len, 263)
-    # - Text files: corresponding text descriptions
-    
-    print(f"Loading HumanML3D {split} split from {dataset_path}")
-    print("TODO: Implement actual data loading from HumanML3D format")
-    
+    for file_id in file_ids:
+        motion_path = motion_dir / f'{file_id}.npy'
+        text_path = text_dir / f'{file_id}.txt'
+        
+        if motion_path.exists() and text_path.exists():
+            # Load motion
+            motion = np.load(motion_path)
+            
+            # Load text (HumanML3D text files often have multiple lines/descriptions)
+            with open(text_path, 'r') as f:
+                descriptions = [line.strip().split('#')[0] for line in f.readlines()]
+                # Pick one description or handle multiple if needed
+                # For simplicity, we take the first descriptive one
+                description = descriptions[0] if descriptions else ""
+            
+            data.append((motion, description))
+        else:
+            # Skip missing files silently or log warning
+            pass
+            
     return data
 
 
@@ -72,7 +89,7 @@ def preprocess_motion(
     normalize: bool = True
 ) -> List[Tuple[np.ndarray, str]]:
     """
-    Preprocess motion data to match MoMask format.
+    Preprocess motion data: padding, truncation, and normalization.
     
     Args:
         dataset: List of (motion_features, text) tuples
@@ -84,19 +101,31 @@ def preprocess_motion(
     """
     processed_data = []
     
+    # Load mean and std if normalization is requested
+    mean, std = None, None
+    if normalize:
+        mean_path = config.dataset_path / 'Mean.npy'
+        std_path = config.dataset_path / 'Std.npy'
+        if mean_path.exists() and std_path.exists():
+            mean = np.load(mean_path)
+            std = np.load(std_path)
+        else:
+            print("Warning: Mean.npy or Std.npy not found. Normalization skipped.")
+            normalize = False
+
     for motion, text in dataset:
-        # Ensure motion is within max length
-        if len(motion) > config.max_motion_length:
-            motion = motion[:config.max_motion_length]
-        elif len(motion) < config.max_motion_length:
-            # Pad with zeros
-            padding = np.zeros((config.max_motion_length - len(motion), config.motion_dim))
-            motion = np.concatenate([motion, padding], axis=0)
-        
-        # TODO: Normalize if needed
+        # 1. Normalization
         if normalize:
-            # Placeholder: implement normalization based on dataset statistics
-            pass
+            motion = (motion - mean) / std
+            
+        # 2. Handle length
+        seq_len = motion.shape[0]
+        if seq_len > config.max_motion_length:
+            motion = motion[:config.max_motion_length]
+        elif seq_len < config.max_motion_length:
+            # Pad with zeros (or last frame, depending on preference)
+            padding = np.zeros((config.max_motion_length - seq_len, motion.shape[1]))
+            motion = np.concatenate([motion, padding], axis=0)
         
         processed_data.append((motion, text))
     

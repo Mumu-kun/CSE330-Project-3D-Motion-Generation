@@ -18,6 +18,7 @@ seaborn>=0.11.0
 
 # Utilities
 tqdm>=4.62.0
+gdown>=4.4.0
 pathlib2>=2.3.6; python_version < '3.4'
 
 # Optional: For HumanML3D dataset compatibility
