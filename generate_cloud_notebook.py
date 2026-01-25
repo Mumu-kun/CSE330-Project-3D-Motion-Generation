@@ -1,22 +1,59 @@
 import json
 import os
+import ast
 from pathlib import Path
+
+def minify_python(source):
+    """Basic minification: removes docstrings and comments via AST round-trip."""
+    try:
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            # Remove docstrings from modules, classes, and functions
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Module)):
+                if (node.body and isinstance(node.body[0], ast.Expr) and 
+                    isinstance(node.body[0].value, (ast.Constant, ast.Str))):
+                    # In Python 3.8+, docstrings are ast.Constant. In older, ast.Str.
+                    # We check if it's a string constant.
+                    val = node.body[0].value
+                    if isinstance(val, ast.Str) or (isinstance(val, ast.Constant) and isinstance(val.value, str)):
+                        node.body.pop(0)
+        return ast.unparse(tree)
+    except Exception as e:
+        print(f"Warning: Could not minify Python code. Falling back to original. Error: {e}")
+        return source
+
+def minify_requirements(content):
+    """Removes comments and empty lines from requirements.txt."""
+    lines = []
+    for line in content.splitlines():
+        line = line.strip()
+        if line and not line.startswith('#'):
+            lines.append(line)
+    return "\n".join(lines)
 
 def generate_cloud_notebook():
     # 1. Configuration
-    source_dir = Path("src")
-    build_dir = Path("build")
+    script_dir = Path(__file__).parent
+    source_dir = script_dir / "src"
+    build_dir = script_dir / "build"
     source_notebook = source_dir / "pipeline.ipynb"
     output_notebook = build_dir / "notebook.ipynb"
     support_files = ["config.py", "models.py", "utils.py", "requirements.txt"]
     
-    # 2. Extract content from support files
+    # 2. Extract and minify content from support files
     files_content = {}
     for filename in support_files:
         path = source_dir / filename
         if path.exists():
             with open(path, 'r', encoding='utf-8') as f:
-                files_content[filename] = f.read()
+                content = f.read()
+                if filename.endswith('.py'):
+                    print(f"Minifying {filename}...")
+                    content = minify_python(content)
+                elif filename == 'requirements.txt':
+                    print(f"Cleaning {filename}...")
+                    content = minify_requirements(content)
+                files_content[filename] = content
         else:
             print(f"Warning: {path} not found.")
 
