@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data & models
+*.npy
+*.npz
+*.pth
+*.pt
+
+# Outputs
+output/
+outputs/
+results/
+
+# External
+momask-codes/

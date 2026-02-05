@@ -1,0 +1,7 @@
+[tool.mypy]
+# Ignore missing imports for third-party libraries without stubs
+ignore_missing_imports = true
+# Specifically disable the "import-untyped" warning
+disable_error_code = ["import-untyped", "attr-defined"]
+# Ensure mypy looks at the src directory
+mypy_path = "src"
