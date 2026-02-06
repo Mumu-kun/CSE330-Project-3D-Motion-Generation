@@ -7,6 +7,7 @@ venv/
 
 # IDE
 .vscode/
+*.code-workspace
 .idea/
 
 # Jupyter
@@ -29,3 +30,4 @@ results/
 
 # External
 momask-codes/
+*_cache/

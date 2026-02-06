@@ -42,18 +42,22 @@ class Config:
     )
 
     # Dataset configuration
-    dataset_name: str = "t2m"  # "t2m" for HumanML3D or "kit" for KIT
-    unit_length: int = 4  # Unit length for motion sampling
+    dataset_name: str = "t2m"  # "t2m" for HumanML3D
+    unit_length: int = 4
 
-    # Model architecture - Autoregressive Context Encoder (GRU-based)
-    hidden_dim: int = 512
-    num_encoder_layers: int = 3  # Number of GRU layers (typically 2-4 for GRU)
-    dropout: float = 0.1
-    bidirectional_gru: bool = False  # Whether to use bidirectional GRU
+    # Model architecture - MotionHistoryEncoder (Dual-MLP, Test Scale)
+    text_embedding_dim: int = 512
+    text_projection_dim: int = 16
+    joint_feature_projection_dim: int = 32
+    per_joint_out_dim: int = 32
 
-    # Model architecture - Flow Matching Network
+    model_dim: int = 64
+    num_encoder_layers: int = 1
+    dropout: float = 0.0
+    bidirectional_gru: bool = True
+
+    # Model architecture - Flow Matching Network (Conditional)
     num_flow_layers: int = 12
-    flow_hidden_dim: int = 512
     num_timesteps: int = 1000  # Number of flow matching timesteps
 
     # Training settings
@@ -98,7 +102,7 @@ class Config:
     @property
     def context_encoder_output_dim(self) -> int:
         """Output dimension of the context encoder."""
-        return self.hidden_dim
+        return self.model_dim * (2 if self.bidirectional_gru else 1)
 
     def to_dict(self) -> dict:
         """Export the configuration as a serializable dictionary."""

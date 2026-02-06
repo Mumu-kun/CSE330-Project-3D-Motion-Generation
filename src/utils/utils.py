@@ -24,6 +24,7 @@ from .motion_utils import (
     feature_to_joints,
     joints_to_feature,
     extract_features,
+    get_feature_vec_subset,
     recover_from_ric,
 )
 
@@ -58,6 +59,7 @@ __all__ = [
     "feature_to_joints",
     "joints_to_feature",
     "extract_features",
+    "get_feature_vec_subset",
     "recover_from_ric",
     # Visualization
     "plot_3d_motion",

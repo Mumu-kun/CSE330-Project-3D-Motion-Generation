@@ -403,7 +403,7 @@ def joints_to_feature(
     return features
 
 
-def extract_feature_subset(
+def get_feature_vec_subset(
     features: np.ndarray, dimensions: tuple[slice, ...]
 ) -> np.ndarray:
     """

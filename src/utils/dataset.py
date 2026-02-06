@@ -4,15 +4,16 @@ Dataset loading and Text2Motion dataset implementation.
 Handles loading HumanML3D dataset with text-motion pairs.
 """
 
+import torch
 import numpy as np
 from os.path import join as pjoin
 import random
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from config import Config
-from .motion_utils import extract_feature_subset
+from .motion_utils import get_feature_vec_subset
 
 
 class Text2MotionDataset(Dataset):
@@ -127,8 +128,8 @@ class Text2MotionDataset(Dataset):
 
         name_list, length_list = new_name_list, length_list
 
-        self.mean = mean
-        self.std = std
+        self.mean = torch.from_numpy(mean).float()
+        self.std = torch.from_numpy(std).float()
         self.length_arr = np.array(length_list)
         self.data_dict = data_dict
         self.name_list = name_list
@@ -162,43 +163,75 @@ class Text2MotionDataset(Dataset):
             ) * self.config.unit_length
         elif coin2 == "single":
             m_length = (m_length // self.config.unit_length) * self.config.unit_length
-        idx = random.randint(0, len(motion) - m_length)
-        motion = motion[idx : idx + m_length]
-        joints = joints[idx : idx + m_length]
+        # Convert to tensors
+        motion = torch.from_numpy(motion).float()
+        joints = torch.from_numpy(joints).float()
 
+        # Normalize features
         motion = (motion - self.mean) / self.std
 
         if m_length < self.max_motion_length:
-            motion = np.concatenate(
-                [
-                    motion,
-                    np.zeros((self.max_motion_length - m_length, motion.shape[1])),
-                ],
-                axis=0,
+            padding_len = self.max_motion_length - m_length
+
+            # Pad motion features
+            motion_padding = torch.zeros(
+                (padding_len, motion.shape[1]), dtype=motion.dtype
             )
-            joints = np.concatenate(
-                [
-                    joints,
-                    np.zeros(
-                        (
-                            self.max_motion_length - m_length,
-                            joints.shape[1],
-                            joints.shape[2],
-                        )
-                    ),
-                ],
-                axis=0,
+            motion = torch.cat([motion, motion_padding], dim=0)
+
+            # Pad joint positions
+            joints_padding = torch.zeros(
+                (padding_len, joints.shape[1], joints.shape[2]), dtype=joints.dtype
             )
+            joints = torch.cat([joints, joints_padding], dim=0)
 
         # Extract feature subset if specified
-        input_features = extract_feature_subset(motion, self.feature_dims)
+        # motion: (max_seq_len, 263)
+        history_features = get_feature_vec_subset(motion, self.feature_dims)
 
-        return caption, input_features, motion, joints, m_length
+        return caption, history_features, motion, joints, m_length
 
     def reset_min_len(self, length):
         assert length <= self.max_motion_length
         self.pointer = np.searchsorted(self.length_arr, length)
         print("Pointer Pointing at %d" % self.pointer)
+
+
+from typing import List, Dict, Any
+
+
+def text2motion_collate_fn(
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int]],
+) -> Dict[str, Any]:
+    """
+    Collate function for Text2MotionDataset.
+    Expects each sample to be a tuple:
+      - caption: str
+      - history_features: (max_T, C_in = 137) torch.Tensor
+      - motion: (max_T, 263) torch.Tensor
+      - joints: (max_T, J, 3) torch.Tensor
+      - length: int
+    """
+    # Lists of items
+    captions = [b[0] for b in batch]
+    cond_feats_list = [b[1] for b in batch]  # each (T, C_in)
+    motions_list = [b[2] for b in batch]
+    joints_list = [b[3] for b in batch]
+    lengths = [b[4] for b in batch]
+
+    # Stack tensors directly
+    cond_feature_batch = torch.stack(cond_feats_list, dim=0)  # (B, T, C_in)
+    motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 263)
+    joints_batch = torch.stack(joints_list, dim=0)  # (B, T, J, 3)
+    length_batch = torch.tensor(lengths, dtype=torch.long)  # (B,)
+
+    return {
+        "captions": captions,
+        "history_features": cond_feature_batch,
+        "motion": motion_batch,
+        "joints": joints_batch,
+        "lengths": length_batch,
+    }
 
 
 def create_dataloader(
@@ -240,6 +273,7 @@ def create_dataloader(
         shuffle=shuffle,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
+        collate_fn=text2motion_collate_fn,
     )
 
 
