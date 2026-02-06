@@ -48,11 +48,22 @@ def test_motion_history_encoder():
     # Dummy Input
     input_features = torch.randn(B, T_hist, frame_feature_dim)
     text = ["A person is walking", "A person is jumping"]
+    total_duration = torch.tensor([[0.5], [0.8]])  # Normalized duration
 
-    # Forward Pass
-    print(f"Running forward pass with input shape: {input_features.shape}...")
+    # 1. Forward Pass (Default/Optional)
+    print(f"Running forward pass (optional/default)...")
     try:
-        output = model(input_features, text)
+        output = model(text=text)
+        print(f"Success! Output shape (Zero-shot): {output.shape}")
+    except Exception as e:
+        print(f"Default forward pass failed: {str(e)}")
+
+    # 2. Forward Pass (Full Conditioning)
+    print(f"Running forward pass with text and history...")
+    try:
+        output = model(
+            text=text, input_features=input_features, total_duration=total_duration
+        )
         print(f"Success! Output shape: {output.shape}")
 
         # Verify output shape

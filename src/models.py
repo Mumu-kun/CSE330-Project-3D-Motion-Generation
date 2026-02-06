@@ -16,17 +16,16 @@ from typing import Optional, List, Tuple, Union, Callable, Any
 
 class MotionHistoryEncoder(nn.Module):
     """
-    Motion History Encoder for motion generation using GRU.
+    Motion History Encoder (GRU-based Context Encoder).
 
-    Processes motion sequences sequentially to encode contextual information.
-    Input: dim-137 subset feature vectors of (HumanML3D format) + text embedding
-    Output: Context embeddings for flow matching
+    Processes motion sequences sequentially to encode contextual information
+    and text conditioning into a dense history vector.
     """
 
     def __init__(
         self,
-        frame_feature_dim: int,  # 137 for your subset
-        text_embedding_dim: int,  # e.g., 512 for CLIP
+        frame_feature_dim: int,  # HumanML3D dimension (e.g., 263 or 137 subset)
+        text_embedding_dim: int,  # CLIP embedding dimension (e.g., 512)
         joint_feature_projection_dim: int,
         text_projection_dim: int,
         per_joint_out_dim: int,
@@ -35,7 +34,7 @@ class MotionHistoryEncoder(nn.Module):
         num_layers: int = 1,
         bidirectional: bool = False,
         text_encoder: Optional[nn.Module] = None,
-    ):
+    ) -> None:
         super().__init__()
 
         self.frame_feature_dim = frame_feature_dim
@@ -50,16 +49,20 @@ class MotionHistoryEncoder(nn.Module):
         self.text_encoder = text_encoder
         self.joint_count = joint_count
 
+        # Text conditioning projection
         self.text_projection = nn.Linear(text_embedding_dim, text_projection_dim)
 
-        # 4) MLP to encode per-joint features before temporal processing
-        joint_input_dim = 3 + 3 + 8 + text_projection_dim
+        # Dual-MLP Logic Start:
+        # Per-joint encoder: Projects raw motion features + text + duration into joint-latent space
+        # Input dim: pos(3) + vel(3) + global(8) + duration(1) + text(text_proj_dim) = 15 + text_proj_dim
+        joint_input_dim = 3 + 3 + 8 + 1 + text_projection_dim
         self.per_joint_encoder = nn.Sequential(
             nn.Linear(joint_input_dim, joint_feature_projection_dim * 2),
             nn.SiLU(),
             nn.Linear(joint_feature_projection_dim * 2, joint_feature_projection_dim),
         )
 
+        # Temporal core (GRU)
         self.gru = nn.GRU(
             input_size=joint_feature_projection_dim * joint_count,
             hidden_size=model_dim,
@@ -68,7 +71,7 @@ class MotionHistoryEncoder(nn.Module):
             bidirectional=bidirectional,
         )
 
-        # 6) MLP head to project final hidden state to per-joint features
+        # Per-joint head: Projects temporal context back to joint-specific features
         num_directions = 2 if bidirectional else 1
         gru_hidden_dim = num_layers * num_directions * model_dim
         intermediate_dim = model_dim * 2
@@ -78,112 +81,128 @@ class MotionHistoryEncoder(nn.Module):
             nn.Linear(intermediate_dim, joint_count * per_joint_out_dim),
         )
 
+        # Null tokens for zero-shot generation (when no history exists)
+        self.null_history = nn.Parameter(torch.zeros(1, 1, frame_feature_dim))
+        self.null_duration = nn.Parameter(torch.zeros(1, 1))
+
     def _encode_text(
         self, text: Union[str, List[str]], batch_size: int
     ) -> torch.Tensor:
-        """
-        Encodes text and ensures it matches the batch size through broadcasting or validation.
-        """
+        """Encodes text and ensures it matches the batch size."""
         if self.text_encoder is None:
-            raise ValueError(
-                "text_encoder must be provided during initialization to use text inputs."
-            )
+            raise ValueError("text_encoder must be provided to use text inputs.")
 
         if isinstance(text, str):
             # Encode single string and broadcast to batch size
-            single_embedding = self.text_encoder(text)  # (1, dim) or (dim,)
+            single_embedding = self.text_encoder(text)
             if single_embedding.dim() == 1:
                 single_embedding = single_embedding.unsqueeze(0)
             return single_embedding.expand(batch_size, -1)
         elif isinstance(text, list):
             if len(text) != batch_size:
                 raise ValueError(
-                    f"Batch size mismatch: text list length ({len(text)}) does not match motion batch size ({batch_size})."
+                    f"Batch mismatch: text({len(text)}) vs batch({batch_size})"
                 )
-            return self.text_encoder(text)  # (B, dim)
+            return self.text_encoder(text)
         else:
             raise TypeError(f"Expected text to be str or List[str], got {type(text)}")
 
     def forward(
         self,
-        input_features: torch.Tensor,
         text: Union[str, List[str]],
+        input_features: Optional[torch.Tensor] = None,
+        total_duration: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Input:
-          - input_features: (B, T_hist, frame_feature_dim)
-          - text: (B, string)
+        Args:
+            text:           (B, str) or single str
+            input_features: (B, T_hist, frame_feature_dim) - Optional history
+            total_duration: (B, 1) Normalized total frames (Optional)
+
         Returns:
-            history_context: (B, T_hist, H) per-frame GRU outputs
-            final_hidden:    (B, num_layers * num_directions * H) - batch-first flat vector
+            joint_features: (B, 22, per_joint_out_dim) - Encoded per-joint context
         """
-        B, T_hist, _ = input_features.shape
+        # 1) Determine Batch Size from text input
+        if isinstance(text, list):
+            B = len(text)
+        else:
+            B = 1
 
-        # 1) Handle text input: Encode and ensure shape (B, text_embedding_dim)
+        # 2) Handle text conditioning
         text_embeddings = self._encode_text(text, B)
-        text_projected: torch.Tensor = self.text_projection(
-            text_embeddings
-        )  # (B, text_projection_dim)
+        text_projected: torch.Tensor = self.text_projection(text_embeddings)
 
-        # Expand text across time and joints
+        # 3) Handle optional motion features (Null-token if none)
+        if input_features is None:
+            # Start of sequence: use one frame of learned "start" features
+            input_features = self.null_history.expand(B, 1, -1)
+
+        _, T_hist, _ = input_features.shape
+
+        # Expand text across time and joints for per-joint encoding
         text_projected_expanded = (
             text_projected.unsqueeze(1)
             .unsqueeze(2)
             .expand(B, T_hist, self.joint_count, -1)
-        )  # (B, T_hist, 22, text_projection_dim)
+        )
 
-        # 2) Handle motion features
-        # - ric position (Indices 4:67 for 21 joints)
-        ric_joints = input_features[:, :, 4:67]  # (B, T_hist, 63)
-        ric_joints = ric_joints.view(
-            B, T_hist, self.joint_count - 1, 3
-        )  # (B, T_hist, 21, 3)
+        # 4) Handle duration conditioning (Null-token if none)
+        if total_duration is None:
+            duration_expanded = self.null_duration.expand(
+                B, T_hist, self.joint_count, 1
+            )
+        else:
+            duration_expanded = (
+                total_duration.unsqueeze(1)
+                .unsqueeze(2)
+                .expand(B, T_hist, self.joint_count, 1)
+            )
+
+        # 3) Extract motion features (263D Standard Layout)
+        # - RIC position (Indices 4:67 for 21 joints)
+        ric_joints = input_features[:, :, 4:67]
+        ric_joints = ric_joints.view(B, T_hist, self.joint_count - 1, 3)
         root_ric = torch.zeros((B, T_hist, 1, 3), device=ric_joints.device)
         ric_joints = torch.cat([root_ric, ric_joints], dim=2)  # (B, T_hist, 22, 3)
 
-        # - ric velocities (Indices 193:259 for 22 joints)
-        ric_vel = input_features[:, :, 193:259]  # (B, T_hist, 66)
+        # - Local velocities (Indices 193:259 for 22 joints)
+        ric_vel = input_features[:, :, 193:259]
         ric_vel = ric_vel.view(B, T_hist, self.joint_count, 3)  # (B, T_hist, 22, 3)
 
-        # - root angular velocity | linear velocity | root height | foot contact
-        # Indices: [0:4] and [259:263]
+        # - Global features (Root Rot Vel, Lin Vel, Height, Foot Contacts)
         global_features = torch.cat(
-            [input_features[:, :, 0:4], input_features[:, :, 259:263]],
-            dim=-1,
+            [input_features[:, :, 0:4], input_features[:, :, 259:263]], dim=-1
         )  # (B, T_hist, 8)
-
         global_features = global_features.unsqueeze(-2).expand(
             B, T_hist, self.joint_count, -1
-        )  # (B, T_hist, 22, 8)
+        )
 
-        # 3) Concatenate all features
+        # 4) Concatenate and encode per-joint
         motion_tokens = torch.cat(
-            [ric_joints, ric_vel, global_features, text_projected_expanded], dim=-1
-        )  # (B, T_hist, 22, 3 + 3 + 8 + text_projection_dim)
+            [
+                ric_joints,
+                ric_vel,
+                global_features,
+                duration_expanded,
+                text_projected_expanded,
+            ],
+            dim=-1,
+        )  # (B, T_hist, 22, input_dim)
 
-        # 4) Project per joint via MLP encoder
-        fused_tokens: torch.Tensor = self.per_joint_encoder(
-            motion_tokens
-        )  # (B, T_hist, 22, joint_feature_projection_dim)
+        fused_tokens: torch.Tensor = self.per_joint_encoder(motion_tokens)
 
-        # 5) Flatten joint dimension for GRU
-        fused_tokens = fused_tokens.view(
-            B, T_hist, -1
-        )  # (B, T_hist, 22 * joint_feature_projection_dim)
+        # 4) Temporal processing via GRU
+        # Flatten joint dimension into the temporal feature vector
+        temporal_input = fused_tokens.view(B, T_hist, -1)
+        _, final_hidden_raw = self.gru(temporal_input)
 
-        # 6) Run GRU over time
-        # gru_out shape: (B, T_hist, model_dim), hidden shape: (num_layers*num_dirs, B, model_dim)
-        _, final_hidden_raw = self.gru(fused_tokens)
-
-        # 7) Transform final_hidden to batch-first (B, L*D*model_dim)
+        # 5) Transform final hidden state to batch-first
         final_hidden_vec = final_hidden_raw.transpose(0, 1).reshape(B, -1)
 
-        # 8) Project to per-joint features via MLP head
-        joint_features = self.per_joint_head(
-            final_hidden_vec
-        )  # (B, 22 * per_joint_out_dim)
-        joint_features = joint_features.view(
-            B, self.joint_count, -1
+        # 6) Project back to per-joint feature space
+        output: torch.Tensor = self.per_joint_head(final_hidden_vec)
+        joint_features = output.view(
+            B, self.joint_count, self.per_joint_out_dim
         )  # (B, 22, per_joint_out_dim)
 
         return joint_features
@@ -194,94 +213,161 @@ class MotionHistoryEncoder(nn.Module):
         return self.model_dim * (2 if self.bidirectional else 1)
 
 
-class FlowMatchingNetwork(nn.Module):
+class KinematicChainEncoder(nn.Module):
     """
-    Flow matching predictor for ARFM-style motion prediction.
+    Encodes the kinematic hierarchy of the skeleton.
+    Each joint is mapped to a unique (chain_id, depth) pair based on the T2M skeleton.
+    """
 
-    Inputs:
-        history_ctx: (B, C)          - history context (GRU + text, etc.)
-        x_t:        (B, J, D_x)     - current noised displacement per joint
-        v_prev:     (B, J, D_v)     - previous local velocity (or other local per-joint features)
-        t:          (B,) or (B, 1)  - flow time in [0, 1]
+    def __init__(self, model_dim: int) -> None:
+        super().__init__()
+        # t2m_kinematic_chain:
+        # 0: [0, 2, 5, 8, 11] (Root -> R-Leg)
+        # 1: [0, 1, 4, 7, 10] (Root -> L-Leg)
+        # 2: [0, 3, 6, 9, 12, 15] (Root -> Spine -> Head)
+        # 3: [9, 14, 17, 19, 21] (Neck -> R-Arm)
+        # 4: [9, 13, 16, 18, 20] (Neck -> L-Arm)
 
-    Output:
-        v_hat:      (B, J, D_out)   - predicted flow / velocity for each joint
+        joint_to_chain = [0] * 22
+        joint_to_depth = [0] * 22
+
+        # Trace and assign:
+        # Chain 0: Root + Right Leg
+        for d, j in enumerate([0, 2, 5, 8, 11]):
+            joint_to_chain[j], joint_to_depth[j] = 0, d
+        # Chain 1: Left Leg
+        for d, j in enumerate([1, 4, 7, 10], 1):
+            joint_to_chain[j], joint_to_depth[j] = 1, d
+        # Chain 2: Spine + Head
+        for d, j in enumerate([3, 6, 9, 12, 15], 1):
+            joint_to_chain[j], joint_to_depth[j] = 2, d
+        # Chain 3: Right Arm (starts from joint 9, depth 3)
+        for d, j in enumerate([14, 17, 19, 21], 4):
+            joint_to_chain[j], joint_to_depth[j] = 3, d
+        # Chain 4: Left Arm (starts from joint 9, depth 3)
+        for d, j in enumerate([13, 16, 18, 20], 4):
+            joint_to_chain[j], joint_to_depth[j] = 4, d
+
+        self.register_buffer("joint_to_chain", torch.tensor(joint_to_chain))
+        self.register_buffer("joint_to_depth", torch.tensor(joint_to_depth))
+
+        self.chain_emb = nn.Embedding(5, model_dim // 2)
+        self.depth_emb = nn.Embedding(8, model_dim // 2)
+
+    def forward(self, joint_ids: torch.Tensor) -> torch.Tensor:
+        # joint_ids: (n_joints,)
+        chains = self.joint_to_chain[joint_ids]
+        depths = self.joint_to_depth[joint_ids]
+        return torch.cat([self.chain_emb(chains), self.depth_emb(depths)], dim=-1)
+
+
+class FlowMatchingPredictor(nn.Module):
+    """
+    Spatial Transformer-based Flow Matching Predictor (ARFM-style).
+
+    This model predicts the noise/velocity vector to be subtracted from
+    noisy targets to perform flow matching in joint space.
     """
 
     def __init__(
         self,
-        history_ctx_dim: int,  # C
-        x_dim: int = 3,  # D_x, e.g., 3D displacement
-        v_dim: int = 3,  # D_v, e.g., 3D velocity
-        t_embed_dim: int = 64,
-        hidden_dim: int = 512,
-        num_layers: int = 3,
-        out_dim: int = 3,  # D_out, usually 3 for 3D flow
-        dropout: float = 0.0,
-    ):
+        per_joint_dim: int = 32,
+        model_dim: int = 64,
+        num_layers: int = 2,
+        joint_count: int = 22,
+    ) -> None:
         super().__init__()
+        self.model_dim = model_dim
+        self.num_layers = num_layers
+        self.joint_count = joint_count
 
-        self.history_ctx_dim = history_ctx_dim
-        self.x_dim = x_dim
-        self.v_dim = v_dim
-        self.t_embed_dim = t_embed_dim
+        # Hierarchical Kinematic Encoder
+        self.kinematic_encoder = KinematicChainEncoder(model_dim)
 
-        # Time embedding: simple MLP on scalar t
-        self.t_mlp = nn.Sequential(
-            nn.Linear(1, t_embed_dim),
-            nn.SiLU(),
-            nn.Linear(t_embed_dim, t_embed_dim),
+        # Fuse condition (history) + spatial data (pos/rot/diffs) + noisy state + progress + noise time
+        # Dim: history(32) + pos(3) + rot(6) + diffs(3) + noisy(3) + progress(1) + t(1) = 49
+        self.input_proj = nn.Linear(per_joint_dim + 3 + 6 + 3 + 3 + 1 + 1, model_dim)
+
+        # Spatial transformer (22 joints) - ARFM core
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=4,
+            dim_feedforward=model_dim * 2,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.spatial_transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers, enable_nested_tensor=False
         )
 
-        # Project global context to match feature space
-        self.global_proj = nn.Linear(history_ctx_dim, hidden_dim)
+        # Predict flow/noise per joint
+        self.noise_pred = nn.Sequential(
+            nn.Linear(model_dim, model_dim), nn.GELU(), nn.Linear(model_dim, 3)
+        )
 
-        # First layer input dimension
-        in_dim = hidden_dim + x_dim + v_dim + t_embed_dim
+        # Null tokens for zero-shot and unspecified signals
+        self.null_prev_frame = nn.Parameter(torch.zeros(1, 22, 12))
+        self.null_progress = nn.Parameter(torch.zeros(1, 1, 1))
 
-        layers: list[nn.Module] = []
-        dim = in_dim
-        for _ in range(num_layers - 1):
-            layers.append(nn.Linear(dim, hidden_dim))
-            layers.append(nn.SiLU())
-            if dropout > 0:
-                layers.append(nn.Dropout(dropout))
-            dim = hidden_dim
-
-        self.mlp = nn.Sequential(*layers)
-        self.out_layer = nn.Linear(dim, out_dim)
-
-    def forward(self, history_ctx, x_t, v_prev, t):
+    def forward(
+        self,
+        history_features: torch.Tensor,
+        noise_level: torch.Tensor,
+        noisy_target_diffs: Optional[torch.Tensor] = None,
+        prev_frame_features: Optional[torch.Tensor] = None,
+        temporal_progress: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        history_ctx: (B, C)
-        x_t:        (B, J, D_x)
-        v_prev:     (B, J, D_v)
-        t:          (B,) or (B, 1)
+        Args:
+            history_features:     (B, 22, per_joint_dim) - Context from History Encoder
+            noise_level:          (B,)                   - Flow time t in [0, 1]
+            noisy_target_diffs:   (B, 22, 3)             - The noisy state x_t (Optional)
+            prev_frame_features:  (B, 22, 12)            - [pos(3) + rot(6) + diffs(3)] (Optional)
+            temporal_progress:    (B,)                   - Normalized progress [0, 1] (Optional)
+
+        Returns:
+            pred_noise:           (B, 22, 3)             - Predicted flow/velocity v_t
         """
-        B, J, _ = x_t.shape
+        B, joint_count, _ = history_features.shape
 
-        # Ensure shapes
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)  # (B, 1)
+        # 1) Handle noisy state x_t (Sample if None for zero-shot inference)
+        if noisy_target_diffs is None:
+            noisy_target_diffs = torch.randn(
+                (B, joint_count, 3), device=history_features.device
+            )
 
-        # Time embedding
-        t_emb = self.t_mlp(t)  # (B, t_embed_dim)
-        t_emb = t_emb.unsqueeze(1).expand(B, J, -1)  # (B, J, t_embed_dim)
+        # 2) Handle temporal progress (Optional: use learned null token)
+        if temporal_progress is None:
+            p = self.null_progress.expand(B, joint_count, 1)
+        else:
+            p = temporal_progress.view(B, 1, 1).expand(B, joint_count, 1)
 
-        # Global context projected and broadcast to joints
-        g = self.global_proj(history_ctx)  # (B, hidden_dim)
-        g = g.unsqueeze(1).expand(B, J, -1)  # (B, J, hidden_dim)
+        # 3) Handle previous frame context (Optional: use learned null token)
+        if prev_frame_features is None:
+            prev_frame_features = self.null_prev_frame.expand(B, joint_count, 12)
 
-        # Concatenate all conditioning and local features
-        h = torch.cat(
-            [g, x_t, v_prev, t_emb], dim=-1
-        )  # (B, J, hidden + x_dim + v_dim + t_emb)
+        # 4) Construct concatenated conditioning vector
+        # Sequence: history(32) + spatial(12) + noisy(3) + progress(1) + time(1) = 49
+        x = torch.cat(
+            [history_features, prev_frame_features, noisy_target_diffs], dim=-1
+        )  # [B, 22, 47]
 
-        # Flatten joints into batch for MLP
-        h = h.view(B * J, -1)  # (B*J, F)
-        h = self.mlp(h)  # (B*J, hidden_dim)
-        v_hat = self.out_layer(h)  # (B*J, out_dim)
+        t = noise_level.view(B, 1, 1).expand(B, joint_count, 1)
+        cond = torch.cat([x, p, t], dim=-1)  # [B, 22, 49]
 
-        # Reshape back to (B, J, out_dim)
-        v_hat = v_hat.view(B, J, -1)
-        return v_hat
+        x = self.input_proj(cond)  # [B, 22, model_dim]
+
+        # Add learnable kinematic hierarchical bias
+        joint_ids = torch.arange(joint_count, device=x.device)
+        kinematic_bias = self.kinematic_encoder(joint_ids)  # [22, model_dim]
+        x = x + kinematic_bias.unsqueeze(0)  # [B, 22, model_dim]
+
+        # Spatial attention across all 22 joints
+        x = self.spatial_transformer(x)  # [B, 22, model_dim]
+
+        # Predict noise to subtract
+        pred_noise: torch.Tensor = self.noise_pred(x)  # [B, 22, 3]
+
+        return pred_noise
