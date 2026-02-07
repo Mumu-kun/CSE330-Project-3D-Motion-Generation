@@ -234,7 +234,10 @@ def train(
                 clean_diffs = future[:, 0, 193:259].contiguous().view(B, 22, 3)
                 prog = None
 
-            t_prog = torch.full((B,), prog, device=device)
+            if prog is None:
+                t_prog = None
+            else:
+                t_prog = torch.full((B,), prog, device=device)
 
             # C) Sample noise and flow time t
             eps = torch.randn_like(clean_diffs)  # [B, 22, 3]
