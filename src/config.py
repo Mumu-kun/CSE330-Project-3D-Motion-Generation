@@ -45,23 +45,24 @@ class Config:
     dataset_name: str = "t2m"  # "t2m" for HumanML3D
     unit_length: int = 4
 
-    # Model architecture - MotionHistoryEncoder (Dual-MLP, Test Scale)
-    text_embedding_dim: int = 512
-    text_projection_dim: int = 16
-    joint_feature_projection_dim: int = 32
-    per_joint_out_dim: int = 32
+    # Model architecture - MotionHistoryEncoder (Dual-MLP)
+    text_embedding_dim: int = 512  # CLIP embedding size
+    text_projection_dim: int = 32  # Latent text size
+    joint_feature_projection_dim: int = 64  # Size of joint-level latent tokens
+    per_joint_out_dim: int = 64  # Context vector size per joint
 
-    model_dim: int = 64
-    num_encoder_layers: int = 1
-    dropout: float = 0.0
+    # Model architecture - General
+    model_dim: int = 128  # Primary embedding size for sequence/spatial cores
+    num_encoder_layers: int = 1  # GRU layers
+    num_flow_layers: int = 4  # Spatial Transformer layers
+    dropout: float = 0.1
     bidirectional_gru: bool = True
 
-    # Model architecture - Flow Matching Network (Conditional)
-    num_flow_layers: int = 12
-    num_timesteps: int = 1000  # Number of flow matching timesteps
+    # Model architecture - FlowMatchingPredictor (ARFM)
+    num_heads: int = 4  # Attention heads in spatial transformer
 
     # Training settings
-    batch_size: int = 64
+    batch_size: int = 128
     learning_rate: float = 1e-4
     num_epochs: int = 100
     weight_decay: float = 1e-5

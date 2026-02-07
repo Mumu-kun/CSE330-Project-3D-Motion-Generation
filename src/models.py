@@ -84,13 +84,24 @@ class MotionHistoryEncoder(nn.Module):
         # Null tokens for zero-shot generation (when no history exists)
         self.null_history = nn.Parameter(torch.zeros(1, 1, frame_feature_dim))
         self.null_duration = nn.Parameter(torch.zeros(1, 1))
+        self.null_text_embedding = nn.Parameter(torch.zeros(1, text_embedding_dim))
 
     def _encode_text(
-        self, text: Union[str, List[str]], batch_size: int
+        self, text: Union[str, List[str], torch.Tensor], batch_size: int
     ) -> torch.Tensor:
-        """Encodes text and ensures it matches the batch size."""
+        """Encodes text or returns tensors and ensures it matches the batch size."""
+        if isinstance(text, torch.Tensor):
+            if text.shape[0] != batch_size:
+                # Handle case where text is a single embedding being broadcasted
+                if text.shape[0] == 1:
+                    return text.expand(batch_size, -1)
+                raise ValueError(
+                    f"Batch mismatch: text tensor({text.shape[0]}) vs batch({batch_size})"
+                )
+            return text
+
         if self.text_encoder is None:
-            raise ValueError("text_encoder must be provided to use text inputs.")
+            raise ValueError("text_encoder must be provided when passing string text.")
 
         if isinstance(text, str):
             # Encode single string and broadcast to batch size
@@ -105,17 +116,19 @@ class MotionHistoryEncoder(nn.Module):
                 )
             return self.text_encoder(text)
         else:
-            raise TypeError(f"Expected text to be str or List[str], got {type(text)}")
+            raise TypeError(
+                f"Expected text to be str, List[str], or torch.Tensor, got {type(text)}"
+            )
 
     def forward(
         self,
-        text: Union[str, List[str]],
+        text: Union[str, List[str], torch.Tensor],
         input_features: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
-            text:           (B, str) or single str
+            text:           (B, 512) tensor, list of strings, or single string
             input_features: (B, T_hist, frame_feature_dim) - Optional history
             total_duration: (B, 1) Normalized total frames (Optional)
 
@@ -129,7 +142,10 @@ class MotionHistoryEncoder(nn.Module):
             B = 1
 
         # 2) Handle text conditioning
-        text_embeddings = self._encode_text(text, B)
+        if text is None:
+            text_embeddings = self.null_text_embedding.expand(B, -1)
+        else:
+            text_embeddings = self._encode_text(text, B)
         text_projected: torch.Tensor = self.text_projection(text_embeddings)
 
         # 3) Handle optional motion features (Null-token if none)
@@ -371,3 +387,99 @@ class FlowMatchingPredictor(nn.Module):
         pred_noise: torch.Tensor = self.noise_pred(x)  # [B, 22, 3]
 
         return pred_noise
+
+
+class HumanMotionGenerator(nn.Module):
+    """
+    Top-level wrapper for the Human Motion Generation pipeline.
+    Integrates MotionHistoryEncoder (Context) and FlowMatchingPredictor (Spatial Generation).
+    """
+
+    def __init__(
+        self,
+        encoder: MotionHistoryEncoder,
+        predictor: FlowMatchingPredictor,
+    ) -> None:
+        super().__init__()
+        self.encoder = encoder
+        self.predictor = predictor
+
+    def generate(
+        self,
+        text: Union[str, List[str], torch.Tensor],
+        num_steps: int = 10,
+        guidance_scale: float = 2.5,
+        input_features: Optional[torch.Tensor] = None,
+        total_duration: Optional[torch.Tensor] = None,
+        prev_frame_features: Optional[torch.Tensor] = None,
+        temporal_progress: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Iterative generation loop (Inference).
+        Refines noise into clean motion features for the next frame(s).
+
+        Args:
+            text:           Text prompt or pre-encoded CLIP embedding
+            num_steps:      Number of integration steps (t=0 to t=1)
+            guidance_scale: CFG scale (1.0 = no guidance, >1.0 = stronger text adherence)
+            input_features: (B, T_hist, 263) - Optional history
+            ...
+        """
+        self.eval()
+        with torch.no_grad():
+            if isinstance(text, list):
+                B = len(text)
+            elif isinstance(text, torch.Tensor):
+                B = text.shape[0]
+            else:
+                B = 1
+            device = next(self.parameters()).device
+
+            # 1. Encode Context once per frame-generation step
+            # For CFG, we encode both:
+            # - Conditional: using the provided text
+            # - Unconditional: using None (which triggers null_text_embedding)
+            context_cond = self.encoder(
+                text=text, input_features=input_features, total_duration=total_duration
+            )
+
+            # Unconditional branch: maintains temporal context but drops text
+            context_uncond = self.encoder(
+                text=None, input_features=input_features, total_duration=total_duration
+            )
+
+            # 2. Initialize noisy state x_0 (Pure Gaussian Noise)
+            # Shape: (B, 22, 3) - predicting the next displacement/delta
+            x_t = torch.randn((B, 22, 3), device=device)
+
+            # 3. Iterative Refinement (Euler ODE Solver with CFG)
+            dt = 1.0 / num_steps
+            for step in range(num_steps):
+                # t goes from 0 to 1
+                t = torch.full((B,), step * dt, device=device)
+
+                # Conditional velocity
+                v_cond = self.predictor(
+                    history_features=context_cond,
+                    noise_level=t,
+                    noisy_target_diffs=x_t,
+                    prev_frame_features=prev_frame_features,
+                    temporal_progress=temporal_progress,
+                )
+
+                # Unconditional velocity
+                v_uncond = self.predictor(
+                    history_features=context_uncond,
+                    noise_level=t,
+                    noisy_target_diffs=x_t,
+                    prev_frame_features=prev_frame_features,
+                    temporal_progress=temporal_progress,
+                )
+
+                # CFG Interpolation: v = v_uncond + s * (v_cond - v_uncond)
+                v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
+
+                # Euler step: x_{t+dt} = x_t + v_t * dt
+                x_t = x_t + v_t * dt
+
+            return x_t
