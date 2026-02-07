@@ -135,9 +135,13 @@ class MotionHistoryEncoder(nn.Module):
         Returns:
             joint_features: (B, 22, per_joint_out_dim) - Encoded per-joint context
         """
-        # 1) Determine Batch Size from text input
-        if isinstance(text, list):
+        # 1) Determine Batch Size
+        if input_features is not None:
+            B = input_features.shape[0]
+        elif isinstance(text, list):
             B = len(text)
+        elif isinstance(text, torch.Tensor):
+            B = text.shape[0]
         else:
             B = 1
 

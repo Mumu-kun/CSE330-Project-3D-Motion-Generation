@@ -16,12 +16,18 @@ The pipeline is designed to be compatible with MoMask's data format:
 
 ```
 ML-Project/
-├── pipeline.ipynb          # Main pipeline notebook with 7 steps
-├── config.py                # Configuration and hyperparameters
-├── models.py                # Model architectures
-├── utils.py                 # Utility functions (data, post-processing, evaluation)
-├── requirements.txt         # Python dependencies
-└── README.md                # This file
+├── src/                    # Source code
+│   ├── models.py           # Model architectures (Encoder/Predictor)
+│   ├── config.py           # Configuration and hyperparameters
+│   ├── requirements.txt    # Python dependencies
+│   └── utils/              # Utility modules (data, train, visualize)
+├── docs/                   # Documentation
+│   ├── high_level_design.md
+│   ├── architecture.md
+│   ├── dev_guide.md
+│   └── cloud_tutorial.md
+├── generate_cloud_notebook.py # Script to bundle for Kaggle/Colab
+├── README.md               # This file
 ```
 
 ## Setup
@@ -29,7 +35,7 @@ ML-Project/
 ### 1. Install Dependencies
 
 ```bash
-pip install -r requirements.txt
+pip install -r src/requirements.txt
 ```
 
 ### 2. Prepare Dataset
@@ -99,12 +105,12 @@ You can use MoMask's evaluation tools and visualization utilities with the outpu
 
 ## Model Architecture
 
-### Autoregressive Context Encoder
+### Motion History Encoder
 
 - Processes motion sequences sequentially
-- Uses transformer encoder architecture
+- Uses **GRU-based** recurrent architecture
 - Outputs contextual embeddings for flow matching
-- Handles text conditioning (to be integrated)
+- Handles text conditioning via CLIP embeddings
 
 ### Flow Matching Network
 
@@ -140,6 +146,14 @@ Key configuration parameters in `config.py`:
 - [MoMask: Generative Masked Modeling of 3D Human Motions (CVPR 2024)](https://github.com/EricGuo5513/momask-codes)
 - [HumanML3D Dataset](https://github.com/EricGuo5513/HumanML3D)
 - Flow Matching: [Flow Matching for Generative Modeling](https://arxiv.org/abs/2210.02747)
+
+## Documentation
+
+For more detailed information, check the `docs/` folder:
+- [High-Level Design](docs/high_level_design.md)
+- [Architecture Details](docs/architecture.md)
+- [Developer & Cloud Guide](docs/dev_guide.md)
+- [Cloud Setup Tutorial](docs/cloud_tutorial.md)
 
 ## License
 

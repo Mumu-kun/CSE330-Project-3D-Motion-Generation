@@ -6,7 +6,7 @@ sys.path.append(os.getcwd())
 import torch
 import torch.nn as nn
 from src.models import MotionHistoryEncoder, FlowMatchingPredictor
-from src.train_utils import train, build_prev_and_clean_diffs
+from src.utils.train_utils import train, build_prev_and_clean_diffs
 
 
 def test_feature_extraction():

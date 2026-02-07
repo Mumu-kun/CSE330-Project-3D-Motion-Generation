@@ -65,6 +65,7 @@ def generate_cloud_notebook():
         "utils/metrics.py": source_dir / "utils" / "metrics.py",
         "utils/quaternion.py": source_dir / "utils" / "quaternion.py",
         "utils/skeleton.py": source_dir / "utils" / "skeleton.py",
+        "utils/train_utils.py": source_dir / "utils" / "train_utils.py",
     }
 
     # 2. Extract and minify content from support files
