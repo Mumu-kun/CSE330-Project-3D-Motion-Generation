@@ -1,80 +1,115 @@
+"""
+Unit tests for FlowMatchingPredictor.
+Tests the flow predictor in isolation with various input configurations.
+"""
+
 import sys
 import os
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
+
 import torch
-import torch.nn as nn
-
-sys.path.append(os.getcwd())
-
-from src.models import FlowMatchingPredictor
+from models import FlowMatchingPredictor
 
 
-def test_flow_matching_predictor():
-    print("Initializing test for FlowMatchingPredictor...")
+def test_predictor_basic():
+    """Test predictor with all inputs."""
+    print("\n=== Test 1: Predictor with all inputs ===")
 
-    # Parameters
-    B = 2
-    N_joints = 22
-    per_joint_dim = 32
-    model_dim = 64
-    num_layers = 2
+    B, joint_count = 2, 22
+    per_joint_dim = 64
+    model_dim = 128
 
-    # Initialize Model
-    model = FlowMatchingPredictor(
-        per_joint_dim=per_joint_dim, model_dim=model_dim, num_layers=num_layers
+    predictor = FlowMatchingPredictor(
+        per_joint_dim=per_joint_dim,
+        model_dim=model_dim,
+        num_layers=2,
+        joint_count=joint_count,
     )
 
-    # Dummy Inputs
-    history_features = torch.randn(B, N_joints, per_joint_dim)
-    prev_frame_features = torch.randn(B, N_joints, 12)  # pos(3) + rot(6) + diffs(3)
-
+    # Inputs
+    history_features = torch.randn(B, joint_count, per_joint_dim)
     noise_level = torch.rand(B)
-    noisy_target_diffs = torch.randn(B, N_joints, 3)
-    temporal_progress = torch.tensor([0.1, 0.9])  # Progress through generation
+    noisy_target_diffs = torch.randn(B, joint_count, 3)
+    prev_frame_features = torch.randn(B, joint_count, 12)  # pos(3) + rot6d(6) + vel(3)
+    temporal_progress = torch.rand(B)
 
-    # 1. Forward Pass (Zero-shot Inference style)
-    # Only provides history and noise_level. Relies on null tokens and internal sampling.
-    print(f"Running forward pass (Zero-shot / All defaults)...")
-    try:
-        pred_noise = model(
-            history_features=history_features,
-            noise_level=noise_level,
-        )
-        print(f"Success! Output shape: {pred_noise.shape}")
-    except Exception as e:
-        print(f"Zero-shot forward pass failed: {str(e)}")
-        import traceback
+    output = predictor(
+        history_features=history_features,
+        noise_level=noise_level,
+        noisy_target_diffs=noisy_target_diffs,
+        prev_frame_features=prev_frame_features,
+        temporal_progress=temporal_progress,
+    )
 
-        traceback.print_exc()
+    expected_shape = (B, joint_count, 3)
+    assert (
+        output.shape == expected_shape
+    ), f"Expected {expected_shape}, got {output.shape}"
+    print(f"✓ Output shape: {output.shape}")
 
-    # 2. Forward Pass (Full Conditioning)
-    print(f"Running forward pass with full conditioning...")
-    try:
-        pred_noise = model(
+
+def test_predictor_zero_shot():
+    """Test predictor without previous frame (zero-shot)."""
+    print("\n=== Test 2: Zero-shot (no prev frame) ===")
+
+    B, joint_count = 2, 22
+    predictor = FlowMatchingPredictor(
+        per_joint_dim=64,
+        model_dim=128,
+        num_layers=2,
+        joint_count=joint_count,
+    )
+
+    history_features = torch.randn(B, joint_count, 64)
+    noise_level = torch.rand(B)
+    noisy_target_diffs = torch.randn(B, joint_count, 3)
+
+    # No previous frame, no temporal progress
+    output = predictor(
+        history_features=history_features,
+        noise_level=noise_level,
+        noisy_target_diffs=noisy_target_diffs,
+        prev_frame_features=None,
+        temporal_progress=None,
+    )
+
+    expected_shape = (B, joint_count, 3)
+    assert output.shape == expected_shape
+    print(f"✓ Zero-shot output shape: {output.shape}")
+
+
+def test_predictor_different_batch_sizes():
+    """Test predictor with various batch sizes."""
+    print("\n=== Test 3: Different batch sizes ===")
+
+    joint_count = 22
+    predictor = FlowMatchingPredictor(
+        per_joint_dim=64,
+        model_dim=128,
+        num_layers=2,
+        joint_count=joint_count,
+    )
+
+    for B in [1, 4, 8]:
+        history_features = torch.randn(B, joint_count, 64)
+        noise_level = torch.rand(B)
+        noisy_target_diffs = torch.randn(B, joint_count, 3)
+
+        output = predictor(
             history_features=history_features,
             noise_level=noise_level,
             noisy_target_diffs=noisy_target_diffs,
-            prev_frame_features=prev_frame_features,
-            temporal_progress=temporal_progress,
+            prev_frame_features=None,
+            temporal_progress=None,
         )
-        print(f"Success! Output shape: {pred_noise.shape}")
 
-        # Verify output shape
-        expected_shape = (B, N_joints, 3)
-        if pred_noise.shape == expected_shape:
-            print("Output shape is correct.")
-        else:
-            print(f"Error: Expected shape {expected_shape}, got {pred_noise.shape}")
-
-        # Total parameters
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total Trainable Parameters: {total_params:,}")
-
-    except Exception as e:
-        print(f"Full conditioning forward pass failed: {str(e)}")
-        import traceback
-
-        traceback.print_exc()
+        assert output.shape == (B, joint_count, 3)
+        print(f"✓ Batch size {B}: {output.shape}")
 
 
 if __name__ == "__main__":
-    test_flow_matching_predictor()
+    test_predictor_basic()
+    test_predictor_zero_shot()
+    test_predictor_different_batch_sizes()
+    print("\n✅ All FlowMatchingPredictor tests passed!")

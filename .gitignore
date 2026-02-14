@@ -9,6 +9,7 @@ venv/
 .vscode/
 *.code-workspace
 .idea/
+.kilocode
 
 # Jupyter
 .ipynb_checkpoints/

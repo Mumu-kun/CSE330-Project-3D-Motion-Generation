@@ -1,88 +1,123 @@
+"""
+Unit tests for MotionHistoryEncoder.
+Tests the encoder in isolation with various input configurations.
+"""
+
 import sys
 import os
 
-sys.path.append(os.getcwd())
+sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
 
 import torch
-import torch.nn as nn
-from src.models import MotionHistoryEncoder
+from models import MotionHistoryEncoder
 
 
-def test_motion_history_encoder():
-    print("Initializing test for MotionHistoryEncoder...")
+def test_encoder_with_all_inputs():
+    """Test encoder with text, motion history, and duration."""
+    print("\n=== Test 1: Encoder with all inputs ===")
 
-    # Parameters (Reduced for testing)
-    B = 2
-    T_hist = 5
-    frame_feature_dim = 263
-    text_embedding_dim = 512
-    joint_feature_projection_dim = 32
-    text_projection_dim = 16
-    per_joint_out_dim = 32
-    joint_count = 22
-    model_dim = 64
-
-    # Mock Text Encoder
-    class MockTextEncoder(nn.Module):
-        def forward(self, text):
-            # Return random embeddings for text
-            if isinstance(text, str):
-                return torch.randn(1, 512)
-            else:
-                return torch.randn(len(text), 512)
-
-    text_encoder = MockTextEncoder()
-
-    # Initialize Model
-    model = MotionHistoryEncoder(
-        frame_feature_dim=frame_feature_dim,
-        text_embedding_dim=text_embedding_dim,
-        joint_feature_projection_dim=joint_feature_projection_dim,
-        text_projection_dim=text_projection_dim,
-        per_joint_out_dim=per_joint_out_dim,
-        joint_count=joint_count,
-        model_dim=model_dim,
-        text_encoder=text_encoder,
+    B, T_hist, C = 2, 10, 263
+    encoder = MotionHistoryEncoder(
+        frame_feature_dim=C,
+        text_embedding_dim=512,
+        joint_feature_projection_dim=32,
+        text_projection_dim=16,
+        per_joint_out_dim=64,
+        model_dim=128,
+        joint_count=22,
     )
 
-    # Dummy Input
-    input_features = torch.randn(B, T_hist, frame_feature_dim)
-    text = ["A person is walking", "A person is jumping"]
-    total_duration = torch.tensor([[0.5], [0.8]])  # Normalized duration
+    text = torch.randn(B, 512)
+    motion_history = torch.randn(B, T_hist, C)
+    duration = torch.rand(B, 1)
 
-    # 1. Forward Pass (Default/Optional)
-    print(f"Running forward pass (optional/default)...")
-    try:
-        output = model(text=text)
-        print(f"Success! Output shape (Zero-shot): {output.shape}")
-    except Exception as e:
-        print(f"Default forward pass failed: {str(e)}")
+    output = encoder(text=text, input_features=motion_history, total_duration=duration)
 
-    # 2. Forward Pass (Full Conditioning)
-    print(f"Running forward pass with text and history...")
-    try:
-        output = model(
-            text=text, input_features=input_features, total_duration=total_duration
-        )
-        print(f"Success! Output shape: {output.shape}")
+    expected_shape = (B, 22, 64)  # (B, joint_count, per_joint_out_dim)
+    assert (
+        output.shape == expected_shape
+    ), f"Expected {expected_shape}, got {output.shape}"
+    print(f"✓ Output shape: {output.shape}")
 
-        # Verify output shape
-        expected_shape = (B, joint_count, per_joint_out_dim)
-        if output.shape == expected_shape:
-            print("Output shape is correct.")
-        else:
-            print(f"Error: Expected shape {expected_shape}, got {output.shape}")
 
-        # Calculate parameters
-        total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"\nTotal Trainable Parameters: {total_params:,}")
+def test_encoder_zero_shot():
+    """Test encoder with no motion history (zero-shot generation)."""
+    print("\n=== Test 2: Zero-shot (no history) ===")
 
-    except Exception as e:
-        print(f"Forward pass failed with error: {str(e)}")
-        import traceback
+    B = 2
+    encoder = MotionHistoryEncoder(
+        frame_feature_dim=263,
+        text_embedding_dim=512,
+        joint_feature_projection_dim=32,
+        text_projection_dim=16,
+        per_joint_out_dim=64,
+        model_dim=128,
+        joint_count=22,
+    )
 
-        traceback.print_exc()
+    text = torch.randn(B, 512)
+
+    # No motion history, no duration
+    output = encoder(text=text, input_features=None, total_duration=None)
+
+    expected_shape = (B, 22, 64)
+    assert output.shape == expected_shape
+    print(f"✓ Zero-shot output shape: {output.shape}")
+
+
+def test_encoder_unconditional():
+    """Test encoder with no text (unconditional generation)."""
+    print("\n=== Test 3: Unconditional (no text) ===")
+
+    B, T_hist = 2, 10
+    encoder = MotionHistoryEncoder(
+        frame_feature_dim=263,
+        text_embedding_dim=512,
+        joint_feature_projection_dim=32,
+        text_projection_dim=16,
+        per_joint_out_dim=64,
+        model_dim=128,
+        joint_count=22,
+    )
+
+    motion_history = torch.randn(B, T_hist, 263)
+
+    # No text conditioning
+    output = encoder(text=None, input_features=motion_history, total_duration=None)
+
+    expected_shape = (B, 22, 64)
+    assert output.shape == expected_shape
+    print(f"✓ Unconditional output shape: {output.shape}")
+
+
+def test_encoder_batch_broadcasting():
+    """Test encoder with batch size 1 text broadcast to larger batch."""
+    print("\n=== Test 4: Text broadcasting ===")
+
+    B, T_hist = 4, 10
+    encoder = MotionHistoryEncoder(
+        frame_feature_dim=263,
+        text_embedding_dim=512,
+        joint_feature_projection_dim=32,
+        text_projection_dim=16,
+        per_joint_out_dim=64,
+        model_dim=128,
+        joint_count=22,
+    )
+
+    text = torch.randn(1, 512)  # Batch size 1
+    motion_history = torch.randn(B, T_hist, 263)  # Batch size 4
+
+    output = encoder(text=text, input_features=motion_history, total_duration=None)
+
+    expected_shape = (B, 22, 64)
+    assert output.shape == expected_shape
+    print(f"✓ Broadcasting works: {output.shape}")
 
 
 if __name__ == "__main__":
-    test_motion_history_encoder()
+    test_encoder_with_all_inputs()
+    test_encoder_zero_shot()
+    test_encoder_unconditional()
+    test_encoder_batch_broadcasting()
+    print("\n✅ All MotionHistoryEncoder tests passed!")

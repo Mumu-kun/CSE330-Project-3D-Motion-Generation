@@ -5,7 +5,7 @@ import scipy.ndimage.filters as filters
 class Skeleton(object):
     def __init__(self, offset, kinematic_tree, device):
         self.device = device
-        self._raw_offset_np = offset.numpy()
+        self._raw_offset_np = offset.cpu().numpy()
         self._raw_offset = offset.clone().detach().to(device).float()
         self._kinematic_tree = kinematic_tree
         self._offset = None

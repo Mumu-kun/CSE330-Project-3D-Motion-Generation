@@ -1,15 +1,15 @@
 {
-  "id": "mustafamuhaimin/3d-human-motion-generation",
-  "title": "3D Human Motion Generation", 
-  "code_file": "notebook.ipynb",
-  "language": "python",
-  "kernel_type": "notebook",
-  "is_private": "true",
-  "enable_gpu": "true",
-  "enable_tpu": "false",
-  "enable_internet": "true",
-  "dataset_sources": [""],
-  "competition_sources": [],
-  "kernel_sources": ["mustafamuhaimin/humanml3d-subset"],
-  "model_sources": []
+	"id": "mustafamuhaimin/3d-human-motion-generation",
+	"title": "3D Human Motion Generation",
+	"code_file": "notebook.ipynb",
+	"language": "python",
+	"kernel_type": "notebook",
+	"is_private": "true",
+	"enable_gpu": "true",
+	"enable_tpu": "false",
+	"enable_internet": "true",
+	"dataset_sources": ["mustafamuhaimin/humanml3d-subset"],
+	"competition_sources": [],
+	"kernel_sources": [],
+	"model_sources": []
 }

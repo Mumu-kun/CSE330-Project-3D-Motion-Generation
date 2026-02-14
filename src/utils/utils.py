@@ -61,6 +61,7 @@ __all__ = [
     "extract_features",
     "get_feature_vec_subset",
     "recover_from_ric",
+    "IncrementalFeatureExtractor",
     # Visualization
     "plot_3d_motion",
     "visualize_motion",

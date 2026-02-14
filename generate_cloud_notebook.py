@@ -66,18 +66,24 @@ def generate_cloud_notebook():
         "utils/quaternion.py": source_dir / "utils" / "quaternion.py",
         "utils/skeleton.py": source_dir / "utils" / "skeleton.py",
         "utils/train_utils.py": source_dir / "utils" / "train_utils.py",
+        "utils/text_encoder.py": source_dir / "utils" / "text_encoder.py",
     }
 
     # 2. Extract and minify content from support files
     files_content = {}
+    # Files that should NOT be minified (they break with minification)
+    no_minify = {"utils/__init__.py", "utils/text_encoder.py"}
+
     for output_name, file_path in support_files.items():
         if file_path.exists():
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
                 if output_name.endswith(".py"):
-                    if file_path.name != "__init__.py":  # Don't minify __init__.py
+                    if output_name not in no_minify:  # Don't minify critical files
                         print(f"Minifying {output_name}...")
                         content = minify_python(content)
+                    else:
+                        print(f"Skipping minification for {output_name}")
                 files_content[output_name] = content
         else:
             print(f"Warning: {file_path} not found.")

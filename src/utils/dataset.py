@@ -134,24 +134,96 @@ class Text2MotionDataset(Dataset):
         self.data_dict = data_dict
         self.name_list = name_list
 
+        # --- Text Embedding Caching ---
+        self.text_cache_path = config.dataset_path / "text_embeddings_cache.pt"
+        self.text_cache: Dict[str, torch.Tensor] = {}
+
+        if self.text_cache_path.exists():
+            print(f"Loading text embedding cache from {self.text_cache_path}...")
+            self.text_cache = torch.load(self.text_cache_path)
+
+        # Collect all unique captions
+        all_captions = set()
+        for key, data in self.data_dict.items():
+            for text_item in data["text"]:
+                all_captions.add(text_item["caption"])
+
+        # Identify missing captions
+        missing_captions = [cap for cap in all_captions if cap not in self.text_cache]
+
+        if missing_captions:
+            print(
+                f"Computed {len(self.text_cache)}/{len(all_captions)} embeddings. Computing {len(missing_captions)} missing..."
+            )
+
+            # LAZY IMPORT: Only import when needed
+            from .text_encoder import CLIPEncoder
+
+            # Initialize CLIP Encoder only if needed (to save VRAM if cached)
+            clip_encoder = CLIPEncoder(model_name="openai/clip-vit-base-patch32")
+            clip_encoder.to(config.device)
+
+            batch_size = 32
+            for i in tqdm(
+                range(0, len(missing_captions), batch_size), desc="Encoding Texts"
+            ):
+                batch_caps = missing_captions[i : i + batch_size]
+                with torch.no_grad():
+                    # (B, 512)
+                    embeddings = clip_encoder(batch_caps).cpu()
+
+                for cap, emb in zip(batch_caps, embeddings):
+                    self.text_cache[cap] = emb
+
+            # Save updated cache
+            print(f"Saving updated cache to {self.text_cache_path}...")
+            torch.save(self.text_cache, self.text_cache_path)
+
+            # Cleanup to free VRAM
+            del clip_encoder
+            torch.cuda.empty_cache()
+        else:
+            print("All text embeddings are cached.")
+
     def inv_transform(self, data):
         return data * self.std + self.mean
 
     def __len__(self):
         return len(self.data_dict) - self.pointer
 
+    """
+    FINAL CORRECT __getitem__ implementation
+    This is the ONLY version that works - replace everything else
+    """
+
     def __getitem__(self, item):
+        """
+        Returns a single sample from the dataset.
+        GUARANTEES: All returned tensors have shape (max_motion_length, features)
+        """
         idx = self.pointer + item
         data = self.data_dict[self.name_list[idx]]
-        motion, joints, m_length, text_list = (
-            data["motion"],
-            data["joints"],
-            data["length"],
-            data["text"],
-        )
-        text_data = random.choice(text_list)
-        caption, tokens = text_data["caption"], text_data["tokens"]
 
+        # Get raw data from dict
+        motion = data["motion"]  # numpy array (T, 263)
+        joints = data["joints"]  # numpy array (T, 22, 3)
+        original_length = data["length"]  # int, original number of frames
+        text_list = data["text"]  # list of text dicts
+
+        # Choose random text
+        text_data = random.choice(text_list)
+        caption = text_data["caption"]
+
+        # ===== CONVERT TO TENSORS =====
+        motion = torch.from_numpy(motion.copy()).float()  # (T, 263)
+        joints = torch.from_numpy(joints.copy()).float()  # (T, 22, 3)
+
+        # ===== NORMALIZE =====
+        motion = (motion - self.mean) / self.std
+
+        # ===== DETERMINE TARGET LENGTH =====
+        # The m_length modification logic from config
+        m_length = original_length
         if self.config.unit_length < 10:
             coin2 = np.random.choice(["single", "single", "double"])
         else:
@@ -161,35 +233,86 @@ class Text2MotionDataset(Dataset):
             m_length = (
                 m_length // self.config.unit_length - 1
             ) * self.config.unit_length
-        elif coin2 == "single":
+        else:
             m_length = (m_length // self.config.unit_length) * self.config.unit_length
-        # Convert to tensors
-        motion = torch.from_numpy(motion).float()
-        joints = torch.from_numpy(joints).float()
 
-        # Normalize features
-        motion = (motion - self.mean) / self.std
+        # Clamp to actual available data
+        m_length = min(m_length, len(motion))
+        m_length = max(1, m_length)  # At least 1 frame
 
-        if m_length < self.max_motion_length:
-            padding_len = self.max_motion_length - m_length
+        # ===== TRUNCATE TO TARGET LENGTH =====
+        motion = motion[:m_length]
+        joints = joints[:m_length]
 
-            # Pad motion features
-            motion_padding = torch.zeros(
-                (padding_len, motion.shape[1]), dtype=motion.dtype
+        # ===== PAD OR TRUNCATE TO MAX_MOTION_LENGTH =====
+        target_len = self.max_motion_length
+        current_len = len(motion)
+
+        if current_len < target_len:
+            # Pad with zeros
+            pad_size = target_len - current_len
+            motion = torch.cat(
+                [
+                    motion,
+                    torch.zeros(
+                        pad_size,
+                        motion.shape[1],
+                        dtype=motion.dtype,
+                        device=motion.device,
+                    ),
+                ],
+                dim=0,
             )
-            motion = torch.cat([motion, motion_padding], dim=0)
-
-            # Pad joint positions
-            joints_padding = torch.zeros(
-                (padding_len, joints.shape[1], joints.shape[2]), dtype=joints.dtype
+            joints = torch.cat(
+                [
+                    joints,
+                    torch.zeros(
+                        pad_size,
+                        joints.shape[1],
+                        joints.shape[2],
+                        dtype=joints.dtype,
+                        device=joints.device,
+                    ),
+                ],
+                dim=0,
             )
-            joints = torch.cat([joints, joints_padding], dim=0)
+        elif current_len > target_len:
+            # Truncate
+            motion = motion[:target_len]
+            joints = joints[:target_len]
 
-        # Extract feature subset if specified
-        # motion: (max_seq_len, 263)
+        # ===== FINAL SANITY CHECK =====
+        assert (
+            motion.shape[0] == target_len
+        ), f"Motion shape[0]={motion.shape[0]}, expected {target_len}"
+        assert (
+            motion.shape[1] == 263
+        ), f"Motion shape[1]={motion.shape[1]}, expected 263"
+        assert (
+            joints.shape[0] == target_len
+        ), f"Joints shape[0]={joints.shape[0]}, expected {target_len}"
+
+        # ===== EXTRACT FEATURES =====
         history_features = get_feature_vec_subset(motion, self.feature_dims)
 
-        return caption, history_features, motion, joints, m_length
+        # Ensure it's a tensor
+        if isinstance(history_features, np.ndarray):
+            history_features = torch.from_numpy(history_features).float()
+        else:
+            history_features = history_features.float()
+
+        assert (
+            history_features.shape[0] == target_len
+        ), f"history_features shape[0]={history_features.shape[0]}, expected {target_len}"
+
+        # ===== GET TEXT EMBEDDING =====
+        text_embedding = self.text_cache[caption]
+        if isinstance(text_embedding, np.ndarray):
+            text_embedding = torch.from_numpy(text_embedding).float()
+        else:
+            text_embedding = text_embedding.float()
+
+        return caption, history_features, motion, joints, m_length, text_embedding
 
     def reset_min_len(self, length):
         assert length <= self.max_motion_length
@@ -201,7 +324,9 @@ from typing import List, Dict, Any
 
 
 def text2motion_collate_fn(
-    batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int]],
+    batch: List[
+        Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]
+    ],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
@@ -211,6 +336,7 @@ def text2motion_collate_fn(
       - motion: (max_T, 263) torch.Tensor
       - joints: (max_T, J, 3) torch.Tensor
       - length: int
+      - text_embedding: (512,) torch.Tensor
     """
     # Lists of items
     captions = [b[0] for b in batch]
@@ -218,12 +344,29 @@ def text2motion_collate_fn(
     motions_list = [b[2] for b in batch]
     joints_list = [b[3] for b in batch]
     lengths = [b[4] for b in batch]
+    text_embs_list = [b[5] for b in batch]
+
+    # Helper to ensure all are tensors
+    def to_tensor(x):
+        if isinstance(x, np.ndarray):
+            return torch.from_numpy(x).float()
+        elif isinstance(x, torch.Tensor):
+            return x.float()
+        else:
+            return torch.tensor(x).float()
+
+    # Convert all to tensors (redundant safety check)
+    cond_feats_list = [to_tensor(x) for x in cond_feats_list]
+    motions_list = [to_tensor(x) for x in motions_list]
+    joints_list = [to_tensor(x) for x in joints_list]
+    text_embs_list = [to_tensor(x) for x in text_embs_list]
 
     # Stack tensors directly
     cond_feature_batch = torch.stack(cond_feats_list, dim=0)  # (B, T, C_in)
     motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 263)
     joints_batch = torch.stack(joints_list, dim=0)  # (B, T, J, 3)
     length_batch = torch.tensor(lengths, dtype=torch.long)  # (B,)
+    text_emb_batch = torch.stack(text_embs_list, dim=0)  # (B, 512)
 
     return {
         "captions": captions,
@@ -231,6 +374,7 @@ def text2motion_collate_fn(
         "motion": motion_batch,
         "joints": joints_batch,
         "lengths": length_batch,
+        "text_clip": text_emb_batch,
     }
 
 
@@ -271,7 +415,7 @@ def create_dataloader(
         dataset_obj,
         batch_size=config.batch_size,
         shuffle=shuffle,
-        num_workers=config.num_workers,
+        num_workers=0,  # CRITICAL: Must be 0 to avoid serialization issues
         pin_memory=config.pin_memory,
         collate_fn=text2motion_collate_fn,
     )

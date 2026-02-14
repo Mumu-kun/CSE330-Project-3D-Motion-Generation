@@ -11,7 +11,15 @@ Compatible with MoMask input format: dim-263 feature vectors
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from pathlib import Path
 from typing import Optional, List, Tuple, Union, Callable, Any
+from config import Config
+
+from utils.motion_utils import (
+    feature_to_joints,
+    get_dataset_config,
+    IncrementalFeatureExtractor,
+)
 
 
 class MotionHistoryEncoder(nn.Module):
@@ -33,7 +41,6 @@ class MotionHistoryEncoder(nn.Module):
         model_dim: int = 256,
         num_layers: int = 1,
         bidirectional: bool = False,
-        text_encoder: Optional[nn.Module] = None,
     ) -> None:
         super().__init__()
 
@@ -46,7 +53,6 @@ class MotionHistoryEncoder(nn.Module):
         self.model_dim = model_dim
         self.num_layers = num_layers
         self.bidirectional = bidirectional
-        self.text_encoder = text_encoder
         self.joint_count = joint_count
 
         # Text conditioning projection
@@ -55,7 +61,7 @@ class MotionHistoryEncoder(nn.Module):
         # Dual-MLP Logic Start:
         # Per-joint encoder: Projects raw motion features + text + duration into joint-latent space
         # Input dim: pos(3) + vel(3) + global(8) + duration(1) + text(text_proj_dim) = 15 + text_proj_dim
-        joint_input_dim = 3 + 3 + 8 + 1 + text_projection_dim
+        joint_input_dim = 3 + 3 + 8 + text_projection_dim
         self.per_joint_encoder = nn.Sequential(
             nn.Linear(joint_input_dim, joint_feature_projection_dim * 2),
             nn.SiLU(),
@@ -86,49 +92,16 @@ class MotionHistoryEncoder(nn.Module):
         self.null_duration = nn.Parameter(torch.zeros(1, 1))
         self.null_text_embedding = nn.Parameter(torch.zeros(1, text_embedding_dim))
 
-    def _encode_text(
-        self, text: Union[str, List[str], torch.Tensor], batch_size: int
-    ) -> torch.Tensor:
-        """Encodes text or returns tensors and ensures it matches the batch size."""
-        if isinstance(text, torch.Tensor):
-            if text.shape[0] != batch_size:
-                # Handle case where text is a single embedding being broadcasted
-                if text.shape[0] == 1:
-                    return text.expand(batch_size, -1)
-                raise ValueError(
-                    f"Batch mismatch: text tensor({text.shape[0]}) vs batch({batch_size})"
-                )
-            return text
-
-        if self.text_encoder is None:
-            raise ValueError("text_encoder must be provided when passing string text.")
-
-        if isinstance(text, str):
-            # Encode single string and broadcast to batch size
-            single_embedding = self.text_encoder(text)
-            if single_embedding.dim() == 1:
-                single_embedding = single_embedding.unsqueeze(0)
-            return single_embedding.expand(batch_size, -1)
-        elif isinstance(text, list):
-            if len(text) != batch_size:
-                raise ValueError(
-                    f"Batch mismatch: text({len(text)}) vs batch({batch_size})"
-                )
-            return self.text_encoder(text)
-        else:
-            raise TypeError(
-                f"Expected text to be str, List[str], or torch.Tensor, got {type(text)}"
-            )
-
     def forward(
         self,
-        text: Union[str, List[str], torch.Tensor],
+        text: Optional[torch.Tensor],
         input_features: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
+        batch_size: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Args:
-            text:           (B, 512) tensor, list of strings, or single string
+            text:           (B, 512) tensor or None
             input_features: (B, T_hist, frame_feature_dim) - Optional history
             total_duration: (B, 1) Normalized total frames (Optional)
 
@@ -138,10 +111,12 @@ class MotionHistoryEncoder(nn.Module):
         # 1) Determine Batch Size
         if input_features is not None:
             B = input_features.shape[0]
-        elif isinstance(text, list):
-            B = len(text)
-        elif isinstance(text, torch.Tensor):
+        elif text is not None:
             B = text.shape[0]
+        elif total_duration is not None:
+            B = total_duration.shape[0]
+        elif batch_size is not None:
+            B = batch_size
         else:
             B = 1
 
@@ -149,7 +124,17 @@ class MotionHistoryEncoder(nn.Module):
         if text is None:
             text_embeddings = self.null_text_embedding.expand(B, -1)
         else:
-            text_embeddings = self._encode_text(text, B)
+            # Handle broadcasting if text is (1, D) but B > 1
+            if text.shape[0] != B:
+                if text.shape[0] == 1:
+                    text_embeddings = text.expand(B, -1)
+                else:
+                    raise ValueError(
+                        f"Batch mismatch: text tensor({text.shape[0]}) vs batch({B})"
+                    )
+            else:
+                text_embeddings = text
+
         text_projected: torch.Tensor = self.text_projection(text_embeddings)
 
         # 3) Handle optional motion features (Null-token if none)
@@ -164,19 +149,18 @@ class MotionHistoryEncoder(nn.Module):
             text_projected.unsqueeze(1)
             .unsqueeze(2)
             .expand(B, T_hist, self.joint_count, -1)
-        )
+        )  # (B, T_hist, 22, text_projection_dim)
 
         # 4) Handle duration conditioning (Null-token if none)
-        if total_duration is None:
-            duration_expanded = self.null_duration.expand(
-                B, T_hist, self.joint_count, 1
-            )
-        else:
-            duration_expanded = (
-                total_duration.unsqueeze(1)
-                .unsqueeze(2)
-                .expand(B, T_hist, self.joint_count, 1)
-            )
+        # if total_duration is None:
+        #     duration_expanded = self.null_duration.expand(
+        #         B, T_hist, self.joint_count, 1
+        #     )
+        # else:
+        #     # total_duration is (B, 1), expand to (B, T_hist, joint_count, 1)
+        #     duration_expanded = total_duration.view(B, 1, 1, 1).expand(
+        #         B, T_hist, self.joint_count, 1
+        #     )
 
         # 3) Extract motion features (263D Standard Layout)
         # - RIC position (Indices 4:67 for 21 joints)
@@ -203,7 +187,7 @@ class MotionHistoryEncoder(nn.Module):
                 ric_joints,
                 ric_vel,
                 global_features,
-                duration_expanded,
+                # duration_expanded,
                 text_projected_expanded,
             ],
             dim=-1,
@@ -295,18 +279,27 @@ class FlowMatchingPredictor(nn.Module):
         model_dim: int = 64,
         num_layers: int = 2,
         joint_count: int = 22,
+        time_embed_dim: int = 64,
     ) -> None:
         super().__init__()
         self.model_dim = model_dim
         self.num_layers = num_layers
         self.joint_count = joint_count
+        self.time_embed_dim = time_embed_dim
 
         # Hierarchical Kinematic Encoder
         self.kinematic_encoder = KinematicChainEncoder(model_dim)
 
-        # Fuse condition (history) + spatial data (pos/rot/diffs) + noisy state + progress + noise time
-        # Dim: history(32) + pos(3) + rot(6) + diffs(3) + noisy(3) + progress(1) + t(1) = 49
-        self.input_proj = nn.Linear(per_joint_dim + 3 + 6 + 3 + 3 + 1 + 1, model_dim)
+        # Sinusoidal time embedding for noise_level (flow time t)
+        self.time_embed = nn.Sequential(
+            nn.Linear(time_embed_dim, model_dim),
+            nn.SiLU(),
+            nn.Linear(model_dim, model_dim),
+        )
+
+        # Fuse condition (history) + spatial data (pos/rot/diffs) + noisy state
+        # Dim: history(32) + pos(3) + rot(6) + diffs(3) + noisy(3) = 47
+        self.input_proj = nn.Linear(per_joint_dim + 3 + 6 + 3 + 3, model_dim)
 
         # Spatial transformer (22 joints) - ARFM core
         encoder_layer = nn.TransformerEncoderLayer(
@@ -331,11 +324,42 @@ class FlowMatchingPredictor(nn.Module):
         self.null_prev_frame = nn.Parameter(torch.zeros(1, 22, 12))
         self.null_progress = nn.Parameter(torch.zeros(1, 1, 1))
 
+    def _sinusoidal_time_embedding(
+        self, t: torch.Tensor, max_positions=10000
+    ) -> torch.Tensor:
+        """
+        Compute sinusoidal time embedding for flow time t.
+
+        Args:
+            t: (B,) tensor of time values in [0, 1]
+
+        Returns:
+            (B, time_embed_dim) tensor of sinusoidal embeddings
+        """
+        half_dim = self.time_embed_dim // 2
+        # Compute frequencies: exp(log(10000) * (2i / d))
+        freqs = torch.exp(
+            -torch.log(torch.tensor(max_positions))
+            / (half_dim - 1)
+            * torch.arange(half_dim, device=t.device)
+        )
+        # t: (B,) -> (B, half_dim)
+        args = t.unsqueeze(-1) * freqs.unsqueeze(0)  # (B, half_dim)
+        # Sin/cos embedding
+        emb = torch.cat(
+            [torch.sin(args), torch.cos(args)], dim=-1
+        )  # (B, time_embed_dim)
+
+        if self.time_embed_dim % 2 != 0:
+            emb = nn.functional.pad(emb, (0, 1), mode="constant")
+
+        return emb
+
     def forward(
         self,
         history_features: torch.Tensor,
         noise_level: torch.Tensor,
-        noisy_target_diffs: Optional[torch.Tensor] = None,
+        noisy_target: Optional[torch.Tensor] = None,
         prev_frame_features: Optional[torch.Tensor] = None,
         temporal_progress: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -352,42 +376,60 @@ class FlowMatchingPredictor(nn.Module):
         """
         B, joint_count, _ = history_features.shape
 
+        assert (
+            B == noise_level.shape[0]
+        ), f"noise level {noise_level.shape} does not match batch size {B}"
+        if temporal_progress is not None:
+            assert (
+                B == temporal_progress.shape[0]
+            ), f"temporal progress {temporal_progress.shape} does not match batch size {B}"
+        if prev_frame_features is not None:
+            assert (
+                B == prev_frame_features.shape[0]
+            ), f"prev frame features {prev_frame_features.shape} does not match batch size {B}"
+        if noisy_target is not None:
+            assert (
+                B == noisy_target.shape[0]
+            ), f"noisy target diffs {noisy_target.shape} does not match batch size {B}"
+
         # 1) Handle noisy state x_t (Sample if None for zero-shot inference)
-        if noisy_target_diffs is None:
-            noisy_target_diffs = torch.randn(
+        if noisy_target is None:
+            noisy_target = torch.randn(
                 (B, joint_count, 3), device=history_features.device
             )
 
         # 2) Handle temporal progress (Optional: use learned null token)
-        if temporal_progress is None:
-            p = self.null_progress.expand(B, joint_count, 1)
-        else:
-            p = temporal_progress.view(B, 1, 1).expand(B, joint_count, 1)
+        # if temporal_progress is None:
+        #     p = self.null_progress.expand(B, joint_count, 1)
+        # else:
+        #     p = temporal_progress.reshape(B, 1, 1).expand(B, joint_count, 1)
 
         # 3) Handle previous frame context (Optional: use learned null token)
         if prev_frame_features is None:
             prev_frame_features = self.null_prev_frame.expand(B, joint_count, 12)
 
         # 4) Construct concatenated conditioning vector
-        # Sequence: history(32) + spatial(12) + noisy(3) + progress(1) + time(1) = 49
+        # Sequence: history(32) + spatial(12) + noisy(3) = 47
         x = torch.cat(
-            [history_features, prev_frame_features, noisy_target_diffs], dim=-1
+            [history_features, prev_frame_features, noisy_target], dim=-1
         )  # [B, 22, 47]
 
-        t = noise_level.view(B, 1, 1).expand(B, joint_count, 1)
-        cond = torch.cat([x, p, t], dim=-1)  # [B, 22, 49]
+        x = self.input_proj(x)  # [B, 22, model_dim]
 
-        x = self.input_proj(cond)  # [B, 22, model_dim]
+        # 5) Compute sinusoidal time embedding and add as bias (like kinematic bias)
+        time_embed = self._sinusoidal_time_embedding(noise_level)  # (B, time_embed_dim)
+        time_bias = self.time_embed(time_embed)  # (B, model_dim)
+        x = x + time_bias.unsqueeze(1)  # [B, 22, model_dim]
 
-        # Add learnable kinematic hierarchical bias
+        # 6) Add learnable kinematic hierarchical bias
         joint_ids = torch.arange(joint_count, device=x.device)
         kinematic_bias = self.kinematic_encoder(joint_ids)  # [22, model_dim]
         x = x + kinematic_bias.unsqueeze(0)  # [B, 22, model_dim]
 
-        # Spatial attention across all 22 joints
+        # 7) Spatial attention across all 22 joints
         x = self.spatial_transformer(x)  # [B, 22, model_dim]
 
-        # Predict noise to subtract
+        # 8) Predict noise to subtract
         pred_noise: torch.Tensor = self.noise_pred(x)  # [B, 22, 3]
 
         return pred_noise
@@ -408,82 +450,209 @@ class HumanMotionGenerator(nn.Module):
         self.encoder = encoder
         self.predictor = predictor
 
-    def generate(
+    """
+    Updated generate_sequence() methods for HumanMotionGenerator class
+    Returns GLOBAL JOINT POSITIONS instead of feature vectors
+
+    Add these methods to the HumanMotionGenerator class in models.py
+    """
+
+    def generate_sequence(
         self,
         text: Union[str, List[str], torch.Tensor],
+        num_frames: int = 200,
         num_steps: int = 10,
         guidance_scale: float = 2.5,
         input_features: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
-        prev_frame_features: Optional[torch.Tensor] = None,
-        temporal_progress: Optional[torch.Tensor] = None,
+        dataset_type: str = "t2m",
     ) -> torch.Tensor:
         """
-        Iterative generation loop (Inference).
-        Refines noise into clean motion features for the next frame(s).
+        Generate n consecutive animation frames where each frame feeds into the next iteration.
+        Uses torch-based incremental feature extraction.
 
-        Args:
-            text:           Text prompt or pre-encoded CLIP embedding
-            num_steps:      Number of integration steps (t=0 to t=1)
-            guidance_scale: CFG scale (1.0 = no guidance, >1.0 = stronger text adherence)
-            input_features: (B, T_hist, 263) - Optional history
-            ...
+        Returns:
+            joint_positions: (B, num_frames, 22, 3) - Global joint positions
         """
+
         self.eval()
         with torch.no_grad():
-            if isinstance(text, list):
-                B = len(text)
-            elif isinstance(text, torch.Tensor):
+            if isinstance(text, torch.Tensor):
                 B = text.shape[0]
             else:
                 B = 1
             device = next(self.parameters()).device
 
-            # 1. Encode Context once per frame-generation step
-            # For CFG, we encode both:
-            # - Conditional: using the provided text
-            # - Unconditional: using None (which triggers null_text_embedding)
-            context_cond = self.encoder(
-                text=text, input_features=input_features, total_duration=total_duration
+            T_hist = 15
+
+            # Initialize history
+            if input_features is None:
+                history = self.encoder.null_history.expand(B, T_hist, -1).clone()
+            else:
+                if input_features.shape[1] >= T_hist:
+                    history = input_features[:, -T_hist:, :]
+                else:
+                    pad_size = T_hist - input_features.shape[1]
+                    null_pad = self.encoder.null_history.expand(B, pad_size, -1).clone()
+                    history = torch.cat([null_pad, input_features], dim=1)
+
+            # Initialize incremental feature extractor
+            config = get_dataset_config(dataset_type)
+            extractor = IncrementalFeatureExtractor(
+                n_raw_offsets=config["raw_offsets"],
+                kinematic_chain=config["kinematic_chain"],
+                face_joint_indx=config["face_joint_indx"],
+                fid_r=config["fid_r"],
+                fid_l=config["fid_l"],
+                feet_thre=0.002,
+                device=device,
             )
 
-            # Unconditional branch: maintains temporal context but drops text
-            context_uncond = self.encoder(
-                text=None, input_features=input_features, total_duration=total_duration
-            )
+            joint_sequence = []
 
-            # 2. Initialize noisy state x_0 (Pure Gaussian Noise)
-            # Shape: (B, 22, 3) - predicting the next displacement/delta
-            x_t = torch.randn((B, 22, 3), device=device)
+            # Extract initial global joint positions
+            init_frame = history[:, -1, :]  # (B, 263)
+            current_joints_global = feature_to_joints(
+                init_frame, dataset_type=dataset_type
+            )  # (B, 22, 3)
 
-            # 3. Iterative Refinement (Euler ODE Solver with CFG)
-            dt = 1.0 / num_steps
-            for step in range(num_steps):
-                # t goes from 0 to 1
-                t = torch.full((B,), step * dt, device=device)
+            # Initialize extractor with first frame
+            extractor.initialize(current_joints_global)
 
-                # Conditional velocity
-                v_cond = self.predictor(
-                    history_features=context_cond,
-                    noise_level=t,
-                    noisy_target_diffs=x_t,
-                    prev_frame_features=prev_frame_features,
-                    temporal_progress=temporal_progress,
+            for frame_idx in range(num_frames):
+                t_prog = torch.full((B,), frame_idx / num_frames, device=device)
+
+                # Encode context
+                context_cond = self.encoder(
+                    batch_size=B,
+                    text=text,
+                    input_features=history,
+                    total_duration=total_duration,
                 )
 
-                # Unconditional velocity
-                v_uncond = self.predictor(
-                    history_features=context_uncond,
-                    noise_level=t,
-                    noisy_target_diffs=x_t,
-                    prev_frame_features=prev_frame_features,
-                    temporal_progress=temporal_progress,
+                context_uncond = self.encoder(
+                    batch_size=B,
+                    text=None,
+                    input_features=history,
+                    total_duration=total_duration,
                 )
 
-                # CFG Interpolation: v = v_uncond + s * (v_cond - v_uncond)
-                v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
+                # Extract previous frame features
+                last_frame = history[:, -1, :]
+                ric_pos_21 = last_frame[:, 4:67].reshape(B, 21, 3)
+                root_pos = torch.zeros((B, 1, 3), device=device, dtype=last_frame.dtype)
+                prev_pos_ric = torch.cat([root_pos, ric_pos_21], dim=1)
 
-                # Euler step: x_{t+dt} = x_t + v_t * dt
-                x_t = x_t + v_t * dt
+                prev_rot6d = last_frame[:, 67:193].reshape(B, 21, 6)
+                root_rot = torch.zeros((B, 1, 6), device=device, dtype=last_frame.dtype)
+                root_rot[:, 0, 0] = 1.0
+                root_rot[:, 0, 4] = 1.0
+                prev_rot6d = torch.cat([root_rot, prev_rot6d], dim=1)
 
-            return x_t
+                prev_v = last_frame[:, 193:259].reshape(B, 22, 3)
+                prev_frame_features = torch.cat(
+                    [prev_pos_ric, prev_rot6d, prev_v], dim=-1
+                )
+
+                # Generate displacement
+                x_t = torch.randn((B, 22, 3), device=device)
+                dt = 1.0 / num_steps
+
+                for step in range(num_steps):
+                    t = torch.full((B,), step * dt, device=device)
+
+                    v_cond = self.predictor(
+                        history_features=context_cond,
+                        noise_level=t,
+                        noisy_target_diffs=x_t,
+                        prev_frame_features=prev_frame_features,
+                        temporal_progress=t_prog,
+                    )
+
+                    v_uncond = self.predictor(
+                        history_features=context_uncond,
+                        noise_level=t,
+                        noisy_target_diffs=x_t,
+                        prev_frame_features=prev_frame_features,
+                        temporal_progress=t_prog,
+                    )
+
+                    v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
+                    x_t = x_t + v_t * dt
+
+                # Update global joint positions
+                new_joints_global = current_joints_global + x_t
+                current_joints_global = new_joints_global.clone()
+
+                # Collect joint positions
+                joint_sequence.append(new_joints_global.cpu())
+
+                # EFFICIENT: Use torch-based incremental feature extraction
+                # Input: (B, 22, 3) torch tensor
+                # Output: (B, 263) torch tensor
+                new_frame_features = extractor.process_frame(
+                    new_joints_global
+                )  # Already on device
+
+                # Update history
+                history = torch.cat(
+                    [history[:, 1:, :], new_frame_features.unsqueeze(1)], dim=1
+                )
+
+                if (frame_idx + 1) % 50 == 0:
+                    print(f"Generated {frame_idx + 1}/{num_frames} frames")
+
+            # Stack all joint positions
+            joint_positions = torch.stack(joint_sequence, dim=1).to(
+                device
+            )  # (B, num_frames, 22, 3)
+
+            return joint_positions
+
+    @classmethod
+    def load_from_checkpoint(
+        cls, checkpoint_path: Union[str, Path], config: Config, device: str = "cpu"
+    ) -> "HumanMotionGenerator":
+        """
+        Load the generator from a checkpoint file.
+        Prefers EMA weights if available.
+        """
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # Initialize Encoders/Predictors from Config
+        encoder = MotionHistoryEncoder(
+            frame_feature_dim=config.motion_dim,
+            text_embedding_dim=config.text_embedding_dim,
+            joint_feature_projection_dim=config.joint_feature_projection_dim,
+            text_projection_dim=config.text_projection_dim,
+            per_joint_out_dim=config.per_joint_out_dim,
+            joint_count=config.num_joints,
+            model_dim=config.model_dim,
+            num_layers=config.num_encoder_layers,
+            bidirectional=config.bidirectional_gru,
+        )
+
+        predictor = FlowMatchingPredictor(
+            per_joint_dim=config.per_joint_out_dim,
+            model_dim=config.model_dim,
+            num_layers=config.num_flow_layers,
+            joint_count=config.num_joints,
+        )
+
+        # Load weights (Prefer EMA)
+        if "ema_mhe" in checkpoint and "ema_fmp" in checkpoint:
+            print("Loading EMA weights for generation...")
+            encoder.load_state_dict(checkpoint["ema_mhe"])
+            predictor.load_state_dict(checkpoint["ema_fmp"])
+        else:
+            print("Loading standard weights (EMA not found)...")
+            encoder.load_state_dict(checkpoint["motion_history_encoder"])
+            predictor.load_state_dict(checkpoint["flow_predictor"])
+
+        encoder.to(device)
+        predictor.to(device)
+        encoder.eval()
+        predictor.eval()
+
+        return cls(encoder, predictor)

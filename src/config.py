@@ -43,7 +43,7 @@ class Config:
 
     # Dataset configuration
     dataset_name: str = "t2m"  # "t2m" for HumanML3D
-    unit_length: int = 4
+    unit_length: int = 5
 
     # Model architecture - MotionHistoryEncoder (Dual-MLP)
     text_embedding_dim: int = 512  # CLIP embedding size
@@ -62,9 +62,9 @@ class Config:
     num_heads: int = 4  # Attention heads in spatial transformer
 
     # Training settings
-    batch_size: int = 128
+    batch_size: int = 200
     learning_rate: float = 1e-4
-    num_epochs: int = 100
+    num_epochs: int = 200
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
 
@@ -82,7 +82,7 @@ class Config:
     guidance_scale: float = 1.0  # For classifier-free guidance (if used)
 
     # Data loading
-    num_workers: int = 4
+    num_workers: int = 0
     pin_memory: bool = True
 
     # Logging and checkpointing
