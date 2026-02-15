@@ -16,7 +16,8 @@ from typing import Optional, List, Tuple, Union, Callable, Any
 from config import Config
 
 from utils.motion_utils import (
-    feature_to_joints,
+    features_to_positions,
+    preprocess_sequence,
     get_dataset_config,
     IncrementalFeatureExtractor,
 )
@@ -497,13 +498,8 @@ class HumanMotionGenerator(nn.Module):
                     history = torch.cat([null_pad, input_features], dim=1)
 
             # Initialize incremental feature extractor
-            config = get_dataset_config(dataset_type)
             extractor = IncrementalFeatureExtractor(
-                n_raw_offsets=config["raw_offsets"],
-                kinematic_chain=config["kinematic_chain"],
-                face_joint_indx=config["face_joint_indx"],
-                fid_r=config["fid_r"],
-                fid_l=config["fid_l"],
+                dataset_type=dataset_type,
                 feet_thre=0.002,
                 device=device,
             )
@@ -512,7 +508,7 @@ class HumanMotionGenerator(nn.Module):
 
             # Extract initial global joint positions
             init_frame = history[:, -1, :]  # (B, 263)
-            current_joints_global = feature_to_joints(
+            current_joints_global = features_to_positions(
                 init_frame, dataset_type=dataset_type
             )  # (B, 22, 3)
 

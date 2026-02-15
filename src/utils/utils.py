@@ -21,11 +21,10 @@ from .dataset import (
 from .motion_utils import (
     DATASET_CONFIGS,
     get_dataset_config,
-    feature_to_joints,
-    joints_to_feature,
-    extract_features,
-    get_feature_vec_subset,
-    recover_from_ric,
+    features_to_positions,
+    preprocess_sequence,
+    get_feature_subset,
+    IncrementalFeatureExtractor,
 )
 
 # Visualization
@@ -56,11 +55,9 @@ __all__ = [
     # Motion Processing
     "DATASET_CONFIGS",
     "get_dataset_config",
-    "feature_to_joints",
-    "joints_to_feature",
-    "extract_features",
-    "get_feature_vec_subset",
-    "recover_from_ric",
+    "features_to_positions",
+    "preprocess_sequence",
+    "get_feature_subset",
     "IncrementalFeatureExtractor",
     # Visualization
     "plot_3d_motion",

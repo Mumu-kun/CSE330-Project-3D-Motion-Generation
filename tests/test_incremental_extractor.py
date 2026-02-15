@@ -1,12 +1,10 @@
 """
-Test for IncrementalFeatureExtractor.
+Test for new 271D feature extraction and IncrementalFeatureExtractor.
 
-Compares the output of IncrementalFeatureExtractor against pre-extracted
-feature vectors from the HumanML3D dataset.
-
-Sample data:
-- sample_data/000000_joint.npy: (Nframe, 22, 3) global joint positions
-- sample_data/000000_vec.npy: (Nframe, 263) expected feature vectors
+Tests:
+1. preprocess_sequence() - full sequence extraction
+2. features_to_positions() - reconstruction
+3. IncrementalFeatureExtractor - frame-by-frame extraction
 """
 
 import sys
@@ -15,22 +13,77 @@ from pathlib import Path
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
 
-import numpy as np
 import torch
 from utils.motion_utils import (
     IncrementalFeatureExtractor,
     get_dataset_config,
-    extract_features,
+    preprocess_sequence,
+    features_to_positions,
+    FEATURE_SLICES,
 )
 
 
-def test_incremental_extractor():
-    """
-    Test IncrementalFeatureExtractor against pre-extracted features.
+def test_preprocess_sequence():
+    """Test preprocess_sequence() for dataset preprocessing."""
+    print("\n" + "=" * 60)
+    print("Testing preprocess_sequence()")
+    print("=" * 60)
 
-    The pre-extracted features were computed using extract_features() which
-    uses full sequence IK. We compare against incremental extraction.
-    """
+    # Load sample data
+    data_dir = Path(__file__).parent.parent / "sample_data"
+    joint_path = data_dir / "000000_joint.npy"
+
+    if not joint_path.exists():
+        print(f"[ERROR] Sample data not found: {joint_path}")
+        return
+
+    import numpy as np
+
+    joints_np = np.load(joint_path)  # (Nframe, 22, 3)
+    joints = torch.from_numpy(joints_np).float()
+    print(f"\nLoaded joints shape: {joints.shape}")
+
+    # Extract features using new API
+    features = preprocess_sequence(
+        positions=joints,
+        dataset_type="t2m",
+    )
+
+    print(f"Extracted features shape: {features.shape}")
+    print(f"Expected: ({joints.shape[0]}, 271)")
+
+    # Verify feature slices
+    print("\nFeature slice verification:")
+    for name, sl in FEATURE_SLICES.items():
+        feat = features[:, sl]
+        print(
+            f"  {name}: shape {feat.shape}, mean={feat.mean():.6f}, std={feat.std():.6f}"
+        )
+
+    # Test reconstruction
+    print("\n--- Testing Reconstruction ---")
+
+    # Direct RIC transform
+    positions_direct = features_to_positions(features, dataset_type="t2m")
+    print(f"Reconstructed positions: {positions_direct.shape}")
+
+    # Compare with original
+    diff = torch.abs(positions_direct - joints)
+    mean_diff = torch.mean(diff).item()
+    max_diff = torch.max(diff).item()
+    print(f"  Mean absolute diff: {mean_diff:.6f}")
+    print(f"  Max absolute diff: {max_diff:.6f}")
+
+    if mean_diff < 1e-5:
+        print("  [PASS] Reconstruction matches original!")
+    else:
+        print("  [WARN] Reconstruction has differences")
+
+    print("\n" + "=" * 60)
+
+
+def test_incremental_extractor():
+    """Test IncrementalFeatureExtractor for frame-by-frame extraction."""
     print("\n" + "=" * 60)
     print("Testing IncrementalFeatureExtractor")
     print("=" * 60)
@@ -38,100 +91,20 @@ def test_incremental_extractor():
     # Load sample data
     data_dir = Path(__file__).parent.parent / "sample_data"
     joint_path = data_dir / "000000_joint.npy"
-    vec_path = data_dir / "000000_vec.npy"
 
-    if not joint_path.exists() or not vec_path.exists():
-        print(f"[ERROR] Sample data not found:")
-        print(f"   Joint file exists: {joint_path.exists()}")
-        print(f"   Vec file exists: {vec_path.exists()}")
+    if not joint_path.exists():
+        print(f"[ERROR] Sample data not found: {joint_path}")
         return
 
-    joints = np.load(joint_path)  # (Nframe, 22, 3)
-    expected_vec = np.load(vec_path)  # (Nframe, 263)
+    import numpy as np
 
-    print(f"\nLoaded data:")
-    print(f"  Joints shape: {joints.shape}")
-    print(f"  Expected features shape: {expected_vec.shape}")
+    joints_np = np.load(joint_path)  # (Nframe, 22, 3)
+    joints = torch.from_numpy(joints_np).float()
+    print(f"\nLoaded joints shape: {joints.shape}")
 
-    # Get dataset config
-    config = get_dataset_config("t2m")
-
-    # =========================================================================
-    # Test 1: Compare against extract_features (full sequence)
-    # =========================================================================
-    print("\n--- Test 1: Full sequence extraction comparison ---")
-
-    # Extract features using the original function
-    extracted_features = extract_features(
-        positions=joints,
-        feet_thre=0.002,
-        n_raw_offsets=config["raw_offsets"],
-        kinematic_chain=config["kinematic_chain"],
-        face_joint_indx=config["face_joint_indx"],
-        fid_r=config["fid_r"],
-        fid_l=config["fid_l"],
-    )
-
-    print(f"  extract_features output shape: {extracted_features.shape}")
-    print(f"  Expected features shape: {expected_vec.shape}")
-
-    # Note: extract_features returns (Nframe-1, 263) due to velocity calculation
-    print(
-        f"\n  Note: extract_features produces Nframe-1 features due to velocity calculation"
-    )
-
-    # Compare with expected - need to handle shape mismatch
-    min_len = min(extracted_features.shape[0], expected_vec.shape[0])
-
-    diff = np.abs(extracted_features[:min_len] - expected_vec[:min_len])
-    mean_diff = np.mean(diff)
-    max_diff = np.max(diff)
-
-    print(f"\n  Comparison (first {min_len} frames):")
-    print(f"    Mean absolute diff: {mean_diff:.6f}")
-    print(f"    Max absolute diff: {max_diff:.6f}")
-
-    # Check if they match (allowing small numerical tolerance)
-    if mean_diff < 1e-5:
-        print(f"    [PASS] extract_features matches expected features!")
-    else:
-        print(f"    [WARN] extract_features differs from expected features")
-
-        # Show per-feature breakdown
-        feature_names = [
-            "root (0:4)",
-            "RIC (4:67)",
-            "rot (67:193)",
-            "vel (193:259)",
-            "foot (259:263)",
-        ]
-        feature_slices = [
-            slice(0, 4),
-            slice(4, 67),
-            slice(67, 193),
-            slice(193, 259),
-            slice(259, 263),
-        ]
-
-        print("\n  Per-feature breakdown:")
-        for name, sl in zip(feature_names, feature_slices):
-            feat_diff = np.mean(
-                np.abs(extracted_features[:min_len, sl] - expected_vec[:min_len, sl])
-            )
-            print(f"    {name}: mean diff = {feat_diff:.6f}")
-
-    # =========================================================================
-    # Test 2: IncrementalFeatureExtractor
-    # =========================================================================
-    print("\n--- Test 2: IncrementalFeatureExtractor comparison ---")
-
-    # Create incremental extractor
+    # Create incremental extractor with new API (dataset_type instead of individual params)
     extractor = IncrementalFeatureExtractor(
-        n_raw_offsets=config["raw_offsets"],
-        kinematic_chain=config["kinematic_chain"],
-        face_joint_indx=config["face_joint_indx"],
-        fid_r=config["fid_r"],
-        fid_l=config["fid_l"],
+        dataset_type="t2m",
         feet_thre=0.002,
         device=torch.device("cpu"),
         dtype=torch.float32,
@@ -141,102 +114,94 @@ def test_incremental_extractor():
     n_frames = joints.shape[0]
     incremental_features = []
 
-    # Convert to torch tensor with batch dimension
-    joints_torch = torch.from_numpy(joints).float()  # (Nframe, 22, 3)
-
     for i in range(n_frames):
-        frame = joints_torch[i : i + 1]  # (1, 22, 3) - keep batch dim
-        features = extractor.process_frame(frame)  # (1, 263)
-        incremental_features.append(features.detach().numpy())
+        frame = joints[i : i + 1]  # (1, 22, 3)
+        features = extractor.process_frame(frame)
+        incremental_features.append(features)
 
-    incremental_features = np.concatenate(incremental_features, axis=0)  # (Nframe, 263)
+    incremental_features = torch.cat(incremental_features, dim=0)
 
-    print(f"  Incremental features shape: {incremental_features.shape}")
-    print(f"  Expected features shape: {expected_vec.shape}")
+    print(f"Incremental features shape: {incremental_features.shape}")
 
-    # First frame should be zeros (no previous frame for velocity)
-    print(f"\n  First frame (should be zeros):")
-    print(f"    Mean: {np.mean(np.abs(incremental_features[0])):.6f}")
-    print(f"    Max: {np.max(np.abs(incremental_features[0])):.6f}")
+    # First frame should be zeros
+    print(f"\nFirst frame (should be zeros):")
+    print(f"  Mean: {torch.mean(torch.abs(incremental_features[0])).item():.6f}")
+    print(f"  Max: {torch.max(torch.abs(incremental_features[0])).item():.6f}")
 
-    # Compare frames 1: with expected (skip first frame)
-    # Incremental produces Nframe features, expected has Nframe
-    # Compare incremental[1:] with expected[1:] or expected[:-1]
+    # Compare with full sequence extraction
+    full_features = preprocess_sequence(joints, dataset_type="t2m")
 
-    # Try both comparisons
-    print(f"\n  Comparison attempts:")
+    # Skip first frame for comparison
+    diff = torch.abs(incremental_features[1:] - full_features[1:])
+    mean_diff = torch.mean(diff).item()
+    max_diff = torch.max(diff).item()
 
-    # Option A: incremental[1:] vs expected[:-1] (both have Nframe-1 elements)
-    if incremental_features.shape[0] - 1 == expected_vec.shape[0] - 1:
-        inc_from_frame_1 = incremental_features[1:]
-        exp_except_last = expected_vec[:-1]
-        diff_a = np.abs(inc_from_frame_1 - exp_except_last)
-        mean_diff_a = np.mean(diff_a)
-        print(
-            f"    Option A (incremental[1:] vs expected[:-1]): mean diff = {mean_diff_a:.6f}"
-        )
+    print(f"\nComparison (incremental vs full, skipping first frame):")
+    print(f"  Mean absolute diff: {mean_diff:.6f}")
+    print(f"  Max absolute diff: {max_diff:.6f}")
 
-    # Option B: incremental[1:] vs expected[1:]
-    inc_from_frame_1 = incremental_features[1:]
-    exp_from_frame_1 = expected_vec[1:]
-    diff_b = np.abs(inc_from_frame_1 - exp_from_frame_1)
-    mean_diff_b = np.mean(diff_b)
-    print(
-        f"    Option B (incremental[1:] vs expected[1:]): mean diff = {mean_diff_b:.6f}"
-    )
-
-    # Per-feature breakdown for Option B
-    feature_names = [
-        "root (0:4)",
-        "RIC (4:67)",
-        "rot (67:193)",
-        "vel (193:259)",
-        "foot (259:263)",
-    ]
-    feature_slices = [
-        slice(0, 4),
-        slice(4, 67),
-        slice(67, 193),
-        slice(193, 259),
-        slice(259, 263),
-    ]
-
-    print("\n  Per-feature breakdown (Option B):")
-    for name, sl in zip(feature_names, feature_slices):
-        feat_diff = np.mean(np.abs(inc_from_frame_1[:, sl] - exp_from_frame_1[:, sl]))
-        print(f"    {name}: mean diff = {feat_diff:.6f}")
-
-    if mean_diff_b < 0.1:  # Allow larger tolerance for incremental
-        print(f"\n  [PASS] IncrementalFeatureExtractor produces similar results!")
+    if mean_diff < 1e-5:
+        print("  [PASS] Incremental matches full extraction!")
     else:
-        print(f"\n  [WARN] IncrementalFeatureExtractor has significant differences")
-        print(f"     This may be expected due to simplified IK in incremental mode")
-
-    # =========================================================================
-    # Test 3: Compare incremental vs full extraction
-    # =========================================================================
-    print("\n--- Test 3: Incremental vs Full extraction ---")
-
-    if extracted_features.shape[0] == incremental_features.shape[0] - 1:
-        diff = np.abs(extracted_features - incremental_features[1:])
-        mean_diff = np.mean(diff)
-        max_diff = np.max(diff)
-
-        print(f"  Mean absolute diff: {mean_diff:.6f}")
-        print(f"  Max absolute diff: {max_diff:.6f}")
+        print("  [WARN] Incremental has differences from full extraction")
 
         # Per-feature breakdown
         print("\n  Per-feature breakdown:")
-        for name, sl in zip(feature_names, feature_slices):
-            feat_diff = np.mean(
-                np.abs(extracted_features[:, sl] - incremental_features[1:, sl])
-            )
+        for name, sl in FEATURE_SLICES.items():
+            feat_diff = torch.mean(
+                torch.abs(incremental_features[1:, sl] - full_features[1:, sl])
+            ).item()
             print(f"    {name}: mean diff = {feat_diff:.6f}")
 
     print("\n" + "=" * 60)
-    print("Test complete")
+
+
+def test_round_trip():
+    """Test round-trip: positions -> features -> positions."""
+    print("\n" + "=" * 60)
+    print("Testing Round-Trip Conversion")
     print("=" * 60)
+
+    # Load sample data
+    data_dir = Path(__file__).parent.parent / "sample_data"
+    joint_path = data_dir / "000000_joint.npy"
+
+    if not joint_path.exists():
+        print(f"[ERROR] Sample data not found: {joint_path}")
+        return
+
+    import numpy as np
+
+    joints_np = np.load(joint_path)
+    joints = torch.from_numpy(joints_np).float()
+    print(f"\nOriginal joints shape: {joints.shape}")
+
+    # Extract features
+    features = preprocess_sequence(joints, dataset_type="t2m")
+    print(f"Features shape: {features.shape}")
+
+    # Reconstruct positions
+    reconstructed = features_to_positions(features, dataset_type="t2m")
+
+    print(f"Reconstructed shape: {reconstructed.shape}")
+
+    # Compare
+    diff = torch.abs(reconstructed - joints)
+    print(f"\nRound-trip error:")
+    print(f"  Mean: {torch.mean(diff).item():.6f}")
+    print(f"  Max: {torch.max(diff).item():.6f}")
+    print(f"  Per-joint mean error: {torch.mean(diff, dim=(0, 2))}")
+
+    if torch.mean(diff).item() < 1e-5:
+        print("\n  [PASS] Round-trip successful!")
+    else:
+        print("\n  [WARN] Round-trip has errors")
+
+    print("\n" + "=" * 60)
 
 
 if __name__ == "__main__":
+    test_preprocess_sequence()
     test_incremental_extractor()
+    test_round_trip()
+    print("\nAll tests complete!")

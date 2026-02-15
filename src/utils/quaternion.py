@@ -358,6 +358,120 @@ def cont6d_to_matrix_np(cont6d):
     return cont6d_to_matrix(q).numpy()
 
 
+def matrix_to_quaternion(rotation_matrix):
+    """
+    Convert rotation matrices to quaternions.
+
+    Args:
+        rotation_matrix: Rotation matrices (..., 3, 3)
+
+    Returns:
+        Quaternions (..., 4) with real part first
+    """
+    batch_shape = rotation_matrix.shape[:-2]
+    rotation_matrix = rotation_matrix.reshape(-1, 3, 3)
+
+    batch_size = rotation_matrix.shape[0]
+    q = torch.zeros(
+        batch_size, 4, device=rotation_matrix.device, dtype=rotation_matrix.dtype
+    )
+
+    trace = (
+        rotation_matrix[:, 0, 0] + rotation_matrix[:, 1, 1] + rotation_matrix[:, 2, 2]
+    )
+
+    # Case 1: trace > 0
+    mask1 = trace > 0
+    s1 = torch.sqrt(trace[mask1] + 1.0) * 2
+    q[mask1, 0] = 0.25 * s1
+    q[mask1, 1] = (rotation_matrix[mask1, 2, 1] - rotation_matrix[mask1, 1, 2]) / s1
+    q[mask1, 2] = (rotation_matrix[mask1, 0, 2] - rotation_matrix[mask1, 2, 0]) / s1
+    q[mask1, 3] = (rotation_matrix[mask1, 1, 0] - rotation_matrix[mask1, 0, 1]) / s1
+
+    # Case 2: (R00 > R11) and (R00 > R22)
+    mask2 = (
+        (~mask1)
+        & (rotation_matrix[:, 0, 0] > rotation_matrix[:, 1, 1])
+        & (rotation_matrix[:, 0, 0] > rotation_matrix[:, 2, 2])
+    )
+    s2 = (
+        torch.sqrt(
+            1.0
+            + rotation_matrix[mask2, 0, 0]
+            - rotation_matrix[mask2, 1, 1]
+            - rotation_matrix[mask2, 2, 2]
+        )
+        * 2
+    )
+    q[mask2, 0] = (rotation_matrix[mask2, 2, 1] - rotation_matrix[mask2, 1, 2]) / s2
+    q[mask2, 1] = 0.25 * s2
+    q[mask2, 2] = (rotation_matrix[mask2, 0, 1] + rotation_matrix[mask2, 1, 0]) / s2
+    q[mask2, 3] = (rotation_matrix[mask2, 0, 2] + rotation_matrix[mask2, 2, 0]) / s2
+
+    # Case 3: R11 > R22
+    mask3 = (~mask1) & (~mask2) & (rotation_matrix[:, 1, 1] > rotation_matrix[:, 2, 2])
+    s3 = (
+        torch.sqrt(
+            1.0
+            + rotation_matrix[mask3, 1, 1]
+            - rotation_matrix[mask3, 0, 0]
+            - rotation_matrix[mask3, 2, 2]
+        )
+        * 2
+    )
+    q[mask3, 0] = (rotation_matrix[mask3, 0, 2] - rotation_matrix[mask3, 2, 0]) / s3
+    q[mask3, 1] = (rotation_matrix[mask3, 0, 1] + rotation_matrix[mask3, 1, 0]) / s3
+    q[mask3, 2] = 0.25 * s3
+    q[mask3, 3] = (rotation_matrix[mask3, 1, 2] + rotation_matrix[mask3, 2, 1]) / s3
+
+    # Case 4: else
+    mask4 = (~mask1) & (~mask2) & (~mask3)
+    s4 = (
+        torch.sqrt(
+            1.0
+            + rotation_matrix[mask4, 2, 2]
+            - rotation_matrix[mask4, 0, 0]
+            - rotation_matrix[mask4, 1, 1]
+        )
+        * 2
+    )
+    q[mask4, 0] = (rotation_matrix[mask4, 1, 0] - rotation_matrix[mask4, 0, 1]) / s4
+    q[mask4, 1] = (rotation_matrix[mask4, 0, 2] + rotation_matrix[mask4, 2, 0]) / s4
+    q[mask4, 2] = (rotation_matrix[mask4, 1, 2] + rotation_matrix[mask4, 2, 1]) / s4
+    q[mask4, 3] = 0.25 * s4
+
+    # Normalize
+    q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-10)
+
+    return q.reshape(batch_shape + (4,))
+
+
+def matrix_to_quaternion_np(rotation_matrix):
+    """Numpy version of matrix_to_quaternion."""
+    mat = torch.from_numpy(rotation_matrix).contiguous().float()
+    return matrix_to_quaternion(mat).numpy()
+
+
+def cont6d_to_quaternion(cont6d):
+    """
+    Convert 6D rotation representation to quaternion.
+
+    Args:
+        cont6d: 6D rotation (..., 6)
+
+    Returns:
+        Quaternions (..., 4) with real part first
+    """
+    mat = cont6d_to_matrix(cont6d)
+    return matrix_to_quaternion(mat)
+
+
+def cont6d_to_quaternion_np(cont6d):
+    """Numpy version of cont6d_to_quaternion."""
+    q = torch.from_numpy(cont6d).contiguous().float()
+    return cont6d_to_quaternion(q).numpy()
+
+
 def qpow(q0, t, dtype=torch.float):
     """q0 : tensor of quaternions
     t: tensor of powers

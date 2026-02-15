@@ -1,10 +1,10 @@
 PROJECT: Text-to-Motion generation
 ARCH: MotionHistoryEncoder(GRU) + FlowMatchingPredictor(Transformer)
-DATA: HumanML3D 263D features, 22 joints, 20fps
+DATA: HumanML3D 271D features, 22 joints, 20fps
 
 CONSTANTS:
-motion_dim:263 num_joints:22 joint_dim:3 fps:20 max_frames:200
-feature_slices: 0:4(root) 4:67(RIC pos 21x3) 67:193(RIC rot 21x6) 193:259(vel 22x3) 259:263(foot)
+motion_dim:271 num_joints:22 joint_dim:3 fps:20 max_frames:200
+feature_slices: 0:3(global_root) 3:69(RIC pos 22x3) 69:201(RIC rot 22x6) 201:267(vel 22x3) 267:271(foot)
 
 JOINTS: See src/utils/motion_utils.py:t2m_kinematic_chain
 chains: 0=L-leg[0,2,5,8,11] 1=R-leg[0,1,4,7,10] 2=spine[0,3,6,9,12,15] 3=R-arm[9,14,17,19,21] 4=L-arm[9,13,16,18,20]
@@ -18,7 +18,7 @@ Root(0)-+->R_Hip(1)->R_Knee(4)->R_Ankle(7)->R_Foot(10)
                                         +->L_Collar(13)->L_Shoulder(16)->L_Elbow(18)->L_Wrist(20)
 
 MODELS: See src/models.py
-MotionHistoryEncoder: (text:512D, history:BxTx263, duration) -> context:Bx22x64
+MotionHistoryEncoder: (text:512D, history:BxTx271, duration) -> context:Bx22x64
 FlowMatchingPredictor: (context:Bx22x64, t:B, x_t:Bx22x3, prev:12D, progress) -> v:Bx22x3
 HumanMotionGenerator: (text, num_frames, num_steps, guidance_scale) -> joints:BxTx22x3
 
