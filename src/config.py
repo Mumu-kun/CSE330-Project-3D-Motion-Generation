@@ -47,24 +47,24 @@ class Config:
 
     # Model architecture - MotionHistoryEncoder (Dual-MLP)
     text_embedding_dim: int = 512  # CLIP embedding size
-    text_projection_dim: int = 32  # Latent text size
+    text_projection_dim: int = 64  # Latent text size
     joint_feature_projection_dim: int = 64  # Size of joint-level latent tokens
     per_joint_out_dim: int = 64  # Context vector size per joint
 
     # Model architecture - General
-    model_dim: int = 128  # Primary embedding size for sequence/spatial cores
-    num_encoder_layers: int = 1  # GRU layers
-    num_flow_layers: int = 4  # Spatial Transformer layers
+    model_dim: int = 256  # Primary embedding size for sequence/spatial cores
+    num_encoder_layers: int = 2  # GRU layers
     dropout: float = 0.1
-    bidirectional_gru: bool = True
+    bidirectional_gru: bool = False
 
     # Model architecture - FlowMatchingPredictor (ARFM)
+    num_flow_layers: int = 4  # Spatial Transformer layers
     num_heads: int = 4  # Attention heads in spatial transformer
 
     # Training settings
     batch_size: int = 200
     learning_rate: float = 1e-4
-    num_epochs: int = 200
+    num_epochs: int = 400
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
 
@@ -86,7 +86,7 @@ class Config:
     pin_memory: bool = True
 
     # Logging and checkpointing
-    log_interval: int = 100  # Log every N batches
+    log_interval: int = 50  # Log every N batches
     save_interval: int = 5  # Save checkpoint every N epochs
     eval_interval: int = 1  # Evaluate every N epochs
 

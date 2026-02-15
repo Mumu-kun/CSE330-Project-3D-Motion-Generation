@@ -1,12 +1,14 @@
 import math
 import copy
 import os
+import time
 import torch
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import DataLoader
 from typing import Optional, List, Union, Tuple
 from tqdm import tqdm
+from utils.wandb_logger import WandbLogger
 
 
 def build_prev_and_clean_diffs(
@@ -72,6 +74,8 @@ def train(
     weight_decay: float = 1e-2,
     max_grad_norm: float = 1.0,
     ema_decay: float = 0.9999,
+    wandb_project: Optional[str] = None,
+    wandb_run_name: Optional[str] = None,
 ):
     """
     Trains the motion generation models using Flow Matching.
@@ -82,11 +86,36 @@ def train(
         dataloader:              DataLoader providing HumanML3D batches
         num_epochs:              Total training epochs
         save_dir:                Directory to save checkpoints
-        ...
+        device:                  Device to train on
+        lr:                      Learning rate
+        weight_decay:            Weight decay for optimizer
+        max_grad_norm:           Maximum gradient norm for clipping
+        ema_decay:               EMA decay rate
+        wandb_project:           W&B project name (optional, enables logging if provided)
+        wandb_run_name:          W&B run name (optional)
     """
     os.makedirs(save_dir, exist_ok=True)
     motion_history_encoder.to(device)
     flow_predictor.to(device)
+
+    # Initialize W&B logger if project is specified
+    wandb_logger = None
+    if wandb_project:
+        config = {
+            "lr": lr,
+            "weight_decay": weight_decay,
+            "max_grad_norm": max_grad_norm,
+            "ema_decay": ema_decay,
+            "num_epochs": num_epochs,
+            "batch_size": dataloader.batch_size,
+            "mhe_params": sum(p.numel() for p in motion_history_encoder.parameters()),
+            "fp_params": sum(p.numel() for p in flow_predictor.parameters()),
+        }
+        wandb_logger = WandbLogger(
+            project=wandb_project,
+            name=wandb_run_name,
+            config=config,
+        )
 
     # EMA setup (Exponential Moving Average)
     def copy_model(m):
@@ -120,6 +149,8 @@ def train(
 
     global_step = 0
     best_loss = float("inf")
+    best_epoch = -1  # Track when last best model was saved
+    model_log_interval = 10  # Only log model to W&B every N epochs after new best
 
     motion_history_encoder.train()
     flow_predictor.train()
@@ -149,6 +180,8 @@ def train(
             num_batches = 0
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch")
+            batch_start_time = time.time()
+
             for batch in pbar:
                 # 1. Unpack batch
                 motion = batch["motion"].to(device)  # [B, T, 263]
@@ -296,7 +329,7 @@ def train(
                     pred_eps = flow_predictor(
                         history_features=history_context,
                         noise_level=t,
-                        noisy_target_diffs=noisy_target_diffs,
+                        noisy_target=noisy_target_diffs,
                         prev_frame_features=prev_features,
                         # temporal_progress=t_prog,
                     )
@@ -308,7 +341,11 @@ def train(
 
                 # 4. Optimizer Step
                 scaler.scale(loss).backward()
-                torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+
+                # Compute gradient norm before clipping (for logging)
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
+
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -324,13 +361,46 @@ def train(
                     ):
                         ema_p.data.mul_(ema_decay).add_(p.data, alpha=1 - ema_decay)
 
-                # 6. Logging
+                # 6. Timing and memory metrics
+                batch_time = time.time() - batch_start_time
+                batch_start_time = time.time()
+
+                # GPU memory (if available)
+                gpu_memory_allocated = 0.0
+                gpu_memory_reserved = 0.0
+                if torch.cuda.is_available():
+                    gpu_memory_allocated = torch.cuda.memory_allocated() / 1e9  # GB
+                    gpu_memory_reserved = torch.cuda.memory_reserved() / 1e9  # GB
+
+                # 7. Logging
                 pbar.set_postfix(
                     {
                         "loss": f"{loss.item():.4f}",
                         "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                     }
                 )
+
+                # W&B logging (per step)
+                if wandb_logger is not None:
+                    wandb_logger.log(
+                        {
+                            "train/loss": loss.item(),
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/epoch": epoch,
+                            "train/grad_norm": (
+                                grad_norm.item()
+                                if hasattr(grad_norm, "item")
+                                else grad_norm
+                            ),
+                            "train/batch_time": batch_time,
+                            "train/samples_per_sec": (
+                                B / batch_time if batch_time > 0 else 0
+                            ),
+                            "system/gpu_memory_allocated_gb": gpu_memory_allocated,
+                            "system/gpu_memory_reserved_gb": gpu_memory_reserved,
+                        },
+                        step=global_step,
+                    )
 
                 if global_step % 100 == 0:
                     current_lr = scheduler.get_last_lr()[0]
@@ -347,6 +417,16 @@ def train(
             avg_epoch_loss = epoch_loss / max(1, num_batches)
             tqdm.write(f"==> End of Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}")
 
+            # W&B epoch-level logging
+            if wandb_logger is not None:
+                wandb_logger.log(
+                    {
+                        "epoch/avg_loss": avg_epoch_loss,
+                        "epoch/num": epoch,
+                    },
+                    step=global_step,
+                )
+
             # Checkpointing
             # Save Latest (Always)
             save_checkpoint("latest.pt", avg_epoch_loss)
@@ -359,9 +439,25 @@ def train(
                 best_loss = avg_epoch_loss
                 save_checkpoint("best.pt", avg_epoch_loss)
 
+                # Log best model to W&B (only every N epochs to save space)
+                if wandb_logger is not None and (
+                    epoch - best_epoch >= model_log_interval
+                ):
+                    wandb_logger.log_model(
+                        os.path.join(save_dir, "best.pt"),
+                        f"best-model-epoch-{epoch}",
+                        description=f"Best model at epoch {epoch} with loss {avg_epoch_loss:.6f}",
+                    )
+                    best_epoch = epoch
+
     except KeyboardInterrupt:
         tqdm.write("Training interrupted. Saving emergency checkpoint...")
         save_checkpoint("latest_interrupted.pt", 0.0)
         tqdm.write("Done.")
+
+    # Finish W&B run
+    if wandb_logger is not None:
+        wandb_logger.log_summary({"best_loss": best_loss})
+        wandb_logger.finish()
 
     return ema_mhe, ema_fmp

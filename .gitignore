@@ -19,7 +19,7 @@ venv/
 Thumbs.db
 
 # Data & models
-*.npy
+# *.npy
 *.npz
 *.pth
 *.pt

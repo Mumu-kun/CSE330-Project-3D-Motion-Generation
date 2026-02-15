@@ -67,6 +67,7 @@ def generate_cloud_notebook():
         "utils/skeleton.py": source_dir / "utils" / "skeleton.py",
         "utils/train_utils.py": source_dir / "utils" / "train_utils.py",
         "utils/text_encoder.py": source_dir / "utils" / "text_encoder.py",
+        "utils/wandb_logger.py": source_dir / "utils" / "wandb_logger.py",
     }
 
     # 2. Extract and minify content from support files

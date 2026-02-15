@@ -527,14 +527,14 @@ class HumanMotionGenerator(nn.Module):
                     batch_size=B,
                     text=text,
                     input_features=history,
-                    total_duration=total_duration,
+                    # total_duration=total_duration,
                 )
 
                 context_uncond = self.encoder(
                     batch_size=B,
                     text=None,
                     input_features=history,
-                    total_duration=total_duration,
+                    # total_duration=total_duration,
                 )
 
                 # Extract previous frame features
@@ -564,17 +564,17 @@ class HumanMotionGenerator(nn.Module):
                     v_cond = self.predictor(
                         history_features=context_cond,
                         noise_level=t,
-                        noisy_target_diffs=x_t,
+                        noisy_target=x_t,
                         prev_frame_features=prev_frame_features,
-                        temporal_progress=t_prog,
+                        # temporal_progress=t_prog,
                     )
 
                     v_uncond = self.predictor(
                         history_features=context_uncond,
                         noise_level=t,
-                        noisy_target_diffs=x_t,
+                        noisy_target=x_t,
                         prev_frame_features=prev_frame_features,
-                        temporal_progress=t_prog,
+                        # temporal_progress=t_prog,
                     )
 
                     v_t = v_uncond + guidance_scale * (v_cond - v_uncond)

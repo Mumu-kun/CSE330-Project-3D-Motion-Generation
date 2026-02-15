@@ -1,3 +1,5 @@
+import numpy as np
+import torch
 from .quaternion import *
 import scipy.ndimage.filters as filters
 
@@ -5,8 +7,13 @@ import scipy.ndimage.filters as filters
 class Skeleton(object):
     def __init__(self, offset, kinematic_tree, device):
         self.device = device
-        self._raw_offset_np = offset.cpu().numpy()
-        self._raw_offset = offset.clone().detach().to(device).float()
+        # Handle both numpy arrays and torch tensors
+        if isinstance(offset, np.ndarray):
+            self._raw_offset_np = offset.copy()
+            self._raw_offset = torch.from_numpy(offset).to(device).float()
+        else:
+            self._raw_offset_np = offset.detach().cpu().numpy()
+            self._raw_offset = offset.clone().detach().to(device).float()
         self._kinematic_tree = kinematic_tree
         self._offset = None
         self._parents = [0] * len(self._raw_offset)
