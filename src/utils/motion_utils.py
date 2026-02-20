@@ -1,14 +1,16 @@
 """
 Motion Processing and Feature Conversion Utilities for Human Motion Animation Generation.
 
-271D Feature Format (Pure PyTorch):
-- Global root position (3D) - absolute XYZ in world frame
+271D Feature Format (Pure PyTorch) - Updated per normalization plan:
+- Root height Y, Root velocity X, Root velocity Z (3D) - velocity form for X,Z
 - 22 RIC positions (66D) - local positions relative to root, from actual data
 - 22 6D rotations (132D) - auxiliary features from IK
 - 22 local velocities (66D) - causal velocities (current - previous)
 - 4D foot contacts - binary contact flags
 
 Total: 271D per frame
+
+Note: Root X,Z are stored as velocities for autoregressive stability.
 
 API:
 - preprocess_sequence(): Dataset preprocessing (ground truth joints)
@@ -20,7 +22,6 @@ API:
 import torch
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
-from .skeleton import Skeleton
 from .quaternion import (
     qrot,
     qinv,
@@ -104,7 +105,7 @@ def get_dataset_config(dataset_type: str = "t2m") -> Dict[str, Any]:
 # ============================================================================
 
 FEATURE_SLICES = {
-    "global_root_pos": slice(0, 3),  # 3D
+    "root_features": slice(0, 3),  # 3D: root height Y, velocity X, velocity Z
     "ric_positions": slice(3, 69),  # 66D (22 * 3)
     "rotations_6d": slice(69, 201),  # 132D (22 * 6)
     "local_velocities": slice(201, 267),  # 66D (22 * 3)
@@ -297,12 +298,14 @@ def preprocess_sequence(
     Used for dataset preprocessing with ground truth joints.
     Uses direct RIC transform for perfect round-trip reconstruction.
 
-    Feature Layout:
-        [0:3]   Global root position (XYZ)
+    Feature Layout (updated per normalization plan):
+        [0:3]   Root height Y, Root velocity X, Root velocity Z
         [3:69]  22 RIC positions (22 * 3)
         [69:201] 22 6D rotations (22 * 6)
         [201:267] 22 local velocities (22 * 3)
         [267:271] Foot contacts (4D)
+
+    Note: Root X,Z are stored as velocities for autoregressive stability.
 
     Args:
         positions: Joint positions (N, 22, 3) or (B, N, 22, 3)
@@ -337,8 +340,17 @@ def preprocess_sequence(
     # Single sequence mode: (N, 22, 3)
     N = positions.shape[0]
 
-    # 1. Global root position
-    global_root_pos = positions[:, 0].clone()  # (N, 3)
+    # 1. Root features: height Y (absolute), velocity X, velocity Z
+    # Per normalization plan: convert root XZ to velocity form
+    root_features = torch.zeros(N, 3, device=device, dtype=dtype)
+    root_features[:, 0] = positions[:, 0, 1]  # root height Y (keep absolute) at index 0
+    if N > 1:
+        root_features[1:, 1] = (
+            positions[1:, 0, 0] - positions[:-1, 0, 0]
+        )  # vx at index 1
+        root_features[1:, 2] = (
+            positions[1:, 0, 2] - positions[:-1, 0, 2]
+        )  # vz at index 2
 
     # 2. IK for all frames
     quaternions = _compute_ik(
@@ -376,7 +388,7 @@ def preprocess_sequence(
     # Concatenate all features
     features = torch.cat(
         [
-            global_root_pos,
+            root_features,  # [0:3] Root height Y, velocity X, velocity Z
             ric.reshape(N, -1),
             rotations_6d.reshape(N, -1),
             local_vel.reshape(N, -1),
@@ -399,6 +411,9 @@ def features_to_positions(
     Uses direct RIC transform for perfect reconstruction.
     This is the canonical reconstruction function.
 
+    Note: Features now use velocity form for root X,Z. Reconstruction
+    requires cumulative sum to recover absolute positions.
+
     Args:
         features: Feature vectors (..., 271)
         dataset_type: Dataset type ("t2m" for HumanML3D)
@@ -407,12 +422,25 @@ def features_to_positions(
         Global joint positions (..., 22, 3)
     """
     # Extract components
-    global_root_pos = features[..., 0:3]
+    root_features = features[..., 0:3]  # root height Y, velocity X, velocity Z
     ric = features[..., 3:69].reshape(features.shape[:-1] + (22, 3))
     rotations_6d = features[..., 69:201].reshape(features.shape[:-1] + (22, 6))
 
     # Get root quaternion from 6D rotation
     root_quat = cont6d_to_quaternion(rotations_6d[..., 0, :])  # (..., 4)
+
+    # Reconstruct root position from velocity form
+    # root_features[..., 0] = root height Y (absolute)
+    # root_features[..., 1] = root velocity X
+    # root_features[..., 2] = root velocity Z
+    root_height_y = root_features[..., 0:1]  # (..., 1)
+    root_vel_x = root_features[..., 1:2]  # (..., 1)
+    root_vel_z = root_features[..., 2:3]  # (..., 1)
+
+    # Cumulative sum to recover absolute X and Z positions
+    root_pos_x = torch.cumsum(root_vel_x, dim=-1)
+    root_pos_z = torch.cumsum(root_vel_z, dim=-1)
+    global_root_pos = torch.cat([root_pos_x, root_height_y, root_pos_z], dim=-1)
 
     # Direct transform: RIC -> global
     # global = root_pos + rotate_inverse(RIC, root_rot)
@@ -434,12 +462,14 @@ class IncrementalFeatureExtractor:
     Used during inference/motion generation when processing one frame at a time.
     Uses FK-based extraction for predicted joints to maintain kinematic consistency.
 
-    Feature Layout (271D):
-        [0:3]   Global root position
+    Feature Layout (271D) - Updated per normalization plan:
+        [0:3]   Root height Y, Root velocity X, Root velocity Z
         [3:69]  22 RIC positions
         [69:201] 22 6D rotations
         [201:267] 22 local velocities
         [267:271] Foot contacts
+
+    Note: Root X,Z are stored as velocities for autoregressive stability.
     """
 
     def __init__(
@@ -528,8 +558,13 @@ class IncrementalFeatureExtractor:
 
         B = positions.shape[0]
 
-        # === 1. Global root position ===
-        global_root_pos = positions[:, 0]  # (B, 3)
+        # === 1. Root features: height Y (absolute), velocity X, velocity Z ===
+        root_height_y = positions[:, 0, 1:2]  # (B, 1)
+        root_vel_x = positions[:, 0, 0:1] - self.prev_positions[:, 0, 0:1]  # (B, 1)
+        root_vel_z = positions[:, 0, 2:3] - self.prev_positions[:, 0, 2:3]  # (B, 1)
+        root_features = torch.cat(
+            [root_height_y, root_vel_x, root_vel_z], dim=-1
+        )  # (B, 3)
 
         # === 2. IK for rotations ===
         quaternions = _compute_ik(
@@ -541,6 +576,9 @@ class IncrementalFeatureExtractor:
 
         # === 4. RIC from FK positions ===
         rotations_6d = quaternion_to_cont6d(quaternions)
+
+        # Get root position for FK (need absolute position)
+        global_root_pos = positions[:, 0]  # (B, 3)
 
         # Compute FK for kinematic consistency
         fk_positions = _forward_kinematics(
@@ -571,7 +609,7 @@ class IncrementalFeatureExtractor:
         # === Concatenate features ===
         features = torch.cat(
             [
-                global_root_pos,
+                root_features,  # [0:3] Root height Y, velocity X, velocity Z
                 ric.reshape(B, -1),
                 rotations_6d.reshape(B, -1),
                 local_vel.reshape(B, -1),

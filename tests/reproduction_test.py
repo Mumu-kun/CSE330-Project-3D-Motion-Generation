@@ -87,8 +87,9 @@ def test_pipeline():
         per_joint_out_dim=config.per_joint_out_dim,
         joint_count=config.num_joints,
         model_dim=config.model_dim,
-        num_layers=config.num_encoder_layers,
-        bidirectional=config.bidirectional_gru,
+        num_layers=4,  # ARFM uses 4 transformer layers
+        max_text_seq_len=77,  # CLIP max sequence length
+        dropout=config.dropout,
     ).to(device)
 
     predictor = FlowMatchingPredictor(

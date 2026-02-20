@@ -30,14 +30,14 @@ def test_predictor_basic():
     # Inputs
     history_features = torch.randn(B, joint_count, per_joint_dim)
     noise_level = torch.rand(B)
-    noisy_target_diffs = torch.randn(B, joint_count, 3)
+    noisy_target = torch.randn(B, joint_count, 3)
     prev_frame_features = torch.randn(B, joint_count, 12)  # pos(3) + rot6d(6) + vel(3)
     temporal_progress = torch.rand(B)
 
     output = predictor(
         history_features=history_features,
         noise_level=noise_level,
-        noisy_target_diffs=noisy_target_diffs,
+        noisy_target=noisy_target,
         prev_frame_features=prev_frame_features,
         temporal_progress=temporal_progress,
     )
@@ -63,13 +63,13 @@ def test_predictor_zero_shot():
 
     history_features = torch.randn(B, joint_count, 64)
     noise_level = torch.rand(B)
-    noisy_target_diffs = torch.randn(B, joint_count, 3)
+    noisy_target = torch.randn(B, joint_count, 3)
 
     # No previous frame, no temporal progress
     output = predictor(
         history_features=history_features,
         noise_level=noise_level,
-        noisy_target_diffs=noisy_target_diffs,
+        noisy_target=noisy_target,
         prev_frame_features=None,
         temporal_progress=None,
     )
@@ -94,12 +94,12 @@ def test_predictor_different_batch_sizes():
     for B in [1, 4, 8]:
         history_features = torch.randn(B, joint_count, 64)
         noise_level = torch.rand(B)
-        noisy_target_diffs = torch.randn(B, joint_count, 3)
+        noisy_target = torch.randn(B, joint_count, 3)
 
         output = predictor(
             history_features=history_features,
             noise_level=noise_level,
-            noisy_target_diffs=noisy_target_diffs,
+            noisy_target=noisy_target,
             prev_frame_features=None,
             temporal_progress=None,
         )

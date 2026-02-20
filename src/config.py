@@ -1,9 +1,18 @@
 """
 Configuration file for Human Motion Animation Generation Pipeline.
 
-This configuration is compatible with MoMask's input/output format:
-- Input: HumanML3D dim-263 feature vectors
+This configuration uses the custom 271D feature format:
+- Input: 271D feature vectors from motion_utils.py
 - Output: Joint positions (nframe, 22, 3) → BVH files
+
+Feature Layout (271D) - Updated per normalization plan:
+- [0:3]   Root height Y, Root velocity X, Root velocity Z (velocity form)
+- [3:69]  22 RIC positions (22 * 3)
+- [69:201] 22 6D rotations (22 * 6)
+- [201:267] 22 local velocities (22 * 3)
+- [267:271] Foot contacts (4D)
+
+Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
 from pathlib import Path
@@ -24,21 +33,21 @@ class Config:
     output_path: Path = Path("./generation")
     checkpoint_dir: Path = Path("./checkpoints")
 
-    # Motion format settings (MoMask-compatible)
-    motion_dim: int = 263  # HumanML3D feature dimension
+    # Motion format settings (271D custom format from motion_utils.py)
+    motion_dim: int = 271  # Custom 271D feature dimension
     num_joints: int = 22  # Number of joints in skeleton
     joint_dim: int = 3  # 3D coordinates per joint
     max_motion_length: int = 200  # Maximum motion length in frames (rounded by 4)
     fps: int = 20  # Frames per second
 
     # Feature dimension subsetting for training (optional)
-    # Use None for all dimensions, or list of (start, end) tuples
-    # Example: [(0, 3), (3, 69), (261, 263)] for root + RIC + contact
+    # 271D format: [0:3]root_height_y_vel_x_vel_z, [3:69]RIC, [69:201]rot6d, [201:267]vel, [267:271]foot
     feature_dims: tuple[slice, ...] = (
-        slice(0, 4),  # root rotation and velocity
-        slice(4, 67),  # (21*3) RIC
-        slice(193, 259),  # (22*3) local velocities
-        slice(259, 263),  # foot contact
+        slice(0, 3),  # root height Y, velocity X, velocity Z (3D)
+        slice(3, 69),  # RIC positions (22*3 = 66D)
+        slice(69, 201),  # 6D rotations (22*6 = 132D)
+        slice(201, 267),  # local velocities (22*3 = 66D)
+        slice(267, 271),  # foot contacts (4D)
     )
 
     # Dataset configuration

@@ -37,7 +37,8 @@ class CLIPEncoder(torch.nn.Module):
             text: A single string or a list of strings.
 
         Returns:
-            embeddings: (B, 512) tensor containing the text embeddings.
+            embeddings: (B, l_seq, 512) tensor containing the full sequence embeddings.
+                        l_seq is typically 77 for CLIP (max token length).
         """
         if isinstance(text, str):
             text = [text]
@@ -50,9 +51,9 @@ class CLIPEncoder(torch.nn.Module):
         ).to(device)
         outputs = self.model(**inputs)
 
-        # Use the pooler_output for a global representation of the sentence
-        # Shape: (Batch_Size, 512)
-        embeddings = outputs.pooler_output
+        # Use last_hidden_state for full sequence embeddings
+        # Shape: (Batch_Size, Sequence_Length, 512)
+        embeddings = outputs.last_hidden_state
 
         return embeddings
 
