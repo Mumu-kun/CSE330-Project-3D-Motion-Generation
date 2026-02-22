@@ -26,7 +26,9 @@ from utils.motion_utils import (
     features_to_positions,
     preprocess_sequence,
     get_dataset_config,
-    IncrementalFeatureExtractor,
+    flow_output_to_positions,
+    flow_output_to_271d,
+    RootPositionTracker,
 )
 
 
@@ -762,23 +764,22 @@ class HumanMotionGenerator(nn.Module):
         """
         Generate n consecutive animation frames autoregressively.
 
-        Uses proper 72D → positions → 271D conversion pipeline:
-        1. Start with null history or provided initial features
-        2. For each frame:
-           - Encode context from history
-           - Run flow matching to generate 72D output
-           - Convert 72D → 22x3 positions using flow_output_to_positions()
-           - Convert positions → 271D features using IncrementalFeatureExtractor
-           - Update history for next frame
+        Uses flow_output_to_271d for incremental 72D → 271D conversion and
+        RootPositionTracker for absolute root position tracking. This ensures
+        O(n) complexity and Markov-safe autoregressive generation.
+
+        Args:
+            text: Text prompt(s) - str, List[str], or pre-encoded tensor (B, l_seq, 512)
+            num_frames: Number of frames to generate
+            num_steps: Number of flow matching ODE steps
+            guidance_scale: Classifier-free guidance scale
+            input_features: Optional initial motion history (B, N, 271) or (B, 271)
+            total_duration: Optional duration tensor (not used)
+            dataset_type: Dataset type for feature extraction
 
         Returns:
-            joint_positions: (B, num_frames, 22, 3) - Global joint positions
+            position_history: (B, N+num_frames, 22, 3) - Global joint positions including initial history
         """
-        from utils.motion_utils import (
-            IncrementalFeatureExtractor,
-            features_to_positions,
-            flow_output_to_positions,
-        )
         from utils.train_utils import extract_prev_frame_features
 
         self.eval()
@@ -803,44 +804,45 @@ class HumanMotionGenerator(nn.Module):
                 B = text.shape[0]
             device = next(self.parameters()).device
 
-            # Initialize history (single frame for simplicity)
-            if input_features is None:
-                history = self.encoder.null_history.expand(B, 1, -1).clone()
-            else:
-                # input_features must be (B, N, 271)
-                assert (
-                    input_features.ndim == 3
-                ), f"input_features must be (B, N, 271), got {input_features.shape}"
-                history = input_features
+            # ========================================
+            # History Initialization
+            # ========================================
+            # Use RootPositionTracker for absolute root position tracking
+            # and feature_history for context encoding
 
-            # Initialize incremental feature extractor
-            extractor = IncrementalFeatureExtractor(
-                dataset_type=dataset_type,
-                feet_thre=0.002,
-                device=device,
-            )
+            if input_features is None:
+                # Zero-shot: use learned null_history
+                null_features = self.encoder.null_history.expand(B, 1, -1).clone()
+                feature_history = null_features  # (B, 1, 271)
+                # Initialize RootPositionTracker from null features
+                root_tracker = RootPositionTracker.from_history(feature_history)
+            else:
+                # Seeded: use input_features
+                if input_features.ndim == 2:
+                    # Single frame (B, 271)
+                    feature_history = input_features.unsqueeze(1).clone()  # (B, 1, 271)
+                else:
+                    # Sequence (B, N, 271)
+                    feature_history = input_features.clone()  # (B, N, 271)
+                # Initialize RootPositionTracker from feature history
+                root_tracker = RootPositionTracker.from_history(feature_history)
 
             joint_sequence = []
 
-            # Extract initial global joint positions from 271D features
-            init_frame = history[:, -1, :]  # (B, 271)
-            current_joints_global = features_to_positions(
-                init_frame, dataset_type=dataset_type
-            )  # (B, 22, 3)
-
-            # Initialize extractor with first frame
-            extractor.initialize(current_joints_global)
-
-            # Track current frame 271D for conversion
-            current_frame_271d = init_frame.clone()
-
             for frame_idx in range(num_frames):
-                # Encode context (conditional and unconditional for CFG)
-                # Encoder returns (B, T_hist, 22, out_dim), take last frame
+                # ========================================
+                # Step A: Extract last frame from feature history
+                # ========================================
+                last_frame = feature_history[:, -1]  # (B, 271)
+                prev_root_pos = root_tracker.get()  # (B, 3)
+
+                # ========================================
+                # Step B: Encode context from FULL feature history (for CFG)
+                # ========================================
                 context_cond = self.encoder(
                     batch_size=B,
                     text=text,
-                    input_features=history,
+                    input_features=feature_history,  # Full history
                 )[
                     :, -1, :, :
                 ]  # (B, 22, out_dim)
@@ -848,15 +850,19 @@ class HumanMotionGenerator(nn.Module):
                 context_uncond = self.encoder(
                     batch_size=B,
                     text=None,
-                    input_features=history,
+                    input_features=feature_history,  # Full history
                 )[
                     :, -1, :, :
                 ]  # (B, 22, out_dim)
 
-                # Extract previous frame features (261D) from last 271D frame
-                prev_frame_features = extract_prev_frame_features(history[:, -1])
+                # ========================================
+                # Step C: Extract prev_frame_features (261D)
+                # ========================================
+                prev_frame_features = extract_prev_frame_features(last_frame)
 
-                # Flow matching generation
+                # ========================================
+                # Step D: Flow matching ODE loop
+                # ========================================
                 x_t = torch.randn((B, 72), device=device)
                 dt = 1.0 / num_steps
 
@@ -881,31 +887,41 @@ class HumanMotionGenerator(nn.Module):
                     v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
                     x_t = x_t + v_t * dt
 
-                # Convert 72D output → positions → 271D features
-                # Use the extractor's process_flow_output method
-                new_frame_271d, new_positions = extractor.process_flow_output(
-                    x_t, current_frame_271d
-                )
+                # ========================================
+                # Step E: Convert 72D → 271D (incremental)
+                # ========================================
+                new_frame, new_root_pos = flow_output_to_271d(
+                    flow_output=x_t,
+                    prev_frame=last_frame,
+                    prev_root_pos=prev_root_pos,
+                    dataset_type=dataset_type,
+                )  # (B, 271), (B, 3)
 
-                # Update state
-                current_frame_271d = new_frame_271d
-                current_joints_global = new_positions
+                # ========================================
+                # Step F: Update tracker and history
+                # ========================================
+                root_tracker.update(new_frame)
+                feature_history = torch.cat(
+                    [feature_history, new_frame.unsqueeze(1)], dim=1
+                )  # (B, N+1, 271)
 
-                # Update history (single frame)
-                history = new_frame_271d.unsqueeze(1)
-
-                # Collect joint positions
+                # ========================================
+                # Step G: Convert to positions for output
+                # ========================================
+                new_positions = features_to_positions(
+                    new_frame, dataset_type=dataset_type
+                )  # (B, 22, 3)
                 joint_sequence.append(new_positions)
 
                 if (frame_idx + 1) % 50 == 0:
                     print(f"Generated {frame_idx + 1}/{num_frames} frames")
 
-            # Stack all joint positions
-            joint_positions = torch.stack(
-                joint_sequence, dim=1
-            )  # (B, num_frames, 22, 3)
+            # Convert full feature_history to positions for return
+            position_history = features_to_positions(
+                feature_history, dataset_type=dataset_type
+            )  # (B, N+num_frames, 22, 3)
 
-            return joint_positions
+            return position_history
 
     @classmethod
     def load_from_checkpoint(

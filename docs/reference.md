@@ -78,11 +78,28 @@ Reconstruction Functions (src/utils/motion_utils.py):
 
 HumanMotionGenerator: (text, num_frames, num_steps, guidance_scale, input_features) -> joints:(B, T, 22, 3)
   - Integrates MotionHistoryEncoder and FlowMatchingPredictor
-  - Uses IncrementalFeatureExtractor for autoregressive feature extraction
+  - Uses FULL HISTORY tracking for both positions and features
+  - Feature extraction via preprocess_sequence on full position sequence
   - Classifier-free guidance: v = v_uncond + scale * (v_cond - v_uncond)
   - Input text: str, List[str], or pre-encoded tensor (B, 1, 512) from CLIPEncoder
-  - input_features: Required, shape (B, N, 271) - initial motion history frames
+  - input_features: Optional, shape (B, N, 271) or (B, 271) - initial motion history (uses null_history if None)
   - load_from_checkpoint: Uses config.max_text_seq_len (not hardcoded 77)
+  
+  History Tracking:
+    - position_history: (B, N, 22, 3) - Global joint positions for all frames
+    - feature_history: (B, N, 271) - Feature vectors for encoder context
+    - Both grow with each generated frame
+  
+  Autoregressive Loop (per frame):
+    1. Extract last_frame from feature_history (B, 271)
+    2. Get prev_positions from position_history[:, -1] (B, 22, 3)
+    3. Extract prev_root_pos and prev_root_rot_6d
+    4. Encode context from FULL feature_history with CFG (cond and uncond)
+    5. Flow matching ODE loop -> flow_output (B, 72)
+    6. flow_output_to_positions(flow_output, prev_root_pos, prev_root_rot_6d) -> new_positions
+    7. Append new_positions to position_history
+    8. preprocess_sequence(FULL position_history) -> feature_history (B, N+1, 271)
+    9. Feature extraction matches training exactly (velocities from actual frame differences)
 
 CONFIG: See src/config.py
 behavior_params: text_proj:64 joint_proj:64 model_dim:256 transformer_layers:4
@@ -93,7 +110,14 @@ loss_weights: flow:1.0 context:0.1
 ALGORITHMS:
 FlowMatch: x_t = t*clean + (1-t)*noise, predict v = clean - noise, loss = MSE(v_pred, v_target)
 CFG: v = v_uncond + scale*(v_cond - v_uncond), x_t += v*dt
-Infer: null_history, for each frame: CFG loop N steps, x_t->joints, extract features, update history
+Infer (canonical round-trip):
+  - Initialize: history = input_features[:,-1:] or null_history
+  - Per frame:
+    1. last_frame -> features_to_positions -> prev_positions
+    2. CFG loop N steps -> flow_output (72D)
+    3. flow_output_to_positions -> new_positions
+    4. stack(prev_positions, new_positions) -> preprocess_sequence -> extract frame 1 -> new_frame_271d
+    5. history = new_frame_271d.unsqueeze(1)
 
 TRAINING: See src/utils/train_utils.py
 Progressive Horizon Curriculum:

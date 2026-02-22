@@ -564,6 +564,221 @@ def flow_output_to_displacements(
     return displacements
 
 
+def flow_output_to_271d(
+    flow_output: torch.Tensor,  # (B, 72)
+    prev_frame: torch.Tensor,  # (B, 271)
+    prev_root_pos: torch.Tensor,  # (B, 3)  <-- tracked externally
+    dataset_type: str = "t2m",
+    feet_thre: float = 0.002,
+):
+    """
+    Incrementally compute next 271D feature frame.
+
+    No cumulative sum.
+    No full sequence reconstruction.
+    Fully Markov and AR-safe.
+
+    Returns:
+        new_frame: (B, 271)
+        new_root_pos: (B, 3)  <-- updated absolute root position
+    """
+
+    B = flow_output.shape[0]
+    device = flow_output.device
+    dtype = flow_output.dtype
+
+    # -------------------------------------------------
+    # Dataset config (for foot indices)
+    # -------------------------------------------------
+    config = get_dataset_config(dataset_type)
+    fid_r = config["fid_r"]
+    fid_l = config["fid_l"]
+
+    # -------------------------------------------------
+    # 1. Extract flow output components
+    # -------------------------------------------------
+    root_height = flow_output[:, 0:1]  # (B,1)
+    root_vel = flow_output[:, 1:3]  # (B,2)
+    root_rot_6d = flow_output[:, 3:9]  # (B,6)
+    joint_ric_21 = flow_output[:, 9:72].reshape(B, 21, 3)
+
+    # -------------------------------------------------
+    # 2. Update absolute root position (incremental)
+    # -------------------------------------------------
+    new_root_x = prev_root_pos[:, 0:1] + root_vel[:, 0:1]
+    new_root_y = root_height  # absolute
+    new_root_z = prev_root_pos[:, 2:3] + root_vel[:, 1:2]
+
+    new_root_pos = torch.cat([new_root_x, new_root_y, new_root_z], dim=-1)  # (B,3)
+
+    # -------------------------------------------------
+    # 3. Build RIC block (root = zero)
+    # -------------------------------------------------
+    root_ric = torch.zeros(B, 1, 3, device=device, dtype=dtype)
+    ric = torch.cat([root_ric, joint_ric_21], dim=1)  # (B,22,3)
+
+    # -------------------------------------------------
+    # 4. Rotations (update root only)
+    # -------------------------------------------------
+    prev_rot_6d = prev_frame[:, 69:201].reshape(B, 22, 6)
+    rotations_6d = prev_rot_6d.clone()
+    rotations_6d[:, 0] = root_rot_6d
+
+    # -------------------------------------------------
+    # 5. Reconstruct previous positions (incremental)
+    # -------------------------------------------------
+    prev_root_rot_6d = prev_frame[:, 69:75]
+    prev_root_quat = cont6d_to_quaternion(prev_root_rot_6d)
+
+    prev_ric = prev_frame[:, 3:69].reshape(B, 22, 3)
+
+    prev_root_quat_exp = prev_root_quat.unsqueeze(1).expand(-1, 22, -1)
+    prev_positions = prev_root_pos.unsqueeze(1) + qrot(
+        qinv(prev_root_quat_exp), prev_ric
+    )
+
+    # -------------------------------------------------
+    # 6. Reconstruct new positions
+    # -------------------------------------------------
+    root_quat = cont6d_to_quaternion(root_rot_6d)
+    root_quat_exp = root_quat.unsqueeze(1).expand(-1, 21, -1)
+
+    global_offsets = qrot(qinv(root_quat_exp), joint_ric_21)  # (B,21,3)
+
+    global_joints = new_root_pos.unsqueeze(1) + global_offsets
+
+    new_positions = torch.cat(
+        [new_root_pos.unsqueeze(1), global_joints], dim=1
+    )  # (B,22,3)
+
+    # -------------------------------------------------
+    # 7. Local velocities (root-local)
+    # -------------------------------------------------
+    pos_delta = new_positions - prev_positions
+
+    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 22, -1)
+    local_vel = qrot(root_quat_expanded, pos_delta)  # (B,22,3)
+
+    # -------------------------------------------------
+    # 8. Foot contact recomputation
+    # -------------------------------------------------
+    vel_l = new_positions[:, fid_l] - prev_positions[:, fid_l]
+    vel_r = new_positions[:, fid_r] - prev_positions[:, fid_r]
+
+    feet_l = (torch.sum(vel_l**2, dim=-1) < feet_thre).float()
+    feet_r = (torch.sum(vel_r**2, dim=-1) < feet_thre).float()
+
+    foot_contacts = torch.cat([feet_l, feet_r], dim=-1)  # (B,4)
+
+    # -------------------------------------------------
+    # 9. Root feature block (velocity form)
+    # -------------------------------------------------
+    root_features = torch.cat([root_height, root_vel], dim=-1)
+
+    # -------------------------------------------------
+    # 10. Assemble final 271D frame
+    # -------------------------------------------------
+    new_frame = torch.cat(
+        [
+            root_features,  # (B,3)
+            ric.reshape(B, -1),  # (B,66)
+            rotations_6d.reshape(B, -1),  # (B,132)
+            local_vel.reshape(B, -1),  # (B,66)
+            foot_contacts,  # (B,4)
+        ],
+        dim=-1,
+    )
+
+    new_frame = new_frame.to(device=device, dtype=dtype)
+    new_root_pos = new_root_pos.to(device=device, dtype=dtype)
+
+    return new_frame, new_root_pos
+
+
+class RootPositionTracker:
+    """
+    Tracks absolute root position (X, Y, Z) for velocity-form representation.
+
+    Assumes 271D layout:
+    [0]   root height Y (absolute)
+    [1]   root vel X
+    [2]   root vel Z
+    """
+
+    def __init__(self, initial_root_pos: Optional[torch.Tensor] = None):
+        """
+        Args:
+            initial_root_pos: (B, 3) absolute XYZ
+        """
+        if initial_root_pos is None:
+            raise ValueError(
+                "RootPositionTracker requires initial_root_pos for device safety."
+            )
+
+        if initial_root_pos.dim() != 2 or initial_root_pos.size(-1) != 3:
+            raise ValueError("initial_root_pos must be shape (B, 3)")
+
+        self.root_pos = initial_root_pos  # preserves device & dtype
+
+    @classmethod
+    def from_history(cls, history_271: torch.Tensor):
+        """
+        Initialize from full history window.
+
+        Args:
+            history_271: (B, T, 271)
+        """
+        if history_271.dim() != 3 or history_271.size(-1) < 3:
+            raise ValueError("history_271 must be shape (B, T, 271)")
+
+        device = history_271.device
+        dtype = history_271.dtype
+
+        root_height = history_271[..., 0]  # (B,T)
+        root_vel_x = history_271[..., 1]
+        root_vel_z = history_271[..., 2]
+
+        # Integrate velocities to recover absolute X/Z
+        root_pos_x = torch.cumsum(root_vel_x, dim=1)
+        root_pos_z = torch.cumsum(root_vel_z, dim=1)
+
+        # Take last frame absolute position
+        final_x = root_pos_x[:, -1]
+        final_z = root_pos_z[:, -1]
+        final_y = root_height[:, -1]
+
+        initial_root_pos = torch.stack([final_x, final_y, final_z], dim=-1).to(
+            device=device, dtype=dtype
+        )
+
+        return cls(initial_root_pos)
+
+    def get(self):
+        return self.root_pos
+
+    def update(self, new_frame_271: torch.Tensor):
+        """
+        Update state using newly generated frame.
+
+        Args:
+            new_frame_271: (B, 271)
+        """
+        if new_frame_271.device != self.root_pos.device:
+            raise RuntimeError(
+                "Device mismatch in RootPositionTracker.update(): "
+                f"{new_frame_271.device} vs {self.root_pos.device}"
+            )
+
+        root_height = new_frame_271[:, 0:1]
+        root_vel = new_frame_271[:, 1:3]
+
+        new_x = self.root_pos[:, 0:1] + root_vel[:, 0:1]
+        new_z = self.root_pos[:, 2:3] + root_vel[:, 1:2]
+        new_y = root_height
+
+        self.root_pos = torch.cat([new_x, new_y, new_z], dim=-1)
+
+
 # ============================================================================
 # Incremental Feature Extractor for Autoregressive Generation
 # ============================================================================
@@ -789,25 +1004,3 @@ class IncrementalFeatureExtractor:
         new_frame_271d = self.process_frame(new_positions)
 
         return new_frame_271d, new_positions
-
-
-def flow_output_to_271d(
-    flow_output: torch.Tensor,
-    prev_frame_271d: torch.Tensor,
-    extractor: IncrementalFeatureExtractor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert 72D flow output to 271D features.
-
-    Convenience function that wraps IncrementalFeatureExtractor.process_flow_output().
-
-    Args:
-        flow_output: (B, 72) FlowMatchingPredictor output
-        prev_frame_271d: (B, 271) Previous frame features
-        extractor: IncrementalFeatureExtractor instance (must be initialized)
-
-    Returns:
-        new_frame_271d: (B, 271) New frame features
-        new_positions: (B, 22, 3) New global joint positions
-    """
-    return extractor.process_flow_output(flow_output, prev_frame_271d)

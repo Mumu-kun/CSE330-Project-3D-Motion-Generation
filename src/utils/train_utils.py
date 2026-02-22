@@ -25,6 +25,7 @@ from typing import Optional, List, Union, Tuple
 from tqdm import tqdm
 
 from utils.wandb_logger import WandbLogger
+from utils.motion_utils import RootPositionTracker, flow_output_to_271d
 
 
 # =============================================================================
@@ -286,6 +287,13 @@ def train(
         print(f"Saved checkpoint: {path}")
 
     try:
+        use_amp = device.startswith("cuda")
+        amp_dtype = torch.float32  # Default for CPU
+        if use_amp:
+            amp_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
+
         for epoch in tqdm(
             range(start_epoch, num_epochs), desc="Training", unit="epoch"
         ):
@@ -343,16 +351,10 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
 
                 # 6. Forward pass with mixed precision (CPU-safe)
-                use_amp = device.startswith("cuda")
-                amp_dtype = torch.float32  # Default for CPU
-                if use_amp:
-                    amp_dtype = (
-                        torch.bfloat16
-                        if torch.cuda.is_bf16_supported()
-                        else torch.float16
-                    )
 
                 with torch.amp.autocast(device, dtype=amp_dtype, enabled=use_amp):
+                    ## TF training
+
                     # Encode context
                     contexts = encoder(
                         text=text_input,
@@ -368,13 +370,13 @@ def train(
 
                     # Previous frames and targets
                     prev_frames = hist[:, -num_pred_frames:]
-                    target_frames = target_frames[:, -num_pred_frames:]
+                    target_frames_tf = target_frames[:, -num_pred_frames:]
 
                     # Flatten for predictor
                     B, N, J, D = pred_contexts.shape
                     contexts_flat = pred_contexts.reshape(B * N, J, D)
                     prev_flat = prev_frames.reshape(B * N, 271)
-                    targets_flat = target_frames.reshape(B * N, 271)
+                    targets_flat = target_frames_tf.reshape(B * N, 271)
 
                     # Extract features
                     prev_features = extract_prev_frame_features(prev_flat)  # (B*N, 261)
@@ -398,7 +400,108 @@ def train(
 
                     # Loss: velocity field prediction
                     target_v = clean_targets - noise
-                    loss = F.mse_loss(pred, target_v)
+                    loss_tf = F.mse_loss(pred, target_v)
+
+                    ## Rollout training
+                    loss_ar = torch.tensor(0.0, device=device)
+                    rollout_steps = min(4, target_frames.shape[1] - 1)
+                    start_ar = target_frames.shape[1] - rollout_steps
+
+                    current_history = hist[:, :start_ar]
+                    target_frames_ar = target_frames[
+                        :, start_ar - 1 : start_ar - 1 + rollout_steps
+                    ]
+                    root_tracker = RootPositionTracker.from_history(current_history)
+
+                    for step in range(rollout_steps):
+
+                        # ---------------------------------
+                        # 1. Encode current history
+                        # ---------------------------------
+                        contexts_roll = encoder(
+                            text=text_input,
+                            input_features=current_history,
+                            batch_size=B,
+                        )
+
+                        context_last = contexts_roll[:, -1]  # (B, 22, D)
+                        prev_frame = current_history[:, -1]  # (B, 271)
+
+                        # ---------------------------------
+                        # 2. Prepare flow inputs
+                        # ---------------------------------
+                        prev_features = extract_prev_frame_features(prev_frame)
+
+                        clean_target = extract_clean_target(target_frames_ar[:, step])
+
+                        t = torch.rand(B, device=device)
+                        noise = torch.randn_like(clean_target)
+
+                        x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
+
+                        # ---------------------------------
+                        # 3. Predict velocity
+                        # ---------------------------------
+                        pred_roll = predictor(
+                            history_features=context_last,
+                            noise_level=t,
+                            noisy_target=x_t,
+                            prev_frame_features=prev_features,
+                        )
+
+                        target_v_roll = clean_target - noise
+                        step_loss = F.mse_loss(pred_roll, target_v_roll)
+
+                        loss_ar = loss_ar + step_loss
+
+                        # ---------------------------------
+                        # 4. Generate predicted next frame
+                        # ---------------------------------
+                        # ---------------------------------
+                        # Run mini ODE sampling
+                        # ---------------------------------
+                        x_sample = torch.randn_like(clean_target)
+
+                        num_steps = 10  # small, cheaper than inference
+                        dt = 1.0 / num_steps
+
+                        for s in range(num_steps):
+                            t_step = torch.full((B,), s * dt, device=device)
+
+                            v = predictor(
+                                history_features=context_last,
+                                noise_level=t_step,
+                                noisy_target=x_sample,
+                                prev_frame_features=prev_features,
+                            )
+
+                            x_sample = x_sample + v * dt
+
+                        clean_pred = x_sample.detach()
+
+                        prev_root_pos = root_tracker.get()
+                        pred_frame, new_root_pos = flow_output_to_271d(
+                            clean_pred,
+                            prev_frame,
+                            prev_root_pos,
+                        )
+
+                        root_tracker.root_pos = new_root_pos
+
+                        # ---------------------------------
+                        # 5. Append predicted frame
+                        # ---------------------------------
+                        current_history = torch.cat(
+                            [current_history, pred_frame.unsqueeze(1)], dim=1
+                        )
+
+                    if rollout_steps > 0:
+                        loss_ar = loss_ar / rollout_steps
+                    else:
+                        loss_ar = torch.tensor(0.0, device=device)
+
+                lambda_ar = 0.5
+                loss = loss_tf + lambda_ar * loss_ar
 
                 # 7. Backward pass
                 scaler.scale(loss).backward()
@@ -436,6 +539,8 @@ def train(
                 if wandb_logger is not None:
                     wandb_logger.log(
                         {
+                            "train/loss_tf": loss_tf.item(),
+                            "train/loss_ar": loss_ar.item(),
                             "train/loss": loss.item(),
                             "train/lr": lr,
                             "train/epoch": epoch,
@@ -585,13 +690,13 @@ def validate(
             clean_target = extract_clean_target(target_frame)
 
             # Encode context
-            context = encoder(text=text, input_features=hist, batch_size=B)
+            context = encoder(text=text, input_features=hist, batch_size=B)[:, -1, :, :]
 
             # Flow matching
             t = torch.rand(B, device=device)
             noise = torch.randn_like(clean_target)
             x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
-
+            print(context.shape)
             pred = predictor(
                 history_features=context,
                 noise_level=t,
@@ -686,7 +791,9 @@ def generate_free_running(
     with torch.no_grad():
         for frame_idx in range(num_frames):
             # Encode context
-            context = encoder(text=text, input_features=history, batch_size=B)
+            context = encoder(text=text, input_features=history, batch_size=B)[
+                :, -1, :, :
+            ]  # (B, 22, model_dim)
 
             # Extract previous frame features (from last 271D frame in history)
             prev_features = extract_prev_frame_features(history[:, -1])
