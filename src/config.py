@@ -54,26 +54,25 @@ class Config:
     dataset_name: str = "t2m"  # "t2m" for HumanML3D
     unit_length: int = 5
 
-    # Model architecture - MotionHistoryEncoder (Dual-MLP)
+    # Model architecture - MotionHistoryEncoder (Transformer-based)
     text_embedding_dim: int = 512  # CLIP embedding size
-    text_projection_dim: int = 64  # Latent text size
-    joint_feature_projection_dim: int = 64  # Size of joint-level latent tokens
     per_joint_out_dim: int = 64  # Context vector size per joint
+    max_text_seq_len: int = 1  # CLIP max sequence length
 
     # Model architecture - General
     model_dim: int = 256  # Primary embedding size for sequence/spatial cores
-    num_encoder_layers: int = 2  # GRU layers
+    num_encoder_layers: int = 4  # Transformer layers (was GRU layers)
     dropout: float = 0.1
-    bidirectional_gru: bool = False
 
     # Model architecture - FlowMatchingPredictor (ARFM)
     num_flow_layers: int = 4  # Spatial Transformer layers
     num_heads: int = 4  # Attention heads in spatial transformer
+    time_embed_dim: int = 64  # Sinusoidal time embedding dimension
 
     # Training settings
     batch_size: int = 200
     learning_rate: float = 1e-4
-    num_epochs: int = 400
+    num_epochs: int = 200
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
 
@@ -91,7 +90,7 @@ class Config:
     guidance_scale: float = 1.0  # For classifier-free guidance (if used)
 
     # Data loading
-    num_workers: int = 0
+    num_workers: int = 4
     pin_memory: bool = True
 
     # Logging and checkpointing
@@ -108,11 +107,6 @@ class Config:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)
-
-    @property
-    def context_encoder_output_dim(self) -> int:
-        """Output dimension of the context encoder."""
-        return self.model_dim * (2 if self.bidirectional_gru else 1)
 
     def to_dict(self) -> dict:
         """Export the configuration as a serializable dictionary."""

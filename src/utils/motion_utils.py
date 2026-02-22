@@ -22,7 +22,7 @@ API:
 import torch
 import numpy as np
 from typing import List, Tuple, Dict, Any, Optional
-from .quaternion import (
+from utils.quaternion import (
     qrot,
     qinv,
     qmul,
@@ -438,8 +438,16 @@ def features_to_positions(
     root_vel_z = root_features[..., 2:3]  # (..., 1)
 
     # Cumulative sum to recover absolute X and Z positions
-    root_pos_x = torch.cumsum(root_vel_x, dim=-1)
-    root_pos_z = torch.cumsum(root_vel_z, dim=-1)
+    # For input shape (N, 271), we need to sum along dim=0 (time dimension)
+    # Handle both single sequence (N, 271) and batched (B, N, 271) inputs
+    if features.ndim == 2:
+        # Single sequence: (N, 271) -> cumsum along dim=0
+        root_pos_x = torch.cumsum(root_vel_x, dim=0)
+        root_pos_z = torch.cumsum(root_vel_z, dim=0)
+    else:
+        # Batched: (B, N, 271) -> cumsum along dim=1 (time dimension)
+        root_pos_x = torch.cumsum(root_vel_x, dim=-2)
+        root_pos_z = torch.cumsum(root_vel_z, dim=-2)
     global_root_pos = torch.cat([root_pos_x, root_height_y, root_pos_z], dim=-1)
 
     # Direct transform: RIC -> global
@@ -448,6 +456,112 @@ def features_to_positions(
     positions = global_root_pos.unsqueeze(-2) + qrot(qinv(root_quat_expanded), ric)
 
     return positions
+
+
+def flow_output_to_positions(
+    flow_output: torch.Tensor,
+    prev_root_pos: torch.Tensor,
+    prev_root_rot_6d: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reconstruct global joint positions from FlowMatchingPredictor output (72D).
+
+    FlowMatchingPredictor output format (72D):
+        [0:9]   Root features: height (1D) + velocity (2D) + rotation_6d (6D)
+        [9:72]  Joint RIC positions: 21 non-root joints x 3D = 63D
+
+    This function is designed for autoregressive generation where:
+    - Root position is updated using predicted velocity
+    - Root rotation comes from the prediction
+    - Joint positions are reconstructed from RIC
+
+    Args:
+        flow_output: FlowMatchingPredictor output (B, 72)
+        prev_root_pos: Previous frame root position (B, 3)
+        prev_root_rot_6d: Previous frame root rotation in 6D (B, 6)
+
+    Returns:
+        Global joint positions (B, 22, 3)
+    """
+    B = flow_output.shape[0]
+    device = flow_output.device
+    dtype = flow_output.dtype
+
+    # Extract root features (9D)
+    root_height = flow_output[:, 0:1]  # (B, 1)
+    root_vel = flow_output[:, 1:3]  # (B, 2) - velocity X, Z
+    root_rot_6d = flow_output[:, 3:9]  # (B, 6)
+
+    # Extract joint RIC positions (63D -> 21 joints x 3D)
+    joint_ric = flow_output[:, 9:72].reshape(B, 21, 3)  # (B, 21, 3)
+
+    # Reconstruct root position
+    # Height is absolute, X and Z are updated by velocity
+    new_root_x = prev_root_pos[:, 0:1] + root_vel[:, 0:1]  # X from velocity
+    new_root_y = root_height  # Y is absolute height
+    new_root_z = prev_root_pos[:, 2:3] + root_vel[:, 1:2]  # Z from velocity
+    new_root_pos = torch.cat([new_root_x, new_root_y, new_root_z], dim=-1)  # (B, 3)
+
+    # Convert root rotation to quaternion
+    root_quat = cont6d_to_quaternion(root_rot_6d)  # (B, 4)
+
+    # Reconstruct joint positions from RIC
+    # RIC is in root-local coordinates, need to rotate and translate to global
+    # global_joint = root_pos + rotate_inverse(RIC, root_rot)
+    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 21, -1)  # (B, 21, 4)
+    global_joint_offsets = qrot(qinv(root_quat_expanded), joint_ric)  # (B, 21, 3)
+
+    # Add root position to get global joint positions
+    global_joints = new_root_pos.unsqueeze(1) + global_joint_offsets  # (B, 21, 3)
+
+    # Combine root and joints: root at index 0, then 21 joints
+    positions = torch.cat(
+        [new_root_pos.unsqueeze(1), global_joints], dim=1
+    )  # (B, 22, 3)
+
+    return positions
+
+
+def flow_output_to_displacements(
+    flow_output: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Extract joint displacements from FlowMatchingPredictor output (72D).
+
+    This is a simpler interpretation where the output represents
+    per-joint displacements that can be added to current positions.
+
+    FlowMatchingPredictor output format (72D):
+        [0:9]   Root features: height (1D) + velocity (2D) + rotation_6d (6D)
+        [9:72]  Joint RIC positions: 21 non-root joints x 3D = 63D
+
+    Args:
+        flow_output: FlowMatchingPredictor output (B, 72)
+
+    Returns:
+        Joint displacements (B, 22, 3) - can be added to current positions
+    """
+    B = flow_output.shape[0]
+    device = flow_output.device
+    dtype = flow_output.dtype
+
+    # Extract root velocity (interpret as displacement)
+    root_disp_x = flow_output[:, 1:2]  # (B, 1)
+    root_disp_z = flow_output[:, 2:3]  # (B, 1)
+    root_disp_y = torch.zeros_like(root_disp_x)  # No Y displacement from velocity
+    root_disp = torch.cat([root_disp_x, root_disp_y, root_disp_z], dim=-1)  # (B, 3)
+
+    # Extract joint RIC as displacements
+    joint_disps = flow_output[:, 9:72].reshape(B, 21, 3)  # (B, 21, 3)
+
+    # Combine: root displacement at index 0, then 21 joint displacements
+    # Note: For joint 0 (root), we use the root displacement
+    # For joints 1-21, we use the RIC values as displacements
+    displacements = torch.cat(
+        [root_disp.unsqueeze(1), joint_disps], dim=1
+    )  # (B, 22, 3)
+
+    return displacements
 
 
 # ============================================================================
@@ -627,32 +741,73 @@ class IncrementalFeatureExtractor:
         self.prev_fk_positions = None
         self.is_initialized = False
 
+    def process_flow_output(
+        self,
+        flow_output: torch.Tensor,
+        prev_frame_271d: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Process 72D flow output and extract 271D features.
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
+        This is a convenience method that combines flow_output_to_positions()
+        with process_frame() for autoregressive generation.
+
+        Args:
+            flow_output: (B, 72) FlowMatchingPredictor output
+            prev_frame_271d: (B, 271) Previous frame features
+
+        Returns:
+            new_frame_271d: (B, 271) New frame features
+            new_positions: (B, 22, 3) New global joint positions
+        """
+        # Extract previous root info from 271D features
+        # Root position needs to be reconstructed from velocity form
+        prev_root_height = prev_frame_271d[:, 0:1]  # Y height (absolute)
+        # For X and Z, we need cumulative position tracking
+        # Use prev_positions if available, otherwise start from origin
+        if self.prev_positions is not None:
+            prev_root_pos = self.prev_positions[:, 0].clone()  # (B, 3)
+        else:
+            # Initialize from prev_frame_271d
+            prev_root_pos = torch.zeros(
+                flow_output.shape[0],
+                3,
+                device=flow_output.device,
+                dtype=flow_output.dtype,
+            )
+            prev_root_pos[:, 1] = prev_root_height.squeeze(-1)  # Y height
+
+        # Extract previous root rotation (6D)
+        prev_root_rot_6d = prev_frame_271d[:, 69:75]  # (B, 6)
+
+        # Convert 72D → positions
+        new_positions = flow_output_to_positions(
+            flow_output, prev_root_pos, prev_root_rot_6d
+        )
+
+        # Convert positions → 271D features
+        new_frame_271d = self.process_frame(new_positions)
+
+        return new_frame_271d, new_positions
 
 
-def get_feature_subset(
-    features: torch.Tensor,
-    subset_names: List[str],
-) -> torch.Tensor:
+def flow_output_to_271d(
+    flow_output: torch.Tensor,
+    prev_frame_271d: torch.Tensor,
+    extractor: IncrementalFeatureExtractor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Extract a subset of features by name.
+    Convert 72D flow output to 271D features.
+
+    Convenience function that wraps IncrementalFeatureExtractor.process_flow_output().
 
     Args:
-        features: Feature vectors (..., 271)
-        subset_names: List of feature names to extract
+        flow_output: (B, 72) FlowMatchingPredictor output
+        prev_frame_271d: (B, 271) Previous frame features
+        extractor: IncrementalFeatureExtractor instance (must be initialized)
 
     Returns:
-        Concatenated subset of features
+        new_frame_271d: (B, 271) New frame features
+        new_positions: (B, 22, 3) New global joint positions
     """
-    subsets = []
-    for name in subset_names:
-        if name not in FEATURE_SLICES:
-            raise ValueError(
-                f"Unknown feature: {name}. Available: {list(FEATURE_SLICES.keys())}"
-            )
-        subsets.append(features[..., FEATURE_SLICES[name]])
-
-    return torch.cat(subsets, dim=-1)
+    return extractor.process_flow_output(flow_output, prev_frame_271d)

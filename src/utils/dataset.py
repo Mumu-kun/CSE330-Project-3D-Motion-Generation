@@ -13,7 +13,6 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from config import Config
-from .motion_utils import get_feature_vec_subset
 
 
 class Text2MotionDataset(Dataset):
@@ -157,7 +156,7 @@ class Text2MotionDataset(Dataset):
             )
 
             # LAZY IMPORT: Only import when needed
-            from .text_encoder import CLIPEncoder
+            from utils.text_encoder import CLIPEncoder
 
             # Initialize CLIP Encoder only if needed (to save VRAM if cached)
             clip_encoder = CLIPEncoder(model_name="openai/clip-vit-base-patch32")
@@ -169,7 +168,7 @@ class Text2MotionDataset(Dataset):
             ):
                 batch_caps = missing_captions[i : i + batch_size]
                 with torch.no_grad():
-                    # (B, 512)
+                    # (B, 77, 512) - CLIP sequence embeddings
                     embeddings = clip_encoder(batch_caps).cpu()
 
                 for cap, emb in zip(batch_caps, embeddings):
@@ -205,7 +204,7 @@ class Text2MotionDataset(Dataset):
         data = self.data_dict[self.name_list[idx]]
 
         # Get raw data from dict
-        motion = data["motion"]  # numpy array (T, 263)
+        motion = data["motion"]  # numpy array (T, 271)
         joints = data["joints"]  # numpy array (T, 22, 3)
         original_length = data["length"]  # int, original number of frames
         text_list = data["text"]  # list of text dicts
@@ -215,7 +214,7 @@ class Text2MotionDataset(Dataset):
         caption = text_data["caption"]
 
         # ===== CONVERT TO TENSORS =====
-        motion = torch.from_numpy(motion.copy()).float()  # (T, 263)
+        motion = torch.from_numpy(motion.copy()).float()  # (T, 271)
         joints = torch.from_numpy(joints.copy()).float()  # (T, 22, 3)
 
         # ===== NORMALIZE =====
@@ -286,24 +285,11 @@ class Text2MotionDataset(Dataset):
             motion.shape[0] == target_len
         ), f"Motion shape[0]={motion.shape[0]}, expected {target_len}"
         assert (
-            motion.shape[1] == 263
-        ), f"Motion shape[1]={motion.shape[1]}, expected 263"
+            motion.shape[1] == 271
+        ), f"Motion shape[1]={motion.shape[1]}, expected 271"
         assert (
             joints.shape[0] == target_len
         ), f"Joints shape[0]={joints.shape[0]}, expected {target_len}"
-
-        # ===== EXTRACT FEATURES =====
-        history_features = get_feature_vec_subset(motion, self.feature_dims)
-
-        # Ensure it's a tensor
-        if isinstance(history_features, np.ndarray):
-            history_features = torch.from_numpy(history_features).float()
-        else:
-            history_features = history_features.float()
-
-        assert (
-            history_features.shape[0] == target_len
-        ), f"history_features shape[0]={history_features.shape[0]}, expected {target_len}"
 
         # ===== GET TEXT EMBEDDING =====
         text_embedding = self.text_cache[caption]
@@ -312,7 +298,9 @@ class Text2MotionDataset(Dataset):
         else:
             text_embedding = text_embedding.float()
 
-        return caption, history_features, motion, joints, m_length, text_embedding
+        # text_embedding shape: (77, 512) - CLIP sequence embeddings
+        # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
+        return caption, motion, joints, m_length, text_embedding
 
     def reset_min_len(self, length):
         assert length <= self.max_motion_length
@@ -322,29 +310,29 @@ class Text2MotionDataset(Dataset):
 
 from typing import List, Dict, Any
 
+# CLIP constants
+CLIP_MAX_SEQ_LEN = 77
+CLIP_EMBED_DIM = 512
+
 
 def text2motion_collate_fn(
-    batch: List[
-        Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]
-    ],
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor]],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
     Expects each sample to be a tuple:
       - caption: str
-      - history_features: (max_T, C_in = 137) torch.Tensor
-      - motion: (max_T, 263) torch.Tensor
+      - motion: (max_T, 271) torch.Tensor - full 271D features
       - joints: (max_T, J, 3) torch.Tensor
       - length: int
-      - text_embedding: (512,) torch.Tensor
+      - text_embedding: (77, 512) torch.Tensor - CLIP sequence embeddings
     """
     # Lists of items
     captions = [b[0] for b in batch]
-    cond_feats_list = [b[1] for b in batch]  # each (T, C_in)
-    motions_list = [b[2] for b in batch]
-    joints_list = [b[3] for b in batch]
-    lengths = [b[4] for b in batch]
-    text_embs_list = [b[5] for b in batch]
+    motions_list = [b[1] for b in batch]
+    joints_list = [b[2] for b in batch]
+    lengths = [b[3] for b in batch]
+    text_embs_list = [b[4] for b in batch]
 
     # Helper to ensure all are tensors
     def to_tensor(x):
@@ -356,21 +344,19 @@ def text2motion_collate_fn(
             return torch.tensor(x).float()
 
     # Convert all to tensors (redundant safety check)
-    cond_feats_list = [to_tensor(x) for x in cond_feats_list]
     motions_list = [to_tensor(x) for x in motions_list]
     joints_list = [to_tensor(x) for x in joints_list]
     text_embs_list = [to_tensor(x) for x in text_embs_list]
 
     # Stack tensors directly
-    cond_feature_batch = torch.stack(cond_feats_list, dim=0)  # (B, T, C_in)
-    motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 263)
+    motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)
     joints_batch = torch.stack(joints_list, dim=0)  # (B, T, J, 3)
     length_batch = torch.tensor(lengths, dtype=torch.long)  # (B,)
-    text_emb_batch = torch.stack(text_embs_list, dim=0)  # (B, 512)
+
+    text_emb_batch = torch.stack(text_embs_list, dim=0)  # (B, 1, 512)
 
     return {
         "captions": captions,
-        "history_features": cond_feature_batch,
         "motion": motion_batch,
         "joints": joints_batch,
         "lengths": length_batch,
@@ -415,7 +401,7 @@ def create_dataloader(
         dataset_obj,
         batch_size=config.batch_size,
         shuffle=shuffle,
-        num_workers=0,  # CRITICAL: Must be 0 to avoid serialization issues
+        num_workers=config.num_workers,
         pin_memory=config.pin_memory,
         collate_fn=text2motion_collate_fn,
     )
@@ -431,7 +417,7 @@ def load_sample(dataset_path: Path, file_id: str) -> Dict[str, Optional[Any]]:
 
     Returns:
         Dictionary with keys:
-        - 'features': Feature vectors (nframe, 263) from new_joint_vecs
+        - 'features': Feature vectors (nframe, 271) from new_joint_vecs
         - 'joints': Joint positions (nframe, 22, 3) from new_joints
         - 'text': Text description from texts folder
         - 'file_id': Sample ID

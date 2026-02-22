@@ -257,7 +257,7 @@ class MotionHistoryEncoder(nn.Module):
         joint_count: int = 22,
         model_dim: int = 256,
         num_layers: int = 4,  # Transformer layers (default 4)
-        max_text_seq_len: int = 77,  # CLIP max sequence length
+        max_text_seq_len: int = 1,  # CLIP max sequence length
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
@@ -353,6 +353,7 @@ class MotionHistoryEncoder(nn.Module):
         input_features: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
         batch_size: Optional[int] = None,
+        return_all_timesteps: bool = False,
     ) -> torch.Tensor:
         """
         ARFM Feature Fusion Transformer forward pass.
@@ -464,10 +465,11 @@ class MotionHistoryEncoder(nn.Module):
         for block in self.blocks:
             x = block(x)
 
-        x = self.final_norm(x)
+        x = self.final_norm(x)  # (B, L_text + T, 22, D)
 
-        motion_summary = x.mean(dim=1)  # (B, 22, D)
-        out = self.output_proj(motion_summary)  # (B, 22, per_joint_out_dim)
+        x = x[:, -T:]  # (B, T, 22, D)
+
+        out = self.output_proj(x)  # (B, T, 22, out_dim)
 
         return out
 
@@ -534,7 +536,7 @@ class FlowMatchingPredictor(nn.Module):
         - Conditional context from MotionHistoryEncoder
         - Provides temporal and spatial history for all joints including root
 
-    - noisy_target: (B, 72) per frame
+    - noisy_target: (B, 72)
         - Root features (first 9D):
             - 1D root height
             - 2D root local velocity (rotation-invariant)
@@ -548,8 +550,8 @@ class FlowMatchingPredictor(nn.Module):
             - 1D root height
             - 2D root local velocity (rotation-invariant)
             - 6D absolute rotation
-        - Joint features (next 63D):
-            - 21 non-root joints
+        - Joint features (next 252D):
+            - 21 non-root joints x 12D each:
                 - 3D RIC positions
                 - 6D rotations
                 - 3D local velocities
@@ -734,6 +736,8 @@ class HumanMotionGenerator(nn.Module):
     """
     Top-level wrapper for the Human Motion Generation pipeline.
     Integrates MotionHistoryEncoder (Context) and FlowMatchingPredictor (Spatial Generation).
+
+    Updated to use 271D features and proper 72D → 271D conversion for autoregressive generation.
     """
 
     def __init__(
@@ -744,13 +748,6 @@ class HumanMotionGenerator(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.predictor = predictor
-
-    """
-    Updated generate_sequence() methods for HumanMotionGenerator class
-    Returns GLOBAL JOINT POSITIONS instead of feature vectors
-
-    Add these methods to the HumanMotionGenerator class in models.py
-    """
 
     def generate_sequence(
         self,
@@ -763,33 +760,58 @@ class HumanMotionGenerator(nn.Module):
         dataset_type: str = "t2m",
     ) -> torch.Tensor:
         """
-        Generate n consecutive animation frames where each frame feeds into the next iteration.
-        Uses torch-based incremental feature extraction.
+        Generate n consecutive animation frames autoregressively.
+
+        Uses proper 72D → positions → 271D conversion pipeline:
+        1. Start with null history or provided initial features
+        2. For each frame:
+           - Encode context from history
+           - Run flow matching to generate 72D output
+           - Convert 72D → 22x3 positions using flow_output_to_positions()
+           - Convert positions → 271D features using IncrementalFeatureExtractor
+           - Update history for next frame
 
         Returns:
             joint_positions: (B, num_frames, 22, 3) - Global joint positions
         """
+        from utils.motion_utils import (
+            IncrementalFeatureExtractor,
+            features_to_positions,
+            flow_output_to_positions,
+        )
+        from utils.train_utils import extract_prev_frame_features
 
         self.eval()
         with torch.no_grad():
-            if isinstance(text, torch.Tensor):
+            # Handle text encoding
+            if isinstance(text, str):
+                # Single string - encode and use
+                from utils.text_encoder import CLIPEncoder
+
+                clip_encoder = CLIPEncoder()
+                text = clip_encoder(text)  # (1, 1, 512)
+                B = 1
+            elif isinstance(text, list):
+                # List of strings - encode all
+                from utils.text_encoder import CLIPEncoder
+
+                clip_encoder = CLIPEncoder()
+                text = clip_encoder(text)  # (B, 1, 512)
                 B = text.shape[0]
             else:
-                B = 1
+                # Already a tensor
+                B = text.shape[0]
             device = next(self.parameters()).device
 
-            T_hist = 15
-
-            # Initialize history
+            # Initialize history (single frame for simplicity)
             if input_features is None:
-                history = self.encoder.null_history.expand(B, T_hist, -1).clone()
+                history = self.encoder.null_history.expand(B, 1, -1).clone()
             else:
-                if input_features.shape[1] >= T_hist:
-                    history = input_features[:, -T_hist:, :]
-                else:
-                    pad_size = T_hist - input_features.shape[1]
-                    null_pad = self.encoder.null_history.expand(B, pad_size, -1).clone()
-                    history = torch.cat([null_pad, input_features], dim=1)
+                # input_features must be (B, N, 271)
+                assert (
+                    input_features.ndim == 3
+                ), f"input_features must be (B, N, 271), got {input_features.shape}"
+                history = input_features
 
             # Initialize incremental feature extractor
             extractor = IncrementalFeatureExtractor(
@@ -800,8 +822,8 @@ class HumanMotionGenerator(nn.Module):
 
             joint_sequence = []
 
-            # Extract initial global joint positions
-            init_frame = history[:, -1, :]  # (B, 263)
+            # Extract initial global joint positions from 271D features
+            init_frame = history[:, -1, :]  # (B, 271)
             current_joints_global = features_to_positions(
                 init_frame, dataset_type=dataset_type
             )  # (B, 22, 3)
@@ -809,45 +831,33 @@ class HumanMotionGenerator(nn.Module):
             # Initialize extractor with first frame
             extractor.initialize(current_joints_global)
 
-            for frame_idx in range(num_frames):
-                t_prog = torch.full((B,), frame_idx / num_frames, device=device)
+            # Track current frame 271D for conversion
+            current_frame_271d = init_frame.clone()
 
-                # Encode context
+            for frame_idx in range(num_frames):
+                # Encode context (conditional and unconditional for CFG)
+                # Encoder returns (B, T_hist, 22, out_dim), take last frame
                 context_cond = self.encoder(
                     batch_size=B,
                     text=text,
                     input_features=history,
-                    # total_duration=total_duration,
-                )
+                )[
+                    :, -1, :, :
+                ]  # (B, 22, out_dim)
 
                 context_uncond = self.encoder(
                     batch_size=B,
                     text=None,
                     input_features=history,
-                    # total_duration=total_duration,
-                )
+                )[
+                    :, -1, :, :
+                ]  # (B, 22, out_dim)
 
-                # Extract previous frame features (271D format)
-                # - RIC positions: [3:69] for all 22 joints
-                # - 6D rotations: [69:201] for all 22 joints
-                # - Velocities: [201:267] for all 22 joints
-                last_frame = history[:, -1, :]
+                # Extract previous frame features (261D) from last 271D frame
+                prev_frame_features = extract_prev_frame_features(history[:, -1])
 
-                # RIC positions (all 22 joints, no need to add root)
-                prev_pos_ric = last_frame[:, 3:69].reshape(B, 22, 3)
-
-                # 6D rotations (all 22 joints, including root)
-                prev_rot6d = last_frame[:, 69:201].reshape(B, 22, 6)
-
-                # Local velocities (all 22 joints)
-                prev_v = last_frame[:, 201:267].reshape(B, 22, 3)
-
-                prev_frame_features = torch.cat(
-                    [prev_pos_ric, prev_rot6d, prev_v], dim=-1
-                )  # (B, 22, 12) - pos(3) + rot(6) + vel(3)
-
-                # Generate displacement
-                x_t = torch.randn((B, 22, 3), device=device)
+                # Flow matching generation
+                x_t = torch.randn((B, 72), device=device)
                 dt = 1.0 / num_steps
 
                 for step in range(num_steps):
@@ -858,7 +868,6 @@ class HumanMotionGenerator(nn.Module):
                         noise_level=t,
                         noisy_target=x_t,
                         prev_frame_features=prev_frame_features,
-                        # temporal_progress=t_prog,
                     )
 
                     v_uncond = self.predictor(
@@ -866,37 +875,34 @@ class HumanMotionGenerator(nn.Module):
                         noise_level=t,
                         noisy_target=x_t,
                         prev_frame_features=prev_frame_features,
-                        # temporal_progress=t_prog,
                     )
 
+                    # Classifier-free guidance
                     v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
                     x_t = x_t + v_t * dt
 
-                # Update global joint positions
-                new_joints_global = current_joints_global + x_t
-                current_joints_global = new_joints_global.clone()
+                # Convert 72D output → positions → 271D features
+                # Use the extractor's process_flow_output method
+                new_frame_271d, new_positions = extractor.process_flow_output(
+                    x_t, current_frame_271d
+                )
+
+                # Update state
+                current_frame_271d = new_frame_271d
+                current_joints_global = new_positions
+
+                # Update history (single frame)
+                history = new_frame_271d.unsqueeze(1)
 
                 # Collect joint positions
-                joint_sequence.append(new_joints_global.cpu())
-
-                # EFFICIENT: Use torch-based incremental feature extraction
-                # Input: (B, 22, 3) torch tensor
-                # Output: (B, 263) torch tensor
-                new_frame_features = extractor.process_frame(
-                    new_joints_global
-                )  # Already on device
-
-                # Update history
-                history = torch.cat(
-                    [history[:, 1:, :], new_frame_features.unsqueeze(1)], dim=1
-                )
+                joint_sequence.append(new_positions)
 
                 if (frame_idx + 1) % 50 == 0:
                     print(f"Generated {frame_idx + 1}/{num_frames} frames")
 
             # Stack all joint positions
-            joint_positions = torch.stack(joint_sequence, dim=1).to(
-                device
+            joint_positions = torch.stack(
+                joint_sequence, dim=1
             )  # (B, num_frames, 22, 3)
 
             return joint_positions
@@ -916,13 +922,11 @@ class HumanMotionGenerator(nn.Module):
         encoder = MotionHistoryEncoder(
             frame_feature_dim=config.motion_dim,
             text_embedding_dim=config.text_embedding_dim,
-            joint_feature_projection_dim=config.joint_feature_projection_dim,
-            text_projection_dim=config.text_projection_dim,
             per_joint_out_dim=config.per_joint_out_dim,
             joint_count=config.num_joints,
             model_dim=config.model_dim,
             num_layers=4,  # ARFM uses 4 transformer layers
-            max_text_seq_len=77,  # CLIP max sequence length
+            max_text_seq_len=config.max_text_seq_len,  # Use config value
             dropout=config.dropout,
         )
 
@@ -934,14 +938,14 @@ class HumanMotionGenerator(nn.Module):
         )
 
         # Load weights (Prefer EMA)
-        if "ema_mhe" in checkpoint and "ema_fmp" in checkpoint:
+        if "encoder_ema" in checkpoint and "predictor_ema" in checkpoint:
             print("Loading EMA weights for generation...")
-            encoder.load_state_dict(checkpoint["ema_mhe"])
-            predictor.load_state_dict(checkpoint["ema_fmp"])
+            encoder.load_state_dict(checkpoint["encoder_ema"])
+            predictor.load_state_dict(checkpoint["predictor_ema"])
         else:
             print("Loading standard weights (EMA not found)...")
-            encoder.load_state_dict(checkpoint["motion_history_encoder"])
-            predictor.load_state_dict(checkpoint["flow_predictor"])
+            encoder.load_state_dict(checkpoint["encoder"])
+            predictor.load_state_dict(checkpoint["predictor"])
 
         encoder.to(device)
         predictor.to(device)

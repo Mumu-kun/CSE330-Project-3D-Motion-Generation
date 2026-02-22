@@ -339,9 +339,13 @@ def cont6d_to_matrix(cont6d):
     x_raw = cont6d[..., 0:3]
     y_raw = cont6d[..., 3:6]
 
-    x = x_raw / torch.norm(x_raw, dim=-1, keepdim=True)
+    # Add epsilon to prevent division by zero
+    eps = 1e-8
+    x_norm = torch.norm(x_raw, dim=-1, keepdim=True).clamp(min=eps)
+    x = x_raw / x_norm
     z = torch.cross(x, y_raw, dim=-1)
-    z = z / torch.norm(z, dim=-1, keepdim=True)
+    z_norm = torch.norm(z, dim=-1, keepdim=True).clamp(min=eps)
+    z = z / z_norm
 
     y = torch.cross(z, x, dim=-1)
 

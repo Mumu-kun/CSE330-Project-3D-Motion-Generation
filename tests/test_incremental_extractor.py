@@ -11,10 +11,10 @@ import sys
 import os
 from pathlib import Path
 
-sys.path.append(os.path.join(os.path.dirname(__file__), "../src"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
-from utils.motion_utils import (
+from src.utils.motion_utils import (
     IncrementalFeatureExtractor,
     get_dataset_config,
     preprocess_sequence,

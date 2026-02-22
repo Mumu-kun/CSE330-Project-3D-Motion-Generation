@@ -6,45 +6,29 @@ Specific functionality is organized into submodules:
 - dataset.py: Data loading and Text2Motion dataset
 - motion_utils.py: Motion feature conversion and skeleton definitions
 - visualization.py: Motion visualization
-- bvh_utils.py: BVH file handling
-- metrics.py: Evaluation metrics
 """
 
 # Data Loading
-from .dataset import (
+from utils.dataset import (
     Text2MotionDataset,
     create_dataloader,
     load_sample,
 )
 
 # Motion Processing
-from .motion_utils import (
+from utils.motion_utils import (
     DATASET_CONFIGS,
     get_dataset_config,
     features_to_positions,
     preprocess_sequence,
-    get_feature_subset,
     IncrementalFeatureExtractor,
 )
 
 # Visualization
-from .visualization import (
+from utils.visualization import (
     plot_3d_motion,
     visualize_motion,
     compare_motions,
-)
-
-# BVH Utilities
-from .bvh_utils import (
-    joints_to_bvh,
-    save_bvh,
-    save_joints,
-    validate_bvh,
-)
-
-# Metrics
-from .metrics import (
-    compute_metrics,
 )
 
 __all__ = [
@@ -57,17 +41,9 @@ __all__ = [
     "get_dataset_config",
     "features_to_positions",
     "preprocess_sequence",
-    "get_feature_subset",
     "IncrementalFeatureExtractor",
     # Visualization
     "plot_3d_motion",
     "visualize_motion",
     "compare_motions",
-    # BVH Utilities
-    "joints_to_bvh",
-    "save_bvh",
-    "save_joints",
-    "validate_bvh",
-    # Metrics
-    "compute_metrics",
 ]

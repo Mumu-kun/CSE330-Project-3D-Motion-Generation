@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from pathlib import Path
 from typing import Optional, Any
-from .motion_utils import t2m_kinematic_chain
+from utils.motion_utils import T2M_KINEMATIC_CHAIN
 
 
 def plot_3d_motion(
@@ -39,7 +39,7 @@ def plot_3d_motion(
     colors = ["#2980b9", "#c0392b", "#27ae60", "#f39c12", "#8e44ad"]
     lines = [
         ax.plot([], [], [], color=colors[i % len(colors)], marker="o", ms=2, lw=2)[0]
-        for i in range(len(t2m_kinematic_chain))
+        for i in range(len(T2M_KINEMATIC_CHAIN))
     ]
 
     ax.set_xlabel("X (Side)")
@@ -62,7 +62,7 @@ def plot_3d_motion(
             ax.set_ylim3d([pos_min[2] - radius, pos_max[2] + radius])
             ax.set_zlim3d([pos_min[1], pos_max[1] + radius * 0.5])
 
-        for i, c_indices in enumerate(t2m_kinematic_chain):
+        for i, c_indices in enumerate(T2M_KINEMATIC_CHAIN):
             joints = motion[frame, c_indices, :]
             lines[i].set_data(joints[:, 0], joints[:, 2])
             lines[i].set_3d_properties(joints[:, 1])
