@@ -60,7 +60,7 @@ class Config:
 
     # Model architecture - General
     model_dim: int = 128  # Primary embedding size for sequence/spatial cores
-    num_encoder_layers: int = 3  # Transformer layers (was GRU layers)
+    num_encoder_layers: int = 4  # Transformer layers (was GRU layers)
     dropout: float = 0.1
 
     # Model architecture - FlowMatchingPredictor (ARFM)
@@ -69,9 +69,9 @@ class Config:
     time_embed_dim: int = 64  # Sinusoidal time embedding dimension
 
     # Training settings
-    batch_size: int = 100
+    batch_size: int = 192
     learning_rate: float = 1e-4
-    num_epochs: int = 200
+    num_epochs: int = 500
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
 

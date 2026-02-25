@@ -31,6 +31,54 @@ from utils.motion_utils import (
 )
 
 
+class KinematicChainEncoder(nn.Module):
+    """
+    Encodes the kinematic hierarchy of the skeleton.
+    Each joint is mapped to a unique (chain_id, depth) pair based on the T2M skeleton.
+    """
+
+    def __init__(self, model_dim: int) -> None:
+        super().__init__()
+        # t2m_kinematic_chain:
+        # 0: [0, 2, 5, 8, 11] (Root -> R-Leg)
+        # 1: [0, 1, 4, 7, 10] (Root -> L-Leg)
+        # 2: [0, 3, 6, 9, 12, 15] (Root -> Spine -> Head)
+        # 3: [9, 14, 17, 19, 21] (Neck -> R-Arm)
+        # 4: [9, 13, 16, 18, 20] (Neck -> L-Arm)
+
+        joint_to_chain = [0] * 22
+        joint_to_depth = [0] * 22
+
+        # Trace and assign:
+        # Chain 0: Root + Right Leg
+        for d, j in enumerate([0, 2, 5, 8, 11]):
+            joint_to_chain[j], joint_to_depth[j] = 0, d
+        # Chain 1: Left Leg
+        for d, j in enumerate([1, 4, 7, 10], 1):
+            joint_to_chain[j], joint_to_depth[j] = 1, d
+        # Chain 2: Spine + Head
+        for d, j in enumerate([3, 6, 9, 12, 15], 1):
+            joint_to_chain[j], joint_to_depth[j] = 2, d
+        # Chain 3: Right Arm (starts from joint 9, depth 3)
+        for d, j in enumerate([14, 17, 19, 21], 4):
+            joint_to_chain[j], joint_to_depth[j] = 3, d
+        # Chain 4: Left Arm (starts from joint 9, depth 3)
+        for d, j in enumerate([13, 16, 18, 20], 4):
+            joint_to_chain[j], joint_to_depth[j] = 4, d
+
+        self.register_buffer("joint_to_chain", torch.tensor(joint_to_chain))
+        self.register_buffer("joint_to_depth", torch.tensor(joint_to_depth))
+
+        self.chain_emb = nn.Embedding(5, model_dim // 2)
+        self.depth_emb = nn.Embedding(8, model_dim // 2)
+
+    def forward(self, joint_ids: torch.Tensor) -> torch.Tensor:
+        # joint_ids: (n_joints,)
+        chains = self.joint_to_chain[joint_ids]
+        depths = self.joint_to_depth[joint_ids]
+        return torch.cat([self.chain_emb(chains), self.depth_emb(depths)], dim=-1)
+
+
 class Rotary(nn.Module):
     def __init__(self, dim, base=10000):
         super().__init__()
@@ -491,54 +539,6 @@ class MotionHistoryEncoder(nn.Module):
     def output_dim(self) -> int:
         """Output dimension of the context encoder."""
         return self.per_joint_out_dim
-
-
-class KinematicChainEncoder(nn.Module):
-    """
-    Encodes the kinematic hierarchy of the skeleton.
-    Each joint is mapped to a unique (chain_id, depth) pair based on the T2M skeleton.
-    """
-
-    def __init__(self, model_dim: int) -> None:
-        super().__init__()
-        # t2m_kinematic_chain:
-        # 0: [0, 2, 5, 8, 11] (Root -> R-Leg)
-        # 1: [0, 1, 4, 7, 10] (Root -> L-Leg)
-        # 2: [0, 3, 6, 9, 12, 15] (Root -> Spine -> Head)
-        # 3: [9, 14, 17, 19, 21] (Neck -> R-Arm)
-        # 4: [9, 13, 16, 18, 20] (Neck -> L-Arm)
-
-        joint_to_chain = [0] * 22
-        joint_to_depth = [0] * 22
-
-        # Trace and assign:
-        # Chain 0: Root + Right Leg
-        for d, j in enumerate([0, 2, 5, 8, 11]):
-            joint_to_chain[j], joint_to_depth[j] = 0, d
-        # Chain 1: Left Leg
-        for d, j in enumerate([1, 4, 7, 10], 1):
-            joint_to_chain[j], joint_to_depth[j] = 1, d
-        # Chain 2: Spine + Head
-        for d, j in enumerate([3, 6, 9, 12, 15], 1):
-            joint_to_chain[j], joint_to_depth[j] = 2, d
-        # Chain 3: Right Arm (starts from joint 9, depth 3)
-        for d, j in enumerate([14, 17, 19, 21], 4):
-            joint_to_chain[j], joint_to_depth[j] = 3, d
-        # Chain 4: Left Arm (starts from joint 9, depth 3)
-        for d, j in enumerate([13, 16, 18, 20], 4):
-            joint_to_chain[j], joint_to_depth[j] = 4, d
-
-        self.register_buffer("joint_to_chain", torch.tensor(joint_to_chain))
-        self.register_buffer("joint_to_depth", torch.tensor(joint_to_depth))
-
-        self.chain_emb = nn.Embedding(5, model_dim // 2)
-        self.depth_emb = nn.Embedding(8, model_dim // 2)
-
-    def forward(self, joint_ids: torch.Tensor) -> torch.Tensor:
-        # joint_ids: (n_joints,)
-        chains = self.joint_to_chain[joint_ids]
-        depths = self.joint_to_depth[joint_ids]
-        return torch.cat([self.chain_emb(chains), self.depth_emb(depths)], dim=-1)
 
 
 class FlowMatchingPredictor(nn.Module):
