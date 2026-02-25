@@ -17,9 +17,40 @@ JOINTS: See src/utils/motion_utils.py:t2m_kinematic_chain
 chains: 0=L-leg[0,2,5,8,11] 1=R-leg[0,1,4,7,10] 2=spine[0,3,6,9,12,15] 3=R-arm[9,14,17,19,21] 4=L-arm[9,13,16,18,20]
 face_joints:[2,1,17,16] foot_r:[8,11] foot_l:[7,10]
 
+NORMALIZATION: See src/utils/motion_utils.py:FeatureNormalizer
+FeatureNormalizer: Handles normalization/denormalization of raw features
+  - normalize(features_271d) -> normalized_271d
+  - denormalize(features_271d) -> raw_271d
+  - normalize_flow_output(flow_72d) -> normalized_72d
+  - denormalize_flow_output(flow_72d) -> raw_72d
+  - normalize_prev_frame_features(prev_261d) -> normalized_261d
+  - denormalize_prev_frame_features(prev_261d) -> raw_261d
+  - load_from_files(mean_path, std_path) -> FeatureNormalizer
+
+DATA FLOW:
+  Dataset -> RAW features
+     |
+     v
+  Training: normalize in train_utils.py -> normalized features -> models(normalize=False)
+     |
+     v
+  Loss computed in normalized space
+     |
+     v
+  Inference: models(normalize=True) -> normalize internally -> ODE in normalized space
+     |
+     v
+  Denormalize output for reconstruction (via flow_output_to_271d)
+
 MODELS: See src/models.py
 MotionHistoryEncoder (ARFM Feature Fusion Transformer):
-  Input: text:(B, l_seq, 512) CLIP sequence embeddings, history:(B, T, 271) motion features
+  Input: text:(B, l_seq, 512) CLIP sequence embeddings, history:(B, T, 271) RAW motion features
+  __init__ params:
+    - normalizer: Optional[FeatureNormalizer] - for normalizing raw features
+  forward() params:
+    - normalize: bool = True - if True and normalizer set, normalize input_features
+                 Set to False during training (normalization handled externally)
+                 Set to True during inference (models normalize internally)
   Architecture:
     1. Text Prefix Tokens: CLIP sequence (B, l_seq, 512) -> linear -> (B, l_seq, d_model)
     2. Global Token: per-timestep global features (16D) -> linear -> 1 token/timestep
@@ -37,18 +68,25 @@ CLIPEncoder: See src/utils/text_encoder.py
   Output: (B, l_seq, 512) sequence embeddings (l_seq=77 for CLIP)
 
 FlowMatchingPredictor: (context:Bx22x64, t:B, x_t:Bx72, prev:Bx261, progress) -> v:Bx72
+  __init__ params:
+    - normalizer: Optional[FeatureNormalizer] - for normalizing raw features
+  forward() params:
+    - normalize: bool = True - if True and normalizer set, normalize prev_frame_features
+                 Note: noisy_target is already in normalized space (from ODE integration)
+                 Set to False during training (normalization handled externally)
+                 Set to True during inference (models normalize internally)
   Inputs:
     - history_features: (B, 22, per_joint_dim) - Context from MotionHistoryEncoder
     - noise_level: (B,) - Flow time t in [0,1]
-    - noisy_target: (B, 72) - Current noisy state x_t
+    - noisy_target: (B, 72) - Current noisy state x_t (in normalized space)
       - [0:9] Root features: height(1) + velocity(2) + rotation_6d(6)
       - [9:72] Joint RIC positions: 21 joints x 3D = 63D
-    - prev_frame_features: (B, 261) - Previous frame features
+    - prev_frame_features: (B, 261) - Previous frame features (RAW if normalize=True)
       - [0:9] Root features: height(1) + velocity(2) + rotation_6d(6)
       - [9:261] Joint features: 21 joints x 12D = 252D
         - Per joint: RIC position(3) + rotation_6d(6) + local_velocity(3) = 12D
     - temporal_progress: (B,) - Optional normalized frame progress
-  Output: pred_frame:(B, 72)
+  Output: pred_frame:(B, 72) - velocity field (in normalized space)
     - [0:9] Root prediction: height(1) + velocity(2) + rotation_6d(6)
     - [9:72] Joint RIC prediction: 21 joints x 3D = 63D
   Architecture:
@@ -75,11 +113,16 @@ Reconstruction Functions (src/utils/motion_utils.py):
     - Extract joint displacements from FlowMatchingPredictor output
     - Simpler interpretation: output as per-joint deltas to add to current positions
     - Verified: Root velocity extraction matches 271D features (tests/verify_reconstruction.py)
+  flow_output_to_271d(flow_output:Bx72, prev_frame:Bx271, prev_root_pos:Bx3) -> (new_frame:Bx271, new_root_pos:Bx3)
+    - Incrementally compute next 271D feature frame from flow output
+    - Computes ALL 22 joint rotations via IK from new_positions (not just root)
+    - Uses _compute_ik() to derive quaternions, then quaternion_to_cont6d() for 6D rotations
+    - Fully Markov and AR-safe; no cumulative sum or full sequence reconstruction
 
 HumanMotionGenerator: (text, num_frames, num_steps, guidance_scale, input_features) -> joints:(B, T, 22, 3)
   - Integrates MotionHistoryEncoder and FlowMatchingPredictor
   - Uses FULL HISTORY tracking for both positions and features
-  - Feature extraction via preprocess_sequence on full position sequence
+  - Feature extraction via sequence_joints_to_features on full position sequence
   - Classifier-free guidance: v = v_uncond + scale * (v_cond - v_uncond)
   - Input text: str, List[str], or pre-encoded tensor (B, 1, 512) from CLIPEncoder
   - input_features: Optional, shape (B, N, 271) or (B, 271) - initial motion history (uses null_history if None)
@@ -98,7 +141,7 @@ HumanMotionGenerator: (text, num_frames, num_steps, guidance_scale, input_featur
     5. Flow matching ODE loop -> flow_output (B, 72)
     6. flow_output_to_positions(flow_output, prev_root_pos, prev_root_rot_6d) -> new_positions
     7. Append new_positions to position_history
-    8. preprocess_sequence(FULL position_history) -> feature_history (B, N+1, 271)
+    8. sequence_joints_to_features(FULL position_history) -> feature_history (B, N+1, 271)
     9. Feature extraction matches training exactly (velocities from actual frame differences)
 
 CONFIG: See src/config.py
@@ -116,7 +159,7 @@ Infer (canonical round-trip):
     1. last_frame -> features_to_positions -> prev_positions
     2. CFG loop N steps -> flow_output (72D)
     3. flow_output_to_positions -> new_positions
-    4. stack(prev_positions, new_positions) -> preprocess_sequence -> extract frame 1 -> new_frame_271d
+    4. stack(prev_positions, new_positions) -> sequence_joints_to_features -> extract frame 1 -> new_frame_271d
     5. history = new_frame_271d.unsqueeze(1)
 
 TRAINING: See src/utils/train_utils.py
@@ -176,6 +219,8 @@ src/utils/quaternion.py - qrot, qmul, qinv
 src/utils/text_encoder.py - CLIP encoding
 
 TESTS: update test files on code interface change; remove previous redundant tests if new test is written
+tests/test_training_loop.py - Training loop and HumanMotionGenerator verification (8 tests)
+tests/test_rotation_roundtrip.py - Rotation roundtrip verification for flow_output_to_271d
 tests/test_flow_predictor.py - FlowMatchingPredictor unit tests (I/O shapes: 72D noisy, 261D prev, 72D output)
 tests/test_motion_encoder.py - MotionHistoryEncoder unit tests
 tests/test_nan_fix.py - HumanMotionGenerator.generate_sequence() NaN fix verification

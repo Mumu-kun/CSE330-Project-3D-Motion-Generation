@@ -13,6 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from config import Config
+from utils.motion_utils import FeatureNormalizer
 
 
 class Text2MotionDataset(Dataset):
@@ -184,8 +185,9 @@ class Text2MotionDataset(Dataset):
         else:
             print("All text embeddings are cached.")
 
-    def inv_transform(self, data):
-        return data * self.std + self.mean
+    def get_normalizer(self) -> FeatureNormalizer:
+        """Get a FeatureNormalizer instance for normalizing/denormalizing features."""
+        return FeatureNormalizer(mean=self.mean.clone(), std=self.std.clone())
 
     def __len__(self):
         return len(self.data_dict) - self.pointer
@@ -199,6 +201,9 @@ class Text2MotionDataset(Dataset):
         """
         Returns a single sample from the dataset.
         GUARANTEES: All returned tensors have shape (max_motion_length, features)
+
+        NOTE: Returns RAW (unnormalized) features. Normalization should be done
+        externally using FeatureNormalizer before passing to models.
         """
         idx = self.pointer + item
         data = self.data_dict[self.name_list[idx]]
@@ -214,11 +219,12 @@ class Text2MotionDataset(Dataset):
         caption = text_data["caption"]
 
         # ===== CONVERT TO TENSORS =====
-        motion = torch.from_numpy(motion.copy()).float()  # (T, 271)
+        motion = torch.from_numpy(motion.copy()).float()  # (T, 271) - RAW features
         joints = torch.from_numpy(joints.copy()).float()  # (T, 22, 3)
 
-        # ===== NORMALIZE =====
-        motion = (motion - self.mean) / self.std
+        # ===== NO NORMALIZATION HERE =====
+        # Normalization is handled externally via FeatureNormalizer
+        # motion = (motion - self.mean) / self.std  # REMOVED
 
         # ===== DETERMINE TARGET LENGTH =====
         # The m_length modification logic from config
@@ -308,8 +314,6 @@ class Text2MotionDataset(Dataset):
         print("Pointer Pointing at %d" % self.pointer)
 
 
-from typing import List, Dict, Any
-
 # CLIP constants
 CLIP_MAX_SEQ_LEN = 77
 CLIP_EMBED_DIM = 512
@@ -368,7 +372,7 @@ def create_dataloader(
     config: Config,
     split: str = "train",
     shuffle: bool = True,
-) -> DataLoader:
+) -> Tuple[DataLoader, FeatureNormalizer]:
     """
     Create DataLoader for Text2MotionDataset.
 
@@ -380,7 +384,9 @@ def create_dataloader(
         shuffle: Whether to shuffle data
 
     Returns:
-        DataLoader instance
+        Tuple of (DataLoader instance, FeatureNormalizer instance)
+        - DataLoader provides RAW (unnormalized) features
+        - FeatureNormalizer should be used to normalize features before passing to models
     """
     mean_path = config.dataset_path / "Mean.npy"
     std_path = config.dataset_path / "Std.npy"
@@ -397,7 +403,14 @@ def create_dataloader(
     dataset_obj = Text2MotionDataset(
         config, mean, std, split, feature_dims=config.feature_dims
     )
-    return DataLoader(
+
+    # Create FeatureNormalizer for external normalization
+    normalizer = FeatureNormalizer(
+        mean=torch.from_numpy(mean).float(),
+        std=torch.from_numpy(std).float(),
+    )
+
+    dataloader = DataLoader(
         dataset_obj,
         batch_size=config.batch_size,
         shuffle=shuffle,
@@ -405,6 +418,8 @@ def create_dataloader(
         pin_memory=config.pin_memory,
         collate_fn=text2motion_collate_fn,
     )
+
+    return dataloader, normalizer
 
 
 def load_sample(dataset_path: Path, file_id: str) -> Dict[str, Optional[Any]]:

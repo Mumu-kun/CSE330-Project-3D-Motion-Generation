@@ -13,7 +13,7 @@ Total: 271D per frame
 Note: Root X,Z are stored as velocities for autoregressive stability.
 
 API:
-- preprocess_sequence(): Dataset preprocessing (ground truth joints)
+- sequence_joints_to_features(): Dataset preprocessing (ground truth joints)
 - features_to_positions(): Reconstruction (features -> positions)
 - extract_features_from_predicted(): Inference (predicted joints)
 - IncrementalFeatureExtractor: Frame-by-frame inference
@@ -287,7 +287,213 @@ def _forward_kinematics(
 # ============================================================================
 
 
-def preprocess_sequence(
+def subset_271d_to_72d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Subset 271D features to 72D features for training.
+    Args:
+        x: (..., 271) tensor of 271D features
+    Returns:
+        x_72d: (..., 72) tensor of 72D features
+    """
+    slices = [
+        slice(0, 1),  # root height
+        slice(1, 3),  # root velocity
+        slice(69, 75),  # root rotation 6D
+        slice(6, 69),  # joint RIC positions
+    ]
+
+    x_72d_list = []
+
+    for sl in slices:
+        x_72d_list.append(x[..., sl])
+
+    x_72d = torch.cat(x_72d_list, dim=-1)
+    return x_72d
+
+
+def subset_271d_to_261d(x: torch.Tensor) -> torch.Tensor:
+    """
+    Subset 271D features to 261D prev_frame_features.
+
+    261D Layout:
+        [0:9]     Root features: height(1) + velocity(2) + rotation_6d(6)
+        [9:261]   Joint features: 21 joints x 12D = 252D
+                  Per joint: RIC(3) + rotation_6d(6) + velocity(3) = 12D
+
+    Args:
+        x: (..., 271) tensor of 271D features
+    Returns:
+        x_261d: (..., 261) tensor of 261D features
+    """
+    # Root features (9D)
+    root_height = x[..., 0:1]  # height_y
+    root_vel = x[..., 1:3]  # vel_x, vel_z
+    root_rot6d = x[..., 69:75]  # root rotation_6d
+    prev_root = torch.cat([root_height, root_vel, root_rot6d], dim=-1)  # (..., 9)
+
+    # Joint features (252D): 21 non-root joints
+    joint_ric = x[..., 6:69]  # 21 x 3 = 63D (skip root at [3:6])
+    joint_rot6d = x[..., 75:201]  # 21 x 6 = 126D (skip root at [69:75])
+    joint_vel = x[..., 204:267]  # 21 x 3 = 63D (skip root at [201:204])
+    prev_joints = torch.cat([joint_ric, joint_rot6d, joint_vel], dim=-1)  # (..., 252)
+
+    return torch.cat([prev_root, prev_joints], dim=-1)  # (..., 261)
+
+
+class FeatureNormalizer:
+    def __init__(self, mean=torch.zeros(271), std=torch.ones(271)):
+        self.mean = mean
+        self.std = std
+
+    @classmethod
+    def load_from_files(cls, mean_path, std_path, device=torch.device("cpu")):
+        mean_np = np.load(mean_path)
+        std_np = np.load(std_path)
+        mean = torch.from_numpy(mean_np).float().to(device)  # (271,)
+        std = torch.from_numpy(std_np).float().to(device)  # (271,)
+        return cls(mean, std)
+
+    def normalize(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize features to zero mean and unit variance.
+        Args:
+            features: (..., 271) tensor of features (271,) or (B, 271) or (B, N, 271)
+        Returns:
+            normalized_features: (..., 271) tensor of normalized features
+        """
+        if features.shape[-1] != 271:
+            raise ValueError(
+                f"Expected features to have shape (..., 271), got {features.shape}"
+            )
+
+        if features.device != self.mean.device:
+            self.mean = self.mean.to(features.device)
+            self.std = self.std.to(features.device)
+
+        return (features - self.mean) / self.std
+
+    def denormalize(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize features to original scale.
+        Args:
+            features: (..., 271) tensor of normalized features (271,) or (B, 271) or (B, N, 271)
+        Returns:
+            denormalized_features: (..., 271) tensor of denormalized features
+        """
+        if features.shape[-1] != 271:
+            raise ValueError(
+                f"Expected features to have shape (..., 271), got {features.shape}"
+            )
+
+        if features.device != self.mean.device:
+            self.mean = self.mean.to(features.device)
+            self.std = self.std.to(features.device)
+
+        return features * self.std + self.mean
+
+    def denormalize_flow_output(self, flow_output: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize flow output to original scale.
+        Flow Output: 72D
+            - Root token output (first 9D):
+                1D height + 2D velocity + 6D rotation
+            - Joint tokens output (next 63D):
+                21 joints x 3D RIC positions
+        Args:
+            flow_output: (..., 72) tensor of flow output (72,) or (B, 72) or (B, N, 72)
+        Returns:
+            denormalized_flow_output: (..., 72) tensor of denormalized flow output
+        """
+        if flow_output.shape[-1] != 72:
+            raise ValueError(
+                f"Expected flow_output to have shape (..., 72), got {flow_output.shape}"
+            )
+
+        if flow_output.device != self.mean.device:
+            self.mean = self.mean.to(flow_output.device)
+            self.std = self.std.to(flow_output.device)
+
+        mean_72d = subset_271d_to_72d(self.mean)
+        std_72d = subset_271d_to_72d(self.std)
+        return flow_output * std_72d + mean_72d
+
+    def normalize_flow_output(self, flow_output: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize flow output from raw scale to normalized scale.
+        Flow Output: 72D
+            - Root token output (first 9D):
+                1D height + 2D velocity + 6D rotation
+            - Joint tokens output (next 63D):
+                21 joints x 3D RIC positions
+        Args:
+            flow_output: (..., 72) tensor of raw flow output
+        Returns:
+            normalized_flow_output: (..., 72) tensor of normalized flow output
+        """
+        if flow_output.shape[-1] != 72:
+            raise ValueError(
+                f"Expected flow_output to have shape (..., 72), got {flow_output.shape}"
+            )
+
+        if flow_output.device != self.mean.device:
+            self.mean = self.mean.to(flow_output.device)
+            self.std = self.std.to(flow_output.device)
+
+        mean_72d = subset_271d_to_72d(self.mean)
+        std_72d = subset_271d_to_72d(self.std)
+        return (flow_output - mean_72d) / std_72d
+
+    def normalize_prev_frame_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize 261D prev_frame_features from raw scale to normalized scale.
+
+        261D Layout:
+            [0:9]     Root features: height(1) + velocity(2) + rotation_6d(6)
+            [9:261]   Joint features: 21 joints x 12D = 252D
+                      Per joint: RIC(3) + rotation_6d(6) + velocity(3) = 12D
+
+        Args:
+            features: (..., 261) tensor of raw prev_frame_features
+        Returns:
+            normalized_features: (..., 261) tensor of normalized features
+        """
+        if features.shape[-1] != 261:
+            raise ValueError(
+                f"Expected features to have shape (..., 261), got {features.shape}"
+            )
+
+        if features.device != self.mean.device:
+            self.mean = self.mean.to(features.device)
+            self.std = self.std.to(features.device)
+
+        mean_261d = subset_271d_to_261d(self.mean)
+        std_261d = subset_271d_to_261d(self.std)
+        return (features - mean_261d) / std_261d
+
+    def denormalize_prev_frame_features(self, features: torch.Tensor) -> torch.Tensor:
+        """
+        Denormalize 261D prev_frame_features to raw scale.
+
+        Args:
+            features: (..., 261) tensor of normalized prev_frame_features
+        Returns:
+            denormalized_features: (..., 261) tensor of raw features
+        """
+        if features.shape[-1] != 261:
+            raise ValueError(
+                f"Expected features to have shape (..., 261), got {features.shape}"
+            )
+
+        if features.device != self.mean.device:
+            self.mean = self.mean.to(features.device)
+            self.std = self.std.to(features.device)
+
+        mean_261d = subset_271d_to_261d(self.mean)
+        std_261d = subset_271d_to_261d(self.std)
+        return features * std_261d + mean_261d
+
+
+def sequence_joints_to_features(
     positions: torch.Tensor,
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
@@ -332,7 +538,7 @@ def preprocess_sequence(
 
         for b in range(B):
             pos_b = positions[b]
-            feat_b = preprocess_sequence(pos_b, dataset_type, feet_thre)
+            feat_b = sequence_joints_to_features(pos_b, dataset_type, feet_thre)
             features_batch.append(feat_b)
 
         return torch.stack(features_batch, dim=0)
@@ -588,11 +794,14 @@ def flow_output_to_271d(
     dtype = flow_output.dtype
 
     # -------------------------------------------------
-    # Dataset config (for foot indices)
+    # Dataset config (for foot indices and skeleton)
     # -------------------------------------------------
     config = get_dataset_config(dataset_type)
     fid_r = config["fid_r"]
     fid_l = config["fid_l"]
+    raw_offsets = config["raw_offsets"].to(device=device, dtype=dtype)
+    kinematic_chain = config["kinematic_chain"]
+    face_joint_indx = config["face_joint_indx"]
 
     # -------------------------------------------------
     # 1. Extract flow output components
@@ -618,14 +827,7 @@ def flow_output_to_271d(
     ric = torch.cat([root_ric, joint_ric_21], dim=1)  # (B,22,3)
 
     # -------------------------------------------------
-    # 4. Rotations (update root only)
-    # -------------------------------------------------
-    prev_rot_6d = prev_frame[:, 69:201].reshape(B, 22, 6)
-    rotations_6d = prev_rot_6d.clone()
-    rotations_6d[:, 0] = root_rot_6d
-
-    # -------------------------------------------------
-    # 5. Reconstruct previous positions (incremental)
+    # 4. Reconstruct previous positions (incremental)
     # -------------------------------------------------
     prev_root_rot_6d = prev_frame[:, 69:75]
     prev_root_quat = cont6d_to_quaternion(prev_root_rot_6d)
@@ -638,7 +840,7 @@ def flow_output_to_271d(
     )
 
     # -------------------------------------------------
-    # 6. Reconstruct new positions
+    # 5. Reconstruct new positions
     # -------------------------------------------------
     root_quat = cont6d_to_quaternion(root_rot_6d)
     root_quat_exp = root_quat.unsqueeze(1).expand(-1, 21, -1)
@@ -650,6 +852,14 @@ def flow_output_to_271d(
     new_positions = torch.cat(
         [new_root_pos.unsqueeze(1), global_joints], dim=1
     )  # (B,22,3)
+
+    # -------------------------------------------------
+    # 6. Compute rotations via IK
+    # -------------------------------------------------
+    quaternions = _compute_ik(
+        new_positions, raw_offsets, kinematic_chain, face_joint_indx
+    )  # (B, 22, 4)
+    rotations_6d = quaternion_to_cont6d(quaternions)  # (B, 22, 6)
 
     # -------------------------------------------------
     # 7. Local velocities (root-local)
@@ -705,15 +915,11 @@ class RootPositionTracker:
     [2]   root vel Z
     """
 
-    def __init__(self, initial_root_pos: Optional[torch.Tensor] = None):
+    def __init__(self, initial_root_pos: torch.Tensor):
         """
         Args:
             initial_root_pos: (B, 3) absolute XYZ
         """
-        if initial_root_pos is None:
-            raise ValueError(
-                "RootPositionTracker requires initial_root_pos for device safety."
-            )
 
         if initial_root_pos.dim() != 2 or initial_root_pos.size(-1) != 3:
             raise ValueError("initial_root_pos must be shape (B, 3)")
@@ -756,6 +962,9 @@ class RootPositionTracker:
     def get(self):
         return self.root_pos
 
+    def set(self, new_root_pos: torch.Tensor):
+        self.root_pos = new_root_pos
+
     def update(self, new_frame_271: torch.Tensor):
         """
         Update state using newly generated frame.
@@ -777,11 +986,6 @@ class RootPositionTracker:
         new_y = root_height
 
         self.root_pos = torch.cat([new_x, new_y, new_z], dim=-1)
-
-
-# ============================================================================
-# Incremental Feature Extractor for Autoregressive Generation
-# ============================================================================
 
 
 class IncrementalFeatureExtractor:

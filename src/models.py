@@ -19,16 +19,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Optional, List, Tuple, Union, Callable, Any
+from typing import Optional, List, Tuple, Union
 from config import Config
 
 from utils.motion_utils import (
     features_to_positions,
-    preprocess_sequence,
-    get_dataset_config,
     flow_output_to_positions,
     flow_output_to_271d,
     RootPositionTracker,
+    FeatureNormalizer,
 )
 
 
@@ -261,6 +260,9 @@ class MotionHistoryEncoder(nn.Module):
         num_layers: int = 4,  # Transformer layers (default 4)
         max_text_seq_len: int = 1,  # CLIP max sequence length
         dropout: float = 0.1,
+        normalizer: Optional[
+            "FeatureNormalizer"
+        ] = None,  # For normalizing raw features
     ) -> None:
         super().__init__()
 
@@ -272,6 +274,9 @@ class MotionHistoryEncoder(nn.Module):
         self.num_layers = num_layers
         self.joint_count = joint_count
         self.max_text_seq_len = max_text_seq_len
+
+        # Store normalizer for raw feature normalization
+        self.normalizer = normalizer
 
         # Attention config
         self.nhead = model_dim // 64
@@ -356,15 +361,18 @@ class MotionHistoryEncoder(nn.Module):
         total_duration: Optional[torch.Tensor] = None,
         batch_size: Optional[int] = None,
         return_all_timesteps: bool = False,
+        normalize: bool = True,
     ) -> torch.Tensor:
         """
         ARFM Feature Fusion Transformer forward pass.
 
         Args:
             text:           (B, l_seq, 512) CLIP sequence embeddings or None
-            input_features: (B, T_hist, frame_feature_dim) - Optional motion history
+            input_features: (B, T_hist, frame_feature_dim) - Optional motion history (RAW features)
             total_duration: (B, 1) Normalized total frames (Optional, not used in this version)
             batch_size:     Optional batch size for null history case
+            normalize:      If True and normalizer is set, normalize input_features (default: True)
+                            Set to False during training when normalization is handled externally
 
         Returns:
             joint_features: (B, 22, per_joint_out_dim) - Encoded per-joint context
@@ -406,6 +414,10 @@ class MotionHistoryEncoder(nn.Module):
             input_features = self.null_history.to(device).expand(B, T, -1)
         else:
             T = input_features.shape[1]
+
+        # Normalize raw features if normalizer is provided and normalize=True
+        if self.normalizer is not None and normalize:
+            input_features = self.normalizer.normalize(input_features)
 
         S = self.joint_count
 
@@ -582,12 +594,16 @@ class FlowMatchingPredictor(nn.Module):
         joint_count: int = 22,  # total joints including root
         time_embed_dim: int = 64,  # sinusoidal time embedding
         dropout: float = 0.1,  # dropout rate
+        normalizer: Optional[FeatureNormalizer] = None,  # For normalizing raw features
     ):
         super().__init__()
         self.model_dim = model_dim
         self.num_layers = num_layers
         self.joint_count = joint_count
         self.time_embed_dim = time_embed_dim
+
+        # Store normalizer for raw feature normalization
+        self.normalizer = normalizer
 
         # --- Hierarchical Kinematic Encoder ---
         self.kinematic_encoder = KinematicChainEncoder(model_dim)
@@ -664,12 +680,36 @@ class FlowMatchingPredictor(nn.Module):
         self,
         history_features: torch.Tensor,  # (B, 22, per_joint_dim)
         noise_level: torch.Tensor,  # (B,)
-        noisy_target: Optional[torch.Tensor] = None,  # (B, 72)
-        prev_frame_features: Optional[torch.Tensor] = None,  # (B, 72)
+        noisy_target: Optional[torch.Tensor] = None,  # (B, 72) - in normalized space
+        prev_frame_features: Optional[torch.Tensor] = None,  # (B, 261) - RAW features
         temporal_progress: Optional[torch.Tensor] = None,
+        normalize: bool = True,  # If True, normalize prev_frame_features (for inference)
     ):
+        """
+        Forward pass for FlowMatchingPredictor.
+
+        Args:
+            history_features: (B, 22, per_joint_dim) - Context from MotionHistoryEncoder
+            noise_level: (B,) - Flow time t in [0,1]
+            noisy_target: (B, 72) - Current noisy state x_t (already in normalized space)
+            prev_frame_features: (B, 261) - Previous frame features (RAW if normalize=True)
+            temporal_progress: (B,) - Optional normalized frame progress
+            normalize: If True and normalizer is set, normalize prev_frame_features
+                       Set to False during training when normalization is handled externally
+
+        Returns:
+            pred_frame: (B, 72) - Predicted velocity field (in normalized space)
+        """
         B, J, _ = history_features.shape
         device = history_features.device
+
+        # --- Normalize raw prev_frame_features if normalizer is provided and normalize=True ---
+        # Note: noisy_target is already in normalized space (from ODE integration)
+        if self.normalizer is not None and normalize:
+            if prev_frame_features is not None:
+                prev_frame_features = self.normalizer.normalize_prev_frame_features(
+                    prev_frame_features
+                )
 
         # --- Handle optional prev frame ---
         if prev_frame_features is None:
@@ -750,10 +790,11 @@ class HumanMotionGenerator(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.predictor = predictor
+        self.normalizer = encoder.normalizer
 
     def generate_sequence(
         self,
-        text: Union[str, List[str], torch.Tensor],
+        text: Union[str, List[str], torch.Tensor],  # type: ignore
         num_frames: int = 200,
         num_steps: int = 10,
         guidance_scale: float = 2.5,
@@ -797,7 +838,7 @@ class HumanMotionGenerator(nn.Module):
                 from utils.text_encoder import CLIPEncoder
 
                 clip_encoder = CLIPEncoder()
-                text = clip_encoder(text)  # (B, 1, 512)
+                text: torch.Tensor = clip_encoder(text)  # (B, 1, 512)
                 B = text.shape[0]
             else:
                 # Already a tensor
@@ -811,11 +852,8 @@ class HumanMotionGenerator(nn.Module):
             # and feature_history for context encoding
 
             if input_features is None:
-                # Zero-shot: use learned null_history
-                null_features = self.encoder.null_history.expand(B, 1, -1).clone()
-                feature_history = null_features  # (B, 1, 271)
-                # Initialize RootPositionTracker from null features
-                root_tracker = RootPositionTracker.from_history(feature_history)
+                root_pos = torch.zeros((B, 3), device=device)  # (B, 3) - absolute XYZ
+                root_tracker = RootPositionTracker(root_pos)
             else:
                 # Seeded: use input_features
                 if input_features.ndim == 2:
@@ -827,22 +865,22 @@ class HumanMotionGenerator(nn.Module):
                 # Initialize RootPositionTracker from feature history
                 root_tracker = RootPositionTracker.from_history(feature_history)
 
-            joint_sequence = []
-
             for frame_idx in range(num_frames):
                 # ========================================
                 # Step A: Extract last frame from feature history
                 # ========================================
-                last_frame = feature_history[:, -1]  # (B, 271)
+                last_frame = feature_history[:, -1]  # (B, 271) - RAW
                 prev_root_pos = root_tracker.get()  # (B, 3)
 
                 # ========================================
                 # Step B: Encode context from FULL feature history (for CFG)
+                # normalize=True (default) - models normalize RAW features internally
                 # ========================================
                 context_cond = self.encoder(
                     batch_size=B,
                     text=text,
-                    input_features=feature_history,  # Full history
+                    input_features=feature_history,  # RAW features
+                    normalize=True,  # Normalize internally for inference
                 )[
                     :, -1, :, :
                 ]  # (B, 22, out_dim)
@@ -850,18 +888,20 @@ class HumanMotionGenerator(nn.Module):
                 context_uncond = self.encoder(
                     batch_size=B,
                     text=None,
-                    input_features=feature_history,  # Full history
+                    input_features=feature_history,  # RAW features
+                    normalize=True,  # Normalize internally for inference
                 )[
                     :, -1, :, :
                 ]  # (B, 22, out_dim)
 
                 # ========================================
-                # Step C: Extract prev_frame_features (261D)
+                # Step C: Extract prev_frame_features (261D) from RAW features
                 # ========================================
                 prev_frame_features = extract_prev_frame_features(last_frame)
 
                 # ========================================
                 # Step D: Flow matching ODE loop
+                # x_t starts as random noise (already in normalized space conceptually)
                 # ========================================
                 x_t = torch.randn((B, 72), device=device)
                 dt = 1.0 / num_steps
@@ -874,6 +914,7 @@ class HumanMotionGenerator(nn.Module):
                         noise_level=t,
                         noisy_target=x_t,
                         prev_frame_features=prev_frame_features,
+                        normalize=True,  # Normalize prev_frame_features internally
                     )
 
                     v_uncond = self.predictor(
@@ -881,11 +922,15 @@ class HumanMotionGenerator(nn.Module):
                         noise_level=t,
                         noisy_target=x_t,
                         prev_frame_features=prev_frame_features,
+                        normalize=True,  # Normalize prev_frame_features internally
                     )
 
                     # Classifier-free guidance
                     v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
                     x_t = x_t + v_t * dt
+
+                if self.normalizer:
+                    x_t = self.normalizer.denormalize_flow_output(x_t)
 
                 # ========================================
                 # Step E: Convert 72D → 271D (incremental)
@@ -905,14 +950,6 @@ class HumanMotionGenerator(nn.Module):
                     [feature_history, new_frame.unsqueeze(1)], dim=1
                 )  # (B, N+1, 271)
 
-                # ========================================
-                # Step G: Convert to positions for output
-                # ========================================
-                new_positions = features_to_positions(
-                    new_frame, dataset_type=dataset_type
-                )  # (B, 22, 3)
-                joint_sequence.append(new_positions)
-
                 if (frame_idx + 1) % 50 == 0:
                     print(f"Generated {frame_idx + 1}/{num_frames} frames")
 
@@ -925,33 +962,48 @@ class HumanMotionGenerator(nn.Module):
 
     @classmethod
     def load_from_checkpoint(
-        cls, checkpoint_path: Union[str, Path], config: Config, device: str = "cpu"
+        cls,
+        checkpoint_path: Union[str, Path],
+        config: Config,
+        device: str = "cpu",
+        normalizer: Optional[FeatureNormalizer] = None,
     ) -> "HumanMotionGenerator":
         """
         Load the generator from a checkpoint file.
         Prefers EMA weights if available.
+
+        Args:
+            checkpoint_path: Path to checkpoint file
+            config: Config object with model configuration
+            device: Device to load model on
+            normalizer: Optional FeatureNormalizer for raw feature normalization
         """
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=device)
 
-        # Initialize Encoders/Predictors from Config
+        # Initialize Motion History Encoder (Transformer-based)
         encoder = MotionHistoryEncoder(
             frame_feature_dim=config.motion_dim,
             text_embedding_dim=config.text_embedding_dim,
             per_joint_out_dim=config.per_joint_out_dim,
             joint_count=config.num_joints,
             model_dim=config.model_dim,
-            num_layers=4,  # ARFM uses 4 transformer layers
-            max_text_seq_len=config.max_text_seq_len,  # Use config value
+            num_layers=config.num_encoder_layers,
+            max_text_seq_len=config.max_text_seq_len,
             dropout=config.dropout,
-        )
+            normalizer=normalizer,
+        ).to(device)
 
+        # Initialize Flow Matching Predictor
         predictor = FlowMatchingPredictor(
             per_joint_dim=config.per_joint_out_dim,
             model_dim=config.model_dim,
             num_layers=config.num_flow_layers,
             joint_count=config.num_joints,
-        )
+            time_embed_dim=config.time_embed_dim,
+            dropout=config.dropout,
+            normalizer=normalizer,
+        ).to(device)
 
         # Load weights (Prefer EMA)
         if "encoder_ema" in checkpoint and "predictor_ema" in checkpoint:

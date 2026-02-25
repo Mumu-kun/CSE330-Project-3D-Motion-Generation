@@ -77,7 +77,6 @@ def plot_3d_motion(
 
 def visualize_motion(
     joint_positions: np.ndarray,
-    ground_truth: Optional[np.ndarray] = None,
     title: str = "Motion Visualization",
     save_path: Optional[Path] = None,
     fps: float = 20,
@@ -89,7 +88,6 @@ def visualize_motion(
 
     Args:
         joint_positions: Joint positions (nframe, 22, 3)
-        ground_truth: Optional ground truth for comparison
         title: Plot title
         save_path: Optional path to save visualization
         fps: Frames per second
@@ -126,7 +124,6 @@ def compare_motions(
     """
     visualize_motion(
         generated_joints,
-        ground_truth=ground_truth_joints,
         title="Generated vs Ground Truth",
         save_path=save_path,
     )

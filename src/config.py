@@ -17,7 +17,6 @@ Note: Root X,Z are stored as velocities for autoregressive stability.
 
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
 
 
 @dataclass
