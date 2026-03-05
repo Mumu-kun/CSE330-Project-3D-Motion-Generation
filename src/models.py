@@ -774,9 +774,10 @@ class HumanMotionGenerator:
         text: Union[str, List[str], torch.Tensor],  # type: ignore
         num_frames: int = 200,
         num_steps: int = 10,
-        guidance_scale: float = 2.5,
+        horizon: int = 16,
         input_features: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
+        guidance_scale: float = 1.0,
         dataset_type: str = "t2m",
     ) -> torch.Tensor:
         """
@@ -790,7 +791,7 @@ class HumanMotionGenerator:
             text: Text prompt(s) - str, List[str], or pre-encoded tensor (B, l_seq, 512)
             num_frames: Number of frames to generate
             num_steps: Number of flow matching ODE steps
-            guidance_scale: Classifier-free guidance scale
+            horizon: Number of recent frames to use for context encoding
             input_features: Optional initial motion history (B, N, 271) or (B, 271)
             total_duration: Optional duration tensor (not used)
             dataset_type: Dataset type for feature extraction
@@ -848,22 +849,19 @@ class HumanMotionGenerator:
                 prev_root_pos = root_tracker.get()  # (B, 3)
 
                 # ========================================
-                # Step B: Encode context from FULL feature history (for CFG)
+                # Step B: Encode context from last horizon frames
                 # normalize=True (default) - models normalize RAW features internally
                 # ========================================
+                # Slice to last horizon frames
+                horizon_frames = min(horizon, feature_history.shape[1])
+                encoder_input = feature_history[
+                    :, -horizon_frames:, :
+                ]  # (B, horizon, 271)
+
                 context_cond = self.encoder(
                     batch_size=B,
                     text=text,
-                    input_features=feature_history,  # RAW features
-                    normalize=True,  # Normalize internally for inference
-                )[
-                    :, -1, :, :
-                ]  # (B, 22, out_dim)
-
-                context_uncond = self.encoder(
-                    batch_size=B,
-                    text=None,
-                    input_features=feature_history,  # RAW features
+                    input_features=encoder_input,  # Only last horizon frames
                     normalize=True,  # Normalize internally for inference
                 )[
                     :, -1, :, :
@@ -879,20 +877,13 @@ class HumanMotionGenerator:
                 for step in range(num_steps):
                     t = torch.full((B,), step * dt, device=device)
 
-                    v_cond = self.predictor(
+                    # Only conditional prediction (no CFG)
+                    v_t = self.predictor(
                         history_features=context_cond,
                         noise_level=t,
                         noisy_target=x_t,
                     )
 
-                    v_uncond = self.predictor(
-                        history_features=context_uncond,
-                        noise_level=t,
-                        noisy_target=x_t,
-                    )
-
-                    # Classifier-free guidance
-                    v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
                     x_t = x_t + v_t * dt
 
                 if self.normalizer:
