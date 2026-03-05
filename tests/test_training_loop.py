@@ -23,7 +23,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from config import Config
 from models import MotionHistoryEncoder, FlowMatchingPredictor, HumanMotionGenerator
 from utils.train_utils import (
-    extract_prev_frame_features,
     extract_clean_target,
     EMAModel,
 )
@@ -70,64 +69,6 @@ def get_mock_normalizer():
 # =============================================================================
 # Test 1: Feature Extraction Helpers
 # =============================================================================
-
-
-def test_extract_prev_frame_features():
-    """Test extract_prev_frame_features shape and values."""
-    print("=" * 60)
-    print("Test 1: extract_prev_frame_features")
-    print("=" * 60)
-
-    # Create mock 271D frame
-    B = 4
-    frame = torch.randn(B, 271)
-
-    # Extract features
-    prev_features = extract_prev_frame_features(frame)
-
-    # Check shape
-    assert prev_features.shape == (
-        B,
-        261,
-    ), f"Expected shape (B, 261), got {prev_features.shape}"
-    print(f"Input shape: {frame.shape}")
-    print(f"Output shape: {prev_features.shape}")
-
-    # Verify slicing is correct
-    # Root features: height(1) + vel(2) + rot_6d(6) = 9D
-    # [0:1] height_y, [1:3] vel_xz, [69:75] root_rot_6d
-    expected_root = torch.cat(
-        [
-            frame[:, 0:1],  # height_y
-            frame[:, 1:3],  # vel_x, vel_z
-            frame[:, 69:75],  # root_rot_6d
-        ],
-        dim=-1,
-    )
-
-    assert torch.allclose(
-        prev_features[:, :9], expected_root
-    ), "Root features mismatch!"
-    print("Root features: OK")
-
-    # Joint features: 21 joints x 12D = 252D
-    # [6:69] joint_ric (21x3), [75:201] joint_rot6d (21x6), [204:267] joint_vel (21x3)
-    expected_joints = torch.cat(
-        [
-            frame[:, 6:69],  # joint_ric
-            frame[:, 75:201],  # joint_rot6d
-            frame[:, 204:267],  # joint_vel
-        ],
-        dim=-1,
-    )
-
-    assert torch.allclose(
-        prev_features[:, 9:], expected_joints
-    ), "Joint features mismatch!"
-    print("Joint features: OK")
-
-    print("[PASS] extract_prev_frame_features works correctly\n")
-    return True
 
 
 def test_extract_clean_target():
@@ -290,21 +231,17 @@ def test_predictor_forward(predictor, config):
     history_features = torch.randn(B, config.num_joints, config.per_joint_out_dim)
     noise_level = torch.rand(B)
     noisy_target = torch.randn(B, 72)  # 72D flow output
-    prev_frame_features = torch.randn(B, 261)  # 261D prev frame
 
-    # Forward pass with normalize=True (inference mode)
+    # Forward pass
     with torch.no_grad():
         output = predictor(
             history_features=history_features,
             noise_level=noise_level,
             noisy_target=noisy_target,
-            prev_frame_features=prev_frame_features,
-            normalize=True,  # Models normalize internally
         )
 
     print(f"History features shape: {history_features.shape}")
     print(f"Noisy target shape: {noisy_target.shape}")
-    print(f"Prev frame features shape: {prev_frame_features.shape}")
     print(f"Output shape: {output.shape}")
 
     # Check output shape: (B, 72)
@@ -376,14 +313,11 @@ def test_training_iteration(encoder, predictor, config):
     contexts_flat = pred_contexts.reshape(
         B_eff, config.num_joints, config.per_joint_out_dim
     )
-    prev_flat = prev_frames.reshape(B_eff, config.motion_dim)
     targets_flat = targets.reshape(B_eff, config.motion_dim)
 
-    # Extract features
-    prev_features = extract_prev_frame_features(prev_flat)
+    # Extract clean targets
     clean_targets = extract_clean_target(targets_flat)
 
-    print(f"Prev features shape: {prev_features.shape}")
     print(f"Clean targets shape: {clean_targets.shape}")
 
     # Flow matching
@@ -396,8 +330,6 @@ def test_training_iteration(encoder, predictor, config):
         history_features=contexts_flat,
         noise_level=t,
         noisy_target=x_t,
-        prev_frame_features=prev_features,
-        normalize=False,  # Already normalized
     )
 
     # Compute loss
@@ -539,12 +471,6 @@ def run_all_tests():
     results = {}
 
     # Test 1: Feature extraction
-    try:
-        results["extract_prev_frame_features"] = test_extract_prev_frame_features()
-    except Exception as e:
-        results["extract_prev_frame_features"] = False
-        print(f"[FAIL] extract_prev_frame_features: {e}\n")
-
     try:
         results["extract_clean_target"] = test_extract_clean_target()
     except Exception as e:

@@ -311,19 +311,10 @@ def subset_271d_to_72d(x: torch.Tensor) -> torch.Tensor:
     return x_72d
 
 
-def subset_271d_to_261d(x: torch.Tensor) -> torch.Tensor:
+def _subset_unused(x: torch.Tensor) -> torch.Tensor:
     """
-    Subset 271D features to 261D prev_frame_features.
-
-    261D Layout:
-        [0:9]     Root features: height(1) + velocity(2) + rotation_6d(6)
-        [9:261]   Joint features: 21 joints x 12D = 252D
-                  Per joint: RIC(3) + rotation_6d(6) + velocity(3) = 12D
-
-    Args:
-        x: (..., 271) tensor of 271D features
-    Returns:
-        x_261d: (..., 261) tensor of 261D features
+    [DEPRECATED] This function is no longer used.
+    Kept for reference purposes only.
     """
     # Root features (9D)
     root_height = x[..., 0:1]  # height_y
@@ -442,55 +433,6 @@ class FeatureNormalizer:
         mean_72d = subset_271d_to_72d(self.mean)
         std_72d = subset_271d_to_72d(self.std)
         return (flow_output - mean_72d) / std_72d
-
-    def normalize_prev_frame_features(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        Normalize 261D prev_frame_features from raw scale to normalized scale.
-
-        261D Layout:
-            [0:9]     Root features: height(1) + velocity(2) + rotation_6d(6)
-            [9:261]   Joint features: 21 joints x 12D = 252D
-                      Per joint: RIC(3) + rotation_6d(6) + velocity(3) = 12D
-
-        Args:
-            features: (..., 261) tensor of raw prev_frame_features
-        Returns:
-            normalized_features: (..., 261) tensor of normalized features
-        """
-        if features.shape[-1] != 261:
-            raise ValueError(
-                f"Expected features to have shape (..., 261), got {features.shape}"
-            )
-
-        if features.device != self.mean.device:
-            self.mean = self.mean.to(features.device)
-            self.std = self.std.to(features.device)
-
-        mean_261d = subset_271d_to_261d(self.mean)
-        std_261d = subset_271d_to_261d(self.std)
-        return (features - mean_261d) / std_261d
-
-    def denormalize_prev_frame_features(self, features: torch.Tensor) -> torch.Tensor:
-        """
-        Denormalize 261D prev_frame_features to raw scale.
-
-        Args:
-            features: (..., 261) tensor of normalized prev_frame_features
-        Returns:
-            denormalized_features: (..., 261) tensor of raw features
-        """
-        if features.shape[-1] != 261:
-            raise ValueError(
-                f"Expected features to have shape (..., 261), got {features.shape}"
-            )
-
-        if features.device != self.mean.device:
-            self.mean = self.mean.to(features.device)
-            self.std = self.std.to(features.device)
-
-        mean_261d = subset_271d_to_261d(self.mean)
-        std_261d = subset_271d_to_261d(self.std)
-        return features * std_261d + mean_261d
 
 
 def sequence_joints_to_features(

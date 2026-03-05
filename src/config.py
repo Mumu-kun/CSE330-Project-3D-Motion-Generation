@@ -16,7 +16,8 @@ Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -36,12 +37,11 @@ class Config:
     motion_dim: int = 271  # Custom 271D feature dimension
     num_joints: int = 22  # Number of joints in skeleton
     joint_dim: int = 3  # 3D coordinates per joint
-    max_motion_length: int = 200  # Maximum motion length in frames (rounded by 4)
+    max_motion_length: int = 200  # Maximum motion length in frames
     fps: int = 20  # Frames per second
 
-    # Feature dimension subsetting for training (optional)
-    # 271D format: [0:3]root_height_y_vel_x_vel_z, [3:69]RIC, [69:201]rot6d, [201:267]vel, [267:271]foot
-    feature_dims: tuple[slice, ...] = (
+    # Feature dimension subsetting for training
+    feature_dims: tuple = (
         slice(0, 3),  # root height Y, velocity X, velocity Z (3D)
         slice(3, 69),  # RIC positions (22*3 = 66D)
         slice(69, 201),  # 6D rotations (22*6 = 132D)
@@ -49,57 +49,53 @@ class Config:
         slice(267, 271),  # foot contacts (4D)
     )
 
-    # Dataset configuration
-    dataset_name: str = "t2m"  # "t2m" for HumanML3D
-    unit_length: int = 5
-
-    # Model architecture - MotionHistoryEncoder (Transformer-based)
+    # Model architecture - MotionHistoryEncoder
     text_embedding_dim: int = 512  # CLIP embedding size
     per_joint_out_dim: int = 64  # Context vector size per joint
     max_text_seq_len: int = 1  # CLIP max sequence length
-
-    # Model architecture - General
-    model_dim: int = 128  # Primary embedding size for sequence/spatial cores
-    num_encoder_layers: int = 4  # Transformer layers (was GRU layers)
+    model_dim: int = 128  # Primary embedding size
+    num_encoder_layers: int = 4  # Transformer layers
     dropout: float = 0.1
 
-    # Model architecture - FlowMatchingPredictor (ARFM)
-    num_flow_layers: int = 3  # Spatial Transformer layers
-    num_heads: int = 4  # Attention heads in spatial transformer
+    # Model architecture - FlowMatchingPredictor
+    num_flow_layers: int = 2  # Spatial Transformer layers
+    num_heads: int = 4  # Attention heads
     time_embed_dim: int = 64  # Sinusoidal time embedding dimension
 
     # Training settings
     batch_size: int = 192
     learning_rate: float = 1e-4
-    num_epochs: int = 500
+    num_epochs: int = 300
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
+    ema_decay: float = 0.999
 
-    # Training schedule
-    warmup_steps: int = 1000
-    lr_decay: float = 0.95
-    lr_decay_epoch: int = 10
+    # CFG (Classifier-Free Guidance) settings
+    cfg_dropout: float = 0.1  # Dropout probability for CFG
 
-    # Loss weights
-    flow_loss_weight: float = 1.0
-    context_loss_weight: float = 0.1
+    # Horizon settings
+    horizon: int = 16  # Maximum/target horizon for training
 
-    # Inference settings
-    num_inference_steps: int = 50  # Number of flow matching steps during inference
-    guidance_scale: float = 1.0  # For classifier-free guidance (if used)
+    # Curriculum learning settings
+    curriculum_start: Optional[int] = None  # Initial horizon (None = no curriculum)
+    curriculum_step: int = 8  # Frames to increase per step
+    curriculum_step_epochs: int = 10  # Epochs per horizon level
 
     # Data loading
     num_workers: int = 4
     pin_memory: bool = True
 
-    # Logging and checkpointing
-    log_interval: int = 50  # Log every N batches
-    save_interval: int = 5  # Save checkpoint every N epochs
-    eval_interval: int = 1  # Evaluate every N epochs
+    # Inference settings
+    num_inference_steps: int = 10  # Number of flow matching steps
+    guidance_scale: float = 1.0  # CFG scale for inference
 
-    # Evaluation settings
-    num_eval_samples: int = 100
-    eval_batch_size: int = 32
+    # Validation settings
+    val_interval: int = 5  # Run validation every N epochs
+    val_batches: int = 20  # Number of validation batches per run (-1 for all)
+    val_use_ema: bool = True  # Use EMA models for validation
+    save_best_val: bool = True  # Save separate checkpoint for best validation loss
+
+    unit_length = 5
 
     def __post_init__(self):
         """Create necessary directories."""

@@ -24,6 +24,7 @@ from torch.utils.data import DataLoader
 from typing import Optional, Union, Tuple
 from tqdm import tqdm
 
+from config import Config
 from utils.wandb_logger import WandbLogger
 from utils.motion_utils import (
     FeatureNormalizer,
@@ -35,48 +36,6 @@ from utils.motion_utils import (
 # =============================================================================
 # Feature Extraction Helpers
 # =============================================================================
-
-
-def extract_prev_frame_features(frame: torch.Tensor) -> torch.Tensor:
-    """
-    Extract 261D prev_frame_features from 271D frame.
-
-    271D Input Format:
-        [0:3]     Root height Y, Root velocity X, Root velocity Z
-        [3:69]    RIC positions (22 x 3)
-        [69:201]  6D rotations (22 x 6)
-        [201:267] Local velocities (22 x 3)
-        [267:271] Foot contacts (4D)
-
-    261D Output Format:
-        [0:9]     Root features: height(1) + velocity(2) + rotation_6d(6)
-        [9:261]   Joint features: 21 joints x 12D = 252D
-                  Per joint: RIC(3) + rotation_6d(6) + velocity(3) = 12D
-
-    Args:
-        frame: (B, 271) single frame
-
-    Returns:
-        prev_features: (B, 261)
-    """
-    B = frame.shape[0]
-
-    # Root features (9D)
-    root_height = frame[:, 0:1]  # height_y
-    root_vel = frame[:, 1:3]  # vel_x, vel_z
-    root_rot6d = frame[:, 69:75]  # root rotation_6d
-    prev_root = torch.cat([root_height, root_vel, root_rot6d], dim=-1)  # (B, 9)
-
-    # Joint features (252D): 21 non-root joints
-    # RIC positions: [6:69] for 21 joints (skip root at [3:6])
-    joint_ric = frame[:, 6:69]  # 21 x 3 = 63D
-    # Rotations: [75:201] for 21 joints (skip root at [69:75])
-    joint_rot6d = frame[:, 75:201]  # 21 x 6 = 126D
-    # Velocities: [204:267] for 21 joints (skip root at [201:204])
-    joint_vel = frame[:, 204:267]  # 21 x 3 = 63D
-    prev_joints = torch.cat([joint_ric, joint_rot6d, joint_vel], dim=-1)  # (B, 252)
-
-    return torch.cat([prev_root, prev_joints], dim=-1)  # (B, 261)
 
 
 def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
@@ -158,20 +117,14 @@ def train(
     encoder: nn.Module,
     predictor: nn.Module,
     dataloader: DataLoader,
-    num_epochs: int,
     save_dir: str,
-    horizon: int = 16,
-    device: str = "cuda",
-    lr: float = 1e-4,
-    weight_decay: float = 1e-2,
-    max_grad_norm: float = 1.0,
-    ema_decay: float = 0.999,
-    cfg_dropout: float = 0.1,
+    config: "Config",
     clip_encoder: Optional[nn.Module] = None,
     wandb_project: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
     resume_from: Optional[str] = None,
     normalizer: Optional["FeatureNormalizer"] = None,
+    val_dataloader: Optional[DataLoader] = None,
 ) -> Tuple[EMAModel, EMAModel]:
     """
     Training loop with progressive horizon curriculum.
@@ -181,37 +134,79 @@ def train(
     - Fixed learning rate (no scheduling)
     - EMA for validation and checkpointing
     - CFG dropout for classifier-free guidance capability
+    - Progressive horizon curriculum learning (optional)
+    - Periodic validation during training
+
+    All training hyperparameters are read from the config object.
 
     Args:
         encoder: MotionHistoryEncoder model
         predictor: FlowMatchingPredictor model
         dataloader: DataLoader providing HumanML3D batches (RAW features)
-        num_epochs: Total training epochs
         save_dir: Directory to save checkpoints
-        horizon: Current stage horizon (sequence length)
-        device: Device to train on
-        lr: Learning rate (fixed)
-        weight_decay: Weight decay for optimizer
-        max_grad_norm: Maximum gradient norm for clipping
-        ema_decay: EMA decay rate
-        cfg_dropout: Dropout probability for classifier-free guidance
+        config: Config object containing all training hyperparameters
         clip_encoder: Optional CLIPEncoder for encoding raw captions
         wandb_project: W&B project name (optional, enables logging if provided)
         wandb_run_name: W&B run name (optional)
         resume_from: Path to checkpoint to resume from (optional)
         normalizer: Optional FeatureNormalizer for normalizing raw features
+        val_dataloader: Optional validation DataLoader for periodic validation
+                      (requires config.val_interval to be set)
 
     Returns:
         Tuple of (encoder_ema, predictor_ema)
+
+    Example:
+        from config import Config
+
+        config = Config(
+            num_epochs=500,
+            horizon=128,
+            curriculum_start=8,
+            curriculum_step=8,
+            curriculum_step_epochs=5,
+            learning_rate=1e-4,
+            ema_decay=0.999,
+        )
+
+        train(encoder, predictor, dataloader, "./checkpoints", config)
     """
+    # Extract training parameters from config
+    num_epochs = config.num_epochs
+    horizon = config.horizon
+    device = config.device
+    lr = config.learning_rate
+    weight_decay = config.weight_decay
+    max_grad_norm = config.gradient_clip
+    ema_decay = config.ema_decay
+    cfg_dropout = config.cfg_dropout
+    curriculum_start = config.curriculum_start
+    curriculum_step = config.curriculum_step
+    curriculum_step_epochs = config.curriculum_step_epochs
+
+    # Validation settings
+    val_interval = config.val_interval
+    val_batches = config.val_batches
+    val_use_ema = config.val_use_ema
+    save_best_val = config.save_best_val
+
     os.makedirs(save_dir, exist_ok=True)
     encoder.to(device)
     predictor.to(device)
 
+    # Initialize curriculum state
+    use_curriculum = curriculum_start is not None
+    if use_curriculum:
+        current_horizon = curriculum_start
+        max_horizon = horizon
+    else:
+        current_horizon = horizon
+        max_horizon = horizon
+
     # Initialize W&B logger if project is specified
     wandb_logger = None
     if wandb_project:
-        config = {
+        wandb_config = {
             "lr": lr,
             "weight_decay": weight_decay,
             "max_grad_norm": max_grad_norm,
@@ -222,11 +217,15 @@ def train(
             "batch_size": dataloader.batch_size,
             "encoder_params": sum(p.numel() for p in encoder.parameters()),
             "predictor_params": sum(p.numel() for p in predictor.parameters()),
+            "use_curriculum": use_curriculum,
+            "curriculum_start": curriculum_start,
+            "curriculum_step": curriculum_step,
+            "curriculum_step_epochs": curriculum_step_epochs,
         }
         wandb_logger = WandbLogger(
             project=wandb_project,
             name=wandb_run_name,
-            config=config,
+            config=wandb_config,
         )
 
     # EMA setup
@@ -238,19 +237,23 @@ def train(
     optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
 
     # Mixed precision training (CPU-safe)
-    use_amp = device.startswith("cuda")
+    # Handle both string and torch.device objects
+    device_str = str(device)
+    use_amp = device_str.startswith("cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # Training state
     global_step = 0
     best_loss = float("inf")
     best_epoch = -1
+    best_val_loss = float("inf")
+    best_val_epoch = -1
     start_epoch = 0
 
     # Resume from checkpoint if provided
     if resume_from is not None and os.path.exists(resume_from):
         print(f"Resuming from checkpoint: {resume_from}")
-        checkpoint = torch.load(resume_from, map_location=device)
+        checkpoint = torch.load(resume_from, map_location=device, weights_only=False)
         encoder.load_state_dict(checkpoint["encoder"])
         predictor.load_state_dict(checkpoint["predictor"])
         encoder_ema.model.load_state_dict(checkpoint["encoder_ema"])
@@ -261,9 +264,20 @@ def train(
         global_step = checkpoint.get("global_step", 0)
         best_loss = checkpoint.get("best_loss", float("inf"))
         best_epoch = checkpoint.get("best_epoch", -1)
+        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
+        best_val_epoch = checkpoint.get("best_val_epoch", -1)
+        # Restore curriculum state if available
+        if "current_horizon" in checkpoint:
+            current_horizon = checkpoint["current_horizon"]
         print(f"Resumed from epoch {start_epoch}, step {global_step}")
 
-    print(f"Training for {num_epochs} epochs with horizon={horizon}")
+    if use_curriculum:
+        print(
+            f"Training for {num_epochs} epochs with curriculum: "
+            f"{curriculum_start} -> {max_horizon} (step={curriculum_step}, every {curriculum_step_epochs} epochs)"
+        )
+    else:
+        print(f"Training for {num_epochs} epochs with fixed horizon={horizon}")
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")
     print(f"Predictor params: {sum(p.numel() for p in predictor.parameters()):,}")
 
@@ -273,27 +287,30 @@ def train(
     def save_checkpoint(filename: str, loss: float, epoch: int):
         """Save training checkpoint."""
         path = os.path.join(save_dir, filename)
-        torch.save(
-            {
-                "encoder": encoder.state_dict(),
-                "predictor": predictor.state_dict(),
-                "encoder_ema": encoder_ema.model.state_dict(),
-                "predictor_ema": predictor_ema.model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scaler": scaler.state_dict(),
-                "epoch": epoch,
-                "global_step": global_step,
-                "loss": loss,
-                "horizon": horizon,
-                "best_loss": best_loss,
-                "best_epoch": best_epoch,
-            },
-            path,
-        )
+        checkpoint = {
+            "encoder": encoder.state_dict(),
+            "predictor": predictor.state_dict(),
+            "encoder_ema": encoder_ema.model.state_dict(),
+            "predictor_ema": predictor_ema.model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scaler": scaler.state_dict(),
+            "epoch": epoch,
+            "global_step": global_step,
+            "loss": loss,
+            "horizon": horizon,
+            "current_horizon": current_horizon,
+            "use_curriculum": use_curriculum,
+            "best_loss": best_loss,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "best_val_epoch": best_val_epoch,
+        }
+        if config is not None:
+            checkpoint["config"] = config
+        torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
 
     try:
-        use_amp = device.startswith("cuda")
         amp_dtype = torch.float32  # Default for CPU
         if use_amp:
             amp_dtype = (
@@ -303,6 +320,15 @@ def train(
         for epoch in tqdm(
             range(start_epoch, num_epochs), desc="Training", unit="epoch"
         ):
+            # Curriculum: update horizon at epoch boundaries
+            if use_curriculum and epoch > 0 and epoch % curriculum_step_epochs == 0:
+                prev_horizon = current_horizon
+                current_horizon = min(current_horizon + curriculum_step, max_horizon)
+                if current_horizon != prev_horizon:
+                    tqdm.write(
+                        f"Curriculum update: horizon {prev_horizon} -> {current_horizon}"
+                    )
+
             epoch_loss = 0.0
             num_batches = 0
 
@@ -340,18 +366,18 @@ def train(
                         "No text input found. Batch must contain 'text_clip' or 'captions'."
                     )
 
-                # 2. Sample window based on horizon
+                # 2. Sample window based on current_horizon
                 # Use actual sequence lengths from batch to avoid padding issues
                 lengths = batch.get(
                     "lengths", torch.full((B,), T, device=device, dtype=torch.long)
                 )
                 min_length = int(lengths.min().item())
 
-                horizon = min(horizon, min_length - 1)
+                effective_horizon = min(current_horizon, min_length - 1)
 
-                max_start = max(1, min_length - horizon - 1)
+                max_start = max(1, min_length - effective_horizon - 1)
                 start_idx = torch.randint(0, max_start, (1,)).item()
-                end_idx = start_idx + horizon
+                end_idx = start_idx + effective_horizon
 
                 # 3. Extract history and target (already normalized)
                 hist = motion[:, start_idx:end_idx]  # (B, T_hist, 271) - normalized
@@ -366,7 +392,7 @@ def train(
 
                 # 6. Forward pass with mixed precision (CPU-safe)
 
-                with torch.amp.autocast(device, dtype=amp_dtype, enabled=use_amp):
+                with torch.amp.autocast(device_str, dtype=amp_dtype, enabled=use_amp):
                     ## TF training
 
                     # Encode context - pass normalized features with normalize=False
@@ -390,11 +416,9 @@ def train(
                     # Flatten for predictor
                     B, N, J, D = pred_contexts.shape
                     contexts_flat = pred_contexts.reshape(B * N, J, D)
-                    prev_flat = prev_frames.reshape(B * N, 271)
                     targets_flat = target_frames_tf.reshape(B * N, 271)
 
-                    # Extract features
-                    prev_features = extract_prev_frame_features(prev_flat)  # (B*N, 261)
+                    # Extract clean targets
                     clean_targets = extract_clean_target(targets_flat)
 
                     # Flow matching: sample t and create noisy target
@@ -405,18 +429,20 @@ def train(
                         + (1 - t.view(B * N, 1)) * noise
                     )
 
-                    # Predict velocity field - pass normalized features with normalize=False
+                    # Predict velocity field
                     pred = predictor(
                         history_features=contexts_flat,
                         noise_level=t,
                         noisy_target=x_t,
-                        prev_frame_features=prev_features,
-                        normalize=False,  # Features already normalized
                     )
 
                     # Loss: velocity field prediction
                     target_v = clean_targets - noise
                     loss_tf = F.mse_loss(pred, target_v)
+                    loss_root_y = F.mse_loss(pred[:, 0], target_v[:, 0])
+                    loss_root_vel = F.mse_loss(pred[:, 1:3], target_v[:, 1:3])
+                    loss_root_rot = F.mse_loss(pred[:, 3:9], target_v[:, 3:9])
+                    loss_joints = F.mse_loss(pred[:, 9:], target_v[:, 9:])
 
                     # ## Rollout training
                     # loss_ar = torch.tensor(0.0, device=device)
@@ -541,12 +567,6 @@ def train(
                 batch_time = time.time() - batch_start_time
                 batch_start_time = time.time()
 
-                gpu_memory_allocated = 0.0
-                gpu_memory_reserved = 0.0
-                if torch.cuda.is_available():
-                    gpu_memory_allocated = torch.cuda.memory_allocated() / 1e9
-                    gpu_memory_reserved = torch.cuda.memory_reserved() / 1e9
-
                 # 10. Logging
                 pbar.set_postfix(
                     {
@@ -558,8 +578,12 @@ def train(
                 if wandb_logger is not None:
                     wandb_logger.log(
                         {
-                            "train/loss_tf": loss_tf.item(),
+                            # "train/loss_tf": loss_tf.item(),
                             # "train/loss_ar": loss_ar.item(),
+                            "train/loss_root_y": loss_root_y.item(),
+                            "train/loss_root_vel": loss_root_vel.item(),
+                            "train/loss_root_rot": loss_root_rot.item(),
+                            "train/loss_joints": loss_joints.item(),
                             "train/loss": loss.item(),
                             "train/lr": lr,
                             "train/epoch": epoch,
@@ -572,10 +596,9 @@ def train(
                             "train/samples_per_sec": (
                                 B / batch_time if batch_time > 0 else 0
                             ),
-                            "train/horizon": horizon,
+                            "train/current_horizon": current_horizon,
+                            "train/effective_horizon": effective_horizon,
                             "train/num_pred_frames": num_pred_frames,
-                            "system/gpu_memory_allocated_gb": gpu_memory_allocated,
-                            "system/gpu_memory_reserved_gb": gpu_memory_reserved,
                         },
                         step=global_step,
                     )
@@ -594,21 +617,59 @@ def train(
             avg_epoch_loss = epoch_loss / max(1, num_batches)
             tqdm.write(f"==> End of Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}")
 
+            # Validation
+            val_metrics = {}
+            if val_dataloader is not None and (epoch + 1) % val_interval == 0:
+                tqdm.write(f"Running validation...")
+
+                # Choose models for validation
+                if val_use_ema:
+                    val_encoder = encoder_ema.model
+                    val_predictor = predictor_ema.model
+                else:
+                    val_encoder = encoder
+                    val_predictor = predictor
+
+                val_metrics = validate(
+                    encoder=val_encoder,
+                    predictor=val_predictor,
+                    dataloader=val_dataloader,
+                    horizon=current_horizon,
+                    device=device,
+                    num_batches=val_batches,
+                    clip_encoder=clip_encoder,
+                    normalizer=normalizer,
+                )
+
+                val_loss = val_metrics["val_loss"]
+                tqdm.write(f"Validation loss: {val_loss:.6f}")
+
+                # W&B validation logging
+                if wandb_logger is not None:
+                    wandb_logger.log(
+                        {
+                            "val/loss": val_loss,
+                            "val/epoch": epoch,
+                        },
+                        step=global_step,
+                    )
+
             # W&B epoch-level logging
             if wandb_logger is not None:
-                wandb_logger.log(
-                    {
-                        "epoch/avg_loss": avg_epoch_loss,
-                        "epoch/num": epoch,
-                    },
-                    step=global_step,
-                )
+                log_dict = {
+                    "epoch/avg_loss": avg_epoch_loss,
+                    "epoch/num": epoch,
+                    "epoch/current_horizon": current_horizon,
+                }
+                if val_metrics:
+                    log_dict["epoch/val_loss"] = val_metrics["val_loss"]
+                wandb_logger.log(log_dict, step=global_step)
 
             # Checkpointing
             # Save Latest (Always)
             save_checkpoint("latest.pt", avg_epoch_loss, epoch)
 
-            # Save Best
+            # Save Best (Training Loss)
             if avg_epoch_loss < best_loss:
                 tqdm.write(
                     f"New best model! (Loss: {best_loss:.6f} -> {avg_epoch_loss:.6f})"
@@ -617,6 +678,17 @@ def train(
                 best_epoch = epoch
                 save_checkpoint("best.pt", avg_epoch_loss, epoch)
 
+            # Save Best Validation
+            if save_best_val and val_metrics and "val_loss" in val_metrics:
+                val_loss = val_metrics["val_loss"]
+                if val_loss < best_val_loss:
+                    tqdm.write(
+                        f"New best validation model! (Val Loss: {best_val_loss:.6f} -> {val_loss:.6f})"
+                    )
+                    best_val_loss = val_loss
+                    best_val_epoch = epoch
+                    save_checkpoint("best_val.pt", avg_epoch_loss, epoch)
+
     except KeyboardInterrupt:
         tqdm.write("Training interrupted. Saving emergency checkpoint...")
         save_checkpoint("latest_interrupted.pt", 0.0, epoch)
@@ -624,7 +696,16 @@ def train(
 
     # Finish W&B run
     if wandb_logger is not None:
-        wandb_logger.log_summary({"best_loss": best_loss, "best_epoch": best_epoch})
+        summary = {
+            "best_loss": best_loss,
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "best_val_epoch": best_val_epoch,
+        }
+        if use_curriculum:
+            summary["final_horizon"] = current_horizon
+            summary["max_horizon"] = max_horizon
+        wandb_logger.log_summary(summary)
         wandb_logger.finish()
 
     return encoder_ema, predictor_ema
@@ -643,6 +724,7 @@ def validate(
     device: str = "cuda",
     num_batches: int = 10,
     clip_encoder: Optional[nn.Module] = None,
+    normalizer: Optional["FeatureNormalizer"] = None,
 ) -> dict:
     """
     Validation with teacher-forced reconstruction.
@@ -653,8 +735,9 @@ def validate(
         dataloader: Validation DataLoader
         horizon: Current horizon for validation
         device: Device to validate on
-        num_batches: Number of batches to validate
+        num_batches: Number of batches to validate (-1 for all)
         clip_encoder: Optional CLIPEncoder for encoding raw captions
+        normalizer: Optional FeatureNormalizer for normalizing raw features
 
     Returns:
         Dictionary with validation metrics
@@ -667,11 +750,17 @@ def validate(
 
     with torch.no_grad():
         for i, batch in enumerate(dataloader):
-            if i >= num_batches:
+            if num_batches > 0 and i >= num_batches:
                 break
 
-            motion = batch["motion"].to(device)
-            B, T, _ = motion.shape
+            motion_raw = batch["motion"].to(device)  # (B, T, 271) - RAW
+            B, T, _ = motion_raw.shape
+
+            # Normalize raw features if normalizer is provided
+            if normalizer is not None:
+                motion = normalizer.normalize(motion_raw)  # (B, T, 271) - normalized
+            else:
+                motion = motion_raw
 
             # Handle text: Use pre-encoded embeddings or encode raw captions with CLIP
             if "text_clip" in batch:
@@ -700,27 +789,30 @@ def validate(
             # Sample random window
             max_start = max(1, min_length - horizon - 1)
             start_idx = torch.randint(0, max_start, (1,)).item()
-            end_idx = min(start_idx + horizon, min_length - 1)
+            end_idx = int(min(start_idx + horizon, min_length - 1))
 
             hist = motion[:, start_idx:end_idx]
-            target_frame = motion[:, end_idx]
+            target_frame = motion[:, end_idx]  # type: ignore[index]  # end_idx is int
 
-            prev_features = extract_prev_frame_features(hist[:, -1])
             clean_target = extract_clean_target(target_frame)
 
-            # Encode context
-            context = encoder(text=text, input_features=hist, batch_size=B)[:, -1, :, :]
+            # Encode context - pass normalized features with normalize=False
+            context = encoder(
+                text=text,
+                input_features=hist,
+                batch_size=B,
+                normalize=False,  # Features already normalized
+            )[:, -1, :, :]
 
             # Flow matching
             t = torch.rand(B, device=device)
             noise = torch.randn_like(clean_target)
             x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
-            print(context.shape)
+
             pred = predictor(
                 history_features=context,
                 noise_level=t,
                 noisy_target=x_t,
-                prev_frame_features=prev_features,
             )
 
             target_v = clean_target - noise

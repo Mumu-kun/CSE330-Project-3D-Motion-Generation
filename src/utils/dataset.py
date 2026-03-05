@@ -39,7 +39,7 @@ class Text2MotionDataset(Dataset):
         self.max_length = 20
         self.pointer = 0
         self.max_motion_length = config.max_motion_length
-        min_motion_len = 40 if config.dataset_name == "t2m" else 24
+        min_motion_len = 40
 
         # Derive paths from config.dataset_path
         motion_dir = config.dataset_path / "new_joint_vecs"
@@ -140,7 +140,7 @@ class Text2MotionDataset(Dataset):
 
         if self.text_cache_path.exists():
             print(f"Loading text embedding cache from {self.text_cache_path}...")
-            self.text_cache = torch.load(self.text_cache_path)
+            self.text_cache = torch.load(self.text_cache_path, weights_only=False)
 
         # Collect all unique captions
         all_captions = set()

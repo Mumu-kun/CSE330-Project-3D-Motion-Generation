@@ -2,10 +2,10 @@
 
 ## Overview
 
-| Property | Value |
-|:---|:---|
+| Property         | Value                                                                         |
+| :--------------- | :---------------------------------------------------------------------------- |
 | **Architecture** | MotionHistoryEncoder (ARFM Transformer) + FlowMatchingPredictor (Transformer) |
-| **Dataset** | HumanML3D 271D features, 22 joints, 20fps |
+| **Dataset**      | HumanML3D 271D features, 22 joints, 20fps                                     |
 
 ## Constants
 
@@ -22,13 +22,13 @@ feature_slices: 0:3(global_root) 3:69(RIC pos 22x3) 69:201(RIC rot 22x6) 201:267
 
 *Source: [`src/utils/motion_utils.py`](src/utils/motion_utils.py)*
 
-| Index Range | Feature Type | Dimension | Description |
-|:---|:---|:---|:---|
-| `[0:3]` | Root Global | 3D | Height Y, Velocity X, Velocity Z |
-| `[3:69]` | RIC Positions | 66D | 22 joints × 3D local positions relative to root |
-| `[69:201]` | 6D Rotations | 132D | 22 joints × 6D rotation (auxiliary from IK) |
-| `[201:267]` | Local Velocities | 66D | 22 joints × 3D causal velocities (current - previous) |
-| `[267:271]` | Foot Contacts | 4D | Binary contact flags |
+| Index Range | Feature Type     | Dimension | Description                                           |
+| :---------- | :--------------- | :-------- | :---------------------------------------------------- |
+| `[0:3]`     | Root Global      | 3D        | Height Y, Velocity X, Velocity Z                      |
+| `[3:69]`    | RIC Positions    | 66D       | 22 joints × 3D local positions relative to root       |
+| `[69:201]`  | 6D Rotations     | 132D      | 22 joints × 6D rotation (auxiliary from IK)           |
+| `[201:267]` | Local Velocities | 66D       | 22 joints × 3D causal velocities (current - previous) |
+| `[267:271]` | Foot Contacts    | 4D        | Binary contact flags                                  |
 
 ## Joint Structure
 
@@ -36,13 +36,13 @@ feature_slices: 0:3(global_root) 3:69(RIC pos 22x3) 69:201(RIC rot 22x6) 201:267
 
 ### Kinematic Chains
 
-| Chain ID | Name | Joints |
-|:---|:---|:---|
-| 0 | Left Leg | `[0, 2, 5, 8, 11]` |
-| 1 | Right Leg | `[0, 1, 4, 7, 10]` |
-| 2 | Spine | `[0, 3, 6, 9, 12, 15]` |
-| 3 | Right Arm | `[9, 14, 17, 19, 21]` |
-| 4 | Left Arm | `[9, 13, 16, 18, 20]` |
+| Chain ID | Name      | Joints                 |
+| :------- | :-------- | :--------------------- |
+| 0        | Left Leg  | `[0, 2, 5, 8, 11]`     |
+| 1        | Right Leg | `[0, 1, 4, 7, 10]`     |
+| 2        | Spine     | `[0, 3, 6, 9, 12, 15]` |
+| 3        | Right Arm | `[9, 14, 17, 19, 21]`  |
+| 4        | Left Arm  | `[9, 13, 16, 18, 20]`  |
 
 ### Special Joint Groups
 
@@ -58,15 +58,13 @@ feature_slices: 0:3(global_root) 3:69(RIC pos 22x3) 69:201(RIC rot 22x6) 201:267
 
 ### FeatureNormalizer Methods
 
-| Method | Input | Output | Description |
-|:---|:---|:---|:---|
-| `normalize(features_271d)` | `(B, T, 271)` | `(B, T, 271)` | Normalize raw features |
-| `denormalize(features_271d)` | `(B, T, 271)` | `(B, T, 271)` | Denormalize to raw features |
-| `normalize_flow_output(flow_72d)` | `(B, 72)` | `(B, 72)` | Normalize flow output |
-| `denormalize_flow_output(flow_72d)` | `(B, 72)` | `(B, 72)` | Denormalize flow output |
-| `normalize_prev_frame_features(prev_261d)` | `(B, 261)` | `(B, 261)` | Normalize prev frame |
-| `denormalize_prev_frame_features(prev_261d)` | `(B, 261)` | `(B, 261)` | Denormalize prev frame |
-| `load_from_files(mean_path, std_path)` | paths | `FeatureNormalizer` | Load from Mean.npy, Std.npy |
+| Method                                 | Input         | Output              | Description                 |
+| :------------------------------------- | :------------ | :------------------ | :-------------------------- |
+| `normalize(features_271d)`             | `(B, T, 271)` | `(B, T, 271)`       | Normalize raw features      |
+| `denormalize(features_271d)`           | `(B, T, 271)` | `(B, T, 271)`       | Denormalize to raw features |
+| `normalize_flow_output(flow_72d)`      | `(B, 72)`     | `(B, 72)`           | Normalize flow output       |
+| `denormalize_flow_output(flow_72d)`    | `(B, 72)`     | `(B, 72)`           | Denormalize flow output     |
+| `load_from_files(mean_path, std_path)` | paths         | `FeatureNormalizer` | Load from Mean.npy, Std.npy |
 
 ### Data Flow
 
@@ -88,6 +86,79 @@ Denormalize output for reconstruction (via flow_output_to_271d)
 
 ---
 
+## Training
+
+*Source: [`src/utils/train_utils.py`](src/utils/train_utils.py)*
+
+### Validation During Training
+
+The training loop supports periodic validation to monitor generalization and detect overfitting.
+
+**Configuration** (in [`Config`](src/config.py)):
+| Setting         | Type | Default | Description                                            |
+| --------------- | ---- | ------- | ------------------------------------------------------ |
+| `val_interval`  | int  | 5       | Run validation every N epochs                          |
+| `val_batches`   | int  | 20      | Number of validation batches per run (-1 for full set) |
+| `val_use_ema`   | bool | True    | Use EMA models for validation (more stable)            |
+| `save_best_val` | bool | True    | Save separate checkpoint for best validation loss      |
+
+**Usage:**
+```python
+from utils.train_utils import train
+from config import Config
+
+config = Config(val_interval=5, val_batches=20, val_use_ema=True)
+
+# Create train and validation dataloaders
+train_loader = DataLoader(train_dataset, ...)
+val_loader = DataLoader(val_dataset, ...)
+
+train(
+    encoder=encoder,
+    predictor=predictor,
+    dataloader=train_loader,
+    save_dir="./checkpoints",
+    config=config,
+    val_dataloader=val_loader,  # Enable validation
+)
+```
+
+**Output:**
+- `val/loss` logged to W&B
+- `epoch/val_loss` logged to W&B
+- Checkpoints: `best.pt` (best training loss), `best_val.pt` (best validation loss)
+- Checkpoints include validation state: `best_val_loss`, `best_val_epoch`
+
+### Train Function
+
+| Parameter        | Type                | Description                    |
+| ---------------- | ------------------- | ------------------------------ |
+| `encoder`        | `nn.Module`         | MotionHistoryEncoder model     |
+| `predictor`      | `nn.Module`         | FlowMatchingPredictor model    |
+| `dataloader`     | `DataLoader`        | Training data (RAW features)   |
+| `save_dir`       | `str`               | Checkpoint directory           |
+| `config`         | `Config`            | Training configuration         |
+| `val_dataloader` | `DataLoader`        | Optional validation data       |
+| `clip_encoder`   | `nn.Module`         | Optional CLIP encoder for text |
+| `normalizer`     | `FeatureNormalizer` | Optional feature normalizer    |
+
+### Validation Function
+
+| Parameter      | Type                | Default | Description                     |
+| -------------- | ------------------- | ------- | ------------------------------- |
+| `encoder`      | `nn.Module`         | -       | Encoder model (should be EMA)   |
+| `predictor`    | `nn.Module`         | -       | Predictor model (should be EMA) |
+| `dataloader`   | `DataLoader`        | -       | Validation data                 |
+| `horizon`      | `int`               | -       | Current horizon for validation  |
+| `device`       | `str`               | "cuda"  | Device to validate on           |
+| `num_batches`  | `int`               | 10      | Number of batches to validate   |
+| `clip_encoder` | `nn.Module`         | None    | Optional CLIP encoder           |
+| `normalizer`   | `FeatureNormalizer` | None    | Optional normalizer             |
+
+**Returns:** `{"val_loss": float}`
+
+---
+
 ## Models
 
 *Source: [`src/models.py`](src/models.py)*
@@ -96,11 +167,11 @@ Denormalize output for reconstruction (via flow_output_to_271d)
 
 #### Input/Output
 
-| Tensor | Shape | Description |
-|:---|:---|:---|
-| `text` | `(B, l_seq, 512)` | CLIP sequence embeddings |
-| `history` | `(B, T, 271)` | RAW motion features |
-| `output` | `(B, T, 22, per_joint_out_dim)` | Context vectors (all timesteps) |
+| Tensor    | Shape                           | Description                     |
+| :-------- | :------------------------------ | :------------------------------ |
+| `text`    | `(B, l_seq, 512)`               | CLIP sequence embeddings        |
+| `history` | `(B, T, 271)`                   | RAW motion features             |
+| `output`  | `(B, T, 22, per_joint_out_dim)` | Context vectors (all timesteps) |
 
 #### `__init__` Parameters
 
@@ -131,11 +202,11 @@ Denormalize output for reconstruction (via flow_output_to_271d)
 
 *Source: [`src/utils/text_encoder.py`](src/utils/text_encoder.py)*
 
-| Property | Value |
-|:---|:---|
-| Input | `text: str` or `List[str]` |
-| Output | `(B, 1, 512)` pooled embeddings |
-| Note | Uses `pooler_output`, not full sequence. `max_text_seq_len` in config is 1, not 77 |
+| Property | Value                                                                              |
+| :------- | :--------------------------------------------------------------------------------- |
+| Input    | `text: str` or `List[str]`                                                         |
+| Output   | `(B, 1, 512)` pooled embeddings                                                    |
+| Note     | Uses `pooler_output`, not full sequence. `max_text_seq_len` in config is 1, not 77 |
 
 ---
 
@@ -144,62 +215,42 @@ Denormalize output for reconstruction (via flow_output_to_271d)
 #### Signature
 
 ```
-(context: Bx22x64, t: B, x_t: Bx72, prev: Bx261, progress) → v: Bx72
+(context: Bx22x64, t: B, x_t: Bx72, progress) → v: Bx72
 ```
-
-#### `__init__` Parameters
-
-- `normalizer: Optional[FeatureNormalizer]` — for normalizing raw features
-
-#### `forward()` Parameters
-
-- `normalize: bool = True` — if True and normalizer set, normalize prev_frame_features
-  - Note: `noisy_target` is already in normalized space (from ODE integration)
-  - Set to `False` during training (normalization handled externally)
-  - Set to `True` during inference (models normalize internally)
 
 #### Inputs
 
-| Tensor | Shape | Description |
-|:---|:---|:---|
-| `history_features` | `(B, 22, per_joint_dim)` | Context from MotionHistoryEncoder |
-| `noise_level` | `(B,)` | Flow time t in [0,1] |
-| `noisy_target` | `(B, 72)` | Current noisy state x_t (normalized space) |
-| `prev_frame_features` | `(B, 261)` | Previous frame features (RAW if normalize=True) |
-| `temporal_progress` | `(B,)` | Optional normalized frame progress |
+| Tensor              | Shape                    | Description                                |
+| :------------------ | :----------------------- | :----------------------------------------- |
+| `history_features`  | `(B, 22, per_joint_dim)` | Context from MotionHistoryEncoder          |
+| `noise_level`       | `(B,)`                   | Flow time t in [0,1]                       |
+| `noisy_target`      | `(B, 72)`                | Current noisy state x_t (normalized space) |
+| `temporal_progress` | `(B,)`                   | Optional normalized frame progress         |
 
 #### noisy_target Layout (72D)
 
-| Index | Content | Dimension |
-|:---|:---|:---|
-| `[0:9]` | Root: height(1) + velocity(2) + rotation_6d(6) | 9D |
-| `[9:72]` | Joint RIC positions: 21 joints × 3D | 63D |
-
-#### prev_frame_features Layout (261D)
-
-| Index | Content | Dimension |
-|:---|:---|:---|
-| `[0:9]` | Root: height(1) + velocity(2) + rotation_6d(6) | 9D |
-| `[9:261]` | Joints: 21 × 12D (RIC + rot + vel) | 252D |
+| Index    | Content                                        | Dimension |
+| :------- | :--------------------------------------------- | :-------- |
+| `[0:9]`  | Root: height(1) + velocity(2) + rotation_6d(6) | 9D        |
+| `[9:72]` | Joint RIC positions: 21 joints × 3D            | 63D       |
 
 #### Output (72D)
 
-| Index | Content | Dimension |
-|:---|:---|:---|
-| `[0:9]` | Root: height(1) + velocity(2) + rotation_6d(6) | 9D |
-| `[9:72]` | Joint RIC: 21 × 3D | 63D |
+| Index    | Content                                        | Dimension |
+| :------- | :--------------------------------------------- | :-------- |
+| `[0:9]`  | Root: height(1) + velocity(2) + rotation_6d(6) | 9D        |
+| `[9:72]` | Joint RIC: 21 × 3D                             | 63D       |
 
 #### Architecture
 
 1. History projection: `(B, 22, per_joint_dim)` → `(B, 22, model_dim)`
-2. Prev frame projection: `root(9D) + joints(252D)` → `(B, 22, model_dim)`
-3. Noisy target projection: `root(9D) + joints(63D)` → `(B, 22, model_dim)`
-4. Time embedding: sinusoidal → MLP → `(B, model_dim)`
-5. Kinematic bias: `KinematicChainEncoder` → `(22, model_dim)`
-6. Combine: `history + prev + noisy + time + kinematic` → `(B, 22, model_dim)`
-7. Spatial Transformer: 2-4 layers of transformer encoder
-8. Output heads: `root_head → (B, 9)`, `joint_head → (B, 21, 3)`
-9. Concatenate: `(B, 72)`
+2. Noisy target projection: `root(9D) + joints(63D)` → `(B, 22, model_dim)`
+3. Time embedding: sinusoidal → MLP → `(B, model_dim)`
+4. Kinematic bias: `KinematicChainEncoder` → `(22, model_dim)`
+5. Combine: `history + noisy + time + kinematic` → `(B, 22, model_dim)`
+6. Spatial Transformer: 2-4 layers of transformer encoder
+7. Output heads: `root_head → (B, 9)`, `joint_head → (B, 21, 3)`
+8. Concatenate: `(B, 72)`
 
 ---
 
@@ -245,33 +296,44 @@ Denormalize output for reconstruction (via flow_output_to_271d)
 #### Features
 
 - Integrates MotionHistoryEncoder and FlowMatchingPredictor
-- Uses FULL HISTORY tracking for both positions and features
-- Feature extraction via `sequence_joints_to_features` on full position sequence
+- No longer uses `prev_frame_features` (removed from FlowMatchingPredictor)
 - Classifier-free guidance: `v = v_uncond + scale * (v_cond - v_uncond)`
 - Input text: `str`, `List[str]`, or pre-encoded tensor `(B, 1, 512)` from CLIPEncoder
-- `input_features`: Optional, shape `(B, N, 271)` or `(B, 271)` — initial motion history (uses null_history if None)
+- `input_features`: Optional, shape `(B, N, 271)` or `(B, 271)` — initial motion history
 - `load_from_checkpoint`: Uses `config.max_text_seq_len` (not hardcoded 77)
+
+#### Class Methods
+
+| Method                      | Description                                      |
+| :-------------------------- | :----------------------------------------------- |
+| `eval()`                    | Set encoder and predictor to eval mode           |
+| `train(mode=True)`          | Set encoder and predictor to train mode          |
+| `parameters()`              | Yield parameters from both encoder and predictor |
+| `to(device)`                | Move models to specified device                  |
+| `generate_sequence(...)`    | Generate motion sequence autoregressively        |
+| `load_from_checkpoint(...)` | Load from checkpoint (class method)              |
+
+Note: This class does not inherit from `nn.Module` but delegates to its encoder and predictor.
 
 #### History Tracking
 
-| Tensor | Shape | Description |
-|:---|:---|:---|
+| Tensor             | Shape           | Description                           |
+| :----------------- | :-------------- | :------------------------------------ |
 | `position_history` | `(B, N, 22, 3)` | Global joint positions for all frames |
-| `feature_history` | `(B, N, 271)` | Feature vectors for encoder context |
+| `feature_history`  | `(B, N, 271)`   | Feature vectors for encoder context   |
 
-Both grow with each generated frame.
+Both grow with each generated frame using `flow_output_to_271d` and `RootPositionTracker`.
 
 #### Autoregressive Loop (per frame)
 
 1. Extract `last_frame` from `feature_history (B, 271)`
-2. Get `prev_positions` from `position_history[:, -1] (B, 22, 3)`
-3. Extract `prev_root_pos` and `prev_root_rot_6d`
-4. Encode context from FULL `feature_history` with CFG (cond and uncond)
-5. Flow matching ODE loop → `flow_output (B, 72)`
-6. `flow_output_to_positions(flow_output, prev_root_pos, prev_root_rot_6d)` → `new_positions`
-7. Append `new_positions` to `position_history`
-8. `sequence_joints_to_features(FULL position_history)` → `feature_history (B, N+1, 271)`
-9. Feature extraction matches training exactly (velocities from actual frame differences)
+2. Get `prev_root_pos` from `RootPositionTracker.get()`
+3. Encode context from FULL `feature_history` with CFG (cond and uncond)
+4. Flow matching ODE loop → `flow_output (B, 72)`
+5. `flow_output_to_271d(flow_output, prev_frame, prev_root_pos)` → `(new_frame, new_root_pos)`
+6. `RootPositionTracker.update(new_frame)` → update root position
+7. Append `new_frame` to `feature_history`
+8. Final: Convert `feature_history` to positions via `features_to_positions`
 
 ---
 
@@ -281,27 +343,27 @@ Both grow with each generated frame.
 
 ### Model Parameters
 
-| Parameter | Value | Description |
-|:---|:---|:---|
-| `text_proj` | 512 → 128 | CLIP embedding projection |
-| `joint_proj` | 12 → 128 | Per-joint feature projection |
-| `model_dim` | 128 | Transformer hidden dimension |
-| `transformer_layers` | 4 | MotionHistoryEncoder layers |
-| `max_text_seq_len` | 1 | CLIP sequence length (pooled) |
-| `heads` | 2 | Attention heads |
-| `dropout` | 0.1 | Dropout rate |
-| `flow_layers` | 3 | FlowMatchingPredictor layers |
-| `time_embed_dim` | 64 | Sinusoidal time embedding |
+| Parameter            | Value     | Description                   |
+| :------------------- | :-------- | :---------------------------- |
+| `text_proj`          | 512 → 128 | CLIP embedding projection     |
+| `joint_proj`         | 12 → 128  | Per-joint feature projection  |
+| `model_dim`          | 128       | Transformer hidden dimension  |
+| `transformer_layers` | 4         | MotionHistoryEncoder layers   |
+| `max_text_seq_len`   | 1         | CLIP sequence length (pooled) |
+| `heads`              | 2         | Attention heads               |
+| `dropout`            | 0.1       | Dropout rate                  |
+| `flow_layers`        | 3         | FlowMatchingPredictor layers  |
+| `time_embed_dim`     | 64        | Sinusoidal time embedding     |
 
 ### Training Parameters
 
-| Parameter | Value |
-|:---|:---|
-| `batch_size` | 100 |
-| `learning_rate` | 1e-4 |
-| `epochs` | 200 |
-| `flow_loss_weight` | 1.0 |
-| `context_loss_weight` | 0.1 |
+| Parameter             | Value |
+| :-------------------- | :---- |
+| `batch_size`          | 100   |
+| `learning_rate`       | 1e-4  |
+| `epochs`              | 200   |
+| `flow_loss_weight`    | 1.0   |
+| `context_loss_weight` | 0.1   |
 
 ---
 
@@ -343,12 +405,12 @@ Per frame:
 
 ### Progressive Horizon Curriculum
 
-| Stage | Frames |
-|:---|:---|
-| 1 | 16 |
-| 2 | 32 |
-| 3 | 64 |
-| 4 | 128 (optional) |
+| Stage | Frames         |
+| :---- | :------------- |
+| 1     | 16             |
+| 2     | 32             |
+| 3     | 64             |
+| 4     | 128 (optional) |
 
 ### Training Loop
 
@@ -389,17 +451,17 @@ Per frame:
 
 #### `extract_prev_frame_features(frame: Bx271) → (B, 261)`
 
-| Index | Content | Dimension |
-|:---|:---|:---|
-| `[0:9]` | Root: height(1) + vel(2) + rot_6d(6) | 9D |
-| `[9:261]` | Joints: 21 × 12D (RIC + rot + vel) | 252D |
+| Index     | Content                              | Dimension |
+| :-------- | :----------------------------------- | :-------- |
+| `[0:9]`   | Root: height(1) + vel(2) + rot_6d(6) | 9D        |
+| `[9:261]` | Joints: 21 × 12D (RIC + rot + vel)   | 252D      |
 
 #### `extract_clean_target(frame: Bx271) → (B, 72)`
 
-| Index | Content | Dimension |
-|:---|:---|:---|
-| `[0:9]` | Root: height(1) + vel(2) + rot_6d(6) | 9D |
-| `[9:72]` | Joint RIC: 21 × 3D | 63D |
+| Index    | Content                              | Dimension |
+| :------- | :----------------------------------- | :-------- |
+| `[0:9]`  | Root: height(1) + vel(2) + rot_6d(6) | 9D        |
+| `[9:72]` | Joint RIC: 21 × 3D                   | 63D       |
 
 ### EMA Model Management
 
@@ -410,10 +472,10 @@ Per frame:
 
 ### Checkpointing
 
-| File | Trigger |
-|:---|:---|
-| `latest.pt` | Every epoch |
-| `best.pt` | When `avg_epoch_loss < best_loss` |
+| File        | Trigger                           |
+| :---------- | :-------------------------------- |
+| `latest.pt` | Every epoch                       |
+| `best.pt`   | When `avg_epoch_loss < best_loss` |
 
 **Checkpoint Contents**: encoder, predictor, encoder_ema, predictor_ema, optimizer, scaler, epoch, global_step
 
@@ -443,15 +505,15 @@ visualization ← motion_utils
 
 ## Files
 
-| File | Purpose |
-|:---|:---|
-| [`src/config.py`](src/config.py) | Hyperparameters |
-| [`src/models.py`](src/models.py) | MHE, FMP, Generator |
-| [`src/utils/dataset.py`](src/utils/dataset.py) | Text2MotionDataset |
+| File                                                     | Purpose                               |
+| :------------------------------------------------------- | :------------------------------------ |
+| [`src/config.py`](src/config.py)                         | Hyperparameters                       |
+| [`src/models.py`](src/models.py)                         | MHE, FMP, Generator                   |
+| [`src/utils/dataset.py`](src/utils/dataset.py)           | Text2MotionDataset                    |
 | [`src/utils/motion_utils.py`](src/utils/motion_utils.py) | Features, IncrementalFeatureExtractor |
-| [`src/utils/train_utils.py`](src/utils/train_utils.py) | Training loop, EMA |
-| [`src/utils/quaternion.py`](src/utils/quaternion.py) | qrot, qmul, qinv |
-| [`src/utils/text_encoder.py`](src/utils/text_encoder.py) | CLIP encoding |
+| [`src/utils/train_utils.py`](src/utils/train_utils.py)   | Training loop, EMA                    |
+| [`src/utils/quaternion.py`](src/utils/quaternion.py)     | qrot, qmul, qinv                      |
+| [`src/utils/text_encoder.py`](src/utils/text_encoder.py) | CLIP encoding                         |
 
 ---
 
@@ -459,15 +521,15 @@ visualization ← motion_utils
 
 *Update test files on code interface change; remove previous redundant tests if new test is written*
 
-| Test File | Purpose |
-|:---|:---|
-| [`tests/test_training_loop.py`](tests/test_training_loop.py) | Training loop and HumanMotionGenerator verification (8 tests) |
-| [`tests/test_rotation_roundtrip.py`](tests/test_rotation_roundtrip.py) | Rotation roundtrip verification for flow_output_to_271d |
-| [`tests/test_flow_predictor.py`](tests/test_flow_predictor.py) | FlowMatchingPredictor unit tests (I/O shapes: 72D noisy, 261D prev, 72D output) |
-| [`tests/test_motion_encoder.py`](tests/test_motion_encoder.py) | MotionHistoryEncoder unit tests |
-| [`tests/test_nan_fix.py`](tests/test_nan_fix.py) | HumanMotionGenerator.generate_sequence() NaN fix verification |
-| [`tests/test_nan_debug.py`](tests/test_nan_debug.py) | Debug test for tracing NaN propagation |
-| [`tests/test_pose_validation.py`](tests/test_pose_validation.py) | Pose validation unit tests |
+| Test File                                                              | Purpose                                                                         |
+| :--------------------------------------------------------------------- | :------------------------------------------------------------------------------ |
+| [`tests/test_training_loop.py`](tests/test_training_loop.py)           | Training loop and HumanMotionGenerator verification (8 tests)                   |
+| [`tests/test_rotation_roundtrip.py`](tests/test_rotation_roundtrip.py) | Rotation roundtrip verification for flow_output_to_271d                         |
+| [`tests/test_flow_predictor.py`](tests/test_flow_predictor.py)         | FlowMatchingPredictor unit tests (I/O shapes: 72D noisy, 261D prev, 72D output) |
+| [`tests/test_motion_encoder.py`](tests/test_motion_encoder.py)         | MotionHistoryEncoder unit tests                                                 |
+| [`tests/test_nan_fix.py`](tests/test_nan_fix.py)                       | HumanMotionGenerator.generate_sequence() NaN fix verification                   |
+| [`tests/test_nan_debug.py`](tests/test_nan_debug.py)                   | Debug test for tracing NaN propagation                                          |
+| [`tests/test_pose_validation.py`](tests/test_pose_validation.py)       | Pose validation unit tests                                                      |
 
 ---
 
@@ -490,13 +552,13 @@ visualization ← motion_utils
 
 ### PoseValidationResult
 
-| Property | Type |
-|:---|:---|
-| `is_valid` | `bool` |
-| `bone_ratio_issues` | `List[BoneRatioIssue]` |
+| Property               | Type                   |
+| :--------------------- | :--------------------- |
+| `is_valid`             | `bool`                 |
+| `bone_ratio_issues`    | `List[BoneRatioIssue]` |
 | `ric_bound_violations` | `Dict[str, List[int]]` |
-| `kinematic_issues` | `List[KinematicIssue]` |
-| `scaling_metrics` | `ScalingMetrics` |
+| `kinematic_issues`     | `List[KinematicIssue]` |
+| `scaling_metrics`      | `ScalingMetrics`       |
 
 **Methods**:
 - `summary() → str`: Human-readable summary

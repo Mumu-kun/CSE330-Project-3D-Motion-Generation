@@ -559,17 +559,6 @@ class FlowMatchingPredictor(nn.Module):
             - 21 non-root joints, each with 3D RIC positions
         - Represents the current noisy state x_t in flow matching
 
-    - prev_frame_features: (B, 261)
-        - Root features (first 9D):
-            - 1D root height
-            - 2D root local velocity (rotation-invariant)
-            - 6D absolute rotation
-        - Joint features (next 252D):
-            - 21 non-root joints x 12D each:
-                - 3D RIC positions
-                - 6D rotations
-                - 3D local velocities
-
     - noise_level: (B,)
         - Scalar flow time t in [0,1] used to compute sinusoidal embedding
 
@@ -615,22 +604,20 @@ class FlowMatchingPredictor(nn.Module):
             nn.Linear(model_dim, model_dim),
         )
 
-        # --- Project history / prev frame separately ---
+        # --- Project history ---
         self.input_proj_history = nn.Linear(
             per_joint_dim, model_dim
         )  # only history embeddings
-
-        # Prev frame projections (root + joints)
-        self.input_proj_prev_root = nn.Linear(9, model_dim)  # root: height + vel + rot
-        self.input_proj_prev_joint = nn.Linear(
-            12, model_dim
-        )  # joints: RIC + rot + velocity
 
         # --- Project noisy target separately ---
         self.input_proj_noisy_root = nn.Linear(9, model_dim)  # noisy root features
         self.input_proj_noisy_joint = nn.Linear(
             3, model_dim
         )  # noisy joint RIC positions
+
+        self.fusion_proj = nn.Linear(
+            2 * model_dim, model_dim
+        )  # fusion of history and noisy target
 
         # --- Spatial Transformer ---
         encoder_layer = nn.TransformerEncoderLayer(
@@ -658,10 +645,6 @@ class FlowMatchingPredictor(nn.Module):
             nn.Linear(model_dim, 3),  # 3D RIC positions
         )
 
-        # --- Null tokens for prev frame ---
-        self.null_prev_root = nn.Parameter(torch.zeros(1, 9))
-        self.null_prev_joint = nn.Parameter(torch.zeros(1, joint_count - 1, 12))
-
     def _sinusoidal_time_embedding(self, t: torch.Tensor, max_positions=10000):
         """Sinusoidal embedding for flow time t in [0,1]."""
         half_dim = self.time_embed_dim // 2
@@ -681,9 +664,7 @@ class FlowMatchingPredictor(nn.Module):
         history_features: torch.Tensor,  # (B, 22, per_joint_dim)
         noise_level: torch.Tensor,  # (B,)
         noisy_target: Optional[torch.Tensor] = None,  # (B, 72) - in normalized space
-        prev_frame_features: Optional[torch.Tensor] = None,  # (B, 261) - RAW features
         temporal_progress: Optional[torch.Tensor] = None,
-        normalize: bool = True,  # If True, normalize prev_frame_features (for inference)
     ):
         """
         Forward pass for FlowMatchingPredictor.
@@ -692,10 +673,7 @@ class FlowMatchingPredictor(nn.Module):
             history_features: (B, 22, per_joint_dim) - Context from MotionHistoryEncoder
             noise_level: (B,) - Flow time t in [0,1]
             noisy_target: (B, 72) - Current noisy state x_t (already in normalized space)
-            prev_frame_features: (B, 261) - Previous frame features (RAW if normalize=True)
             temporal_progress: (B,) - Optional normalized frame progress
-            normalize: If True and normalizer is set, normalize prev_frame_features
-                       Set to False during training when normalization is handled externally
 
         Returns:
             pred_frame: (B, 72) - Predicted velocity field (in normalized space)
@@ -703,37 +681,8 @@ class FlowMatchingPredictor(nn.Module):
         B, J, _ = history_features.shape
         device = history_features.device
 
-        # --- Normalize raw prev_frame_features if normalizer is provided and normalize=True ---
-        # Note: noisy_target is already in normalized space (from ODE integration)
-        if self.normalizer is not None and normalize:
-            if prev_frame_features is not None:
-                prev_frame_features = self.normalizer.normalize_prev_frame_features(
-                    prev_frame_features
-                )
-
-        # --- Handle optional prev frame ---
-        if prev_frame_features is None:
-            prev_root = self.null_prev_root.expand(B, 9)
-            prev_joints = self.null_prev_joint.expand(B, J - 1, 12)
-        else:
-            # Split root / joints
-            prev_root = prev_frame_features[:, :9]  # (B,9)
-            prev_joints = prev_frame_features[:, 9:]  # (B, (J-1)*12)
-            prev_joints = prev_joints.reshape(B, J - 1, 12)
-
-        # --- Project history and prev frame separately ---
-        history_proj = self.input_proj_history(history_features)  # (B,22,model_dim)
-
-        prev_root_proj = self.input_proj_prev_root(prev_root).unsqueeze(
-            1
-        )  # (B,1,model_dim)
-        prev_joint_proj = self.input_proj_prev_joint(prev_joints)  # (B,21,model_dim)
-        prev_proj = torch.cat(
-            [prev_root_proj, prev_joint_proj], dim=1
-        )  # (B,22,model_dim)
-
-        # --- Combine history + prev frame ---
-        cond_proj = history_proj + prev_proj  # (B,22,model_dim)
+        # --- Project history ---
+        cond_proj = self.input_proj_history(history_features)  # (B,22,model_dim)
 
         # --- Handle noisy target ---
         if noisy_target is None:
@@ -745,10 +694,13 @@ class FlowMatchingPredictor(nn.Module):
         noisy_root_proj = self.input_proj_noisy_root(noisy_root_in).unsqueeze(1)
         noisy_joint_proj = self.input_proj_noisy_joint(noisy_joints_in)
 
-        noisy_proj = torch.cat([noisy_root_proj, noisy_joint_proj], dim=1)
+        noisy_proj = torch.cat(
+            [noisy_root_proj, noisy_joint_proj], dim=1
+        )  # (B,22,model_dim)
 
         # --- Combine condition + noisy ---
-        x = cond_proj + noisy_proj  # (B,22,model_dim)
+        x = torch.cat([cond_proj, noisy_proj], dim=-1)  # (B,22,2*model_dim)
+        x = self.fusion_proj(x)  # (B,22,model_dim)
 
         # --- Add time embedding ---
         t_emb = self._sinusoidal_time_embedding(noise_level)
@@ -774,7 +726,7 @@ class FlowMatchingPredictor(nn.Module):
         return pred_frame
 
 
-class HumanMotionGenerator(nn.Module):
+class HumanMotionGenerator:
     """
     Top-level wrapper for the Human Motion Generation pipeline.
     Integrates MotionHistoryEncoder (Context) and FlowMatchingPredictor (Spatial Generation).
@@ -791,6 +743,31 @@ class HumanMotionGenerator(nn.Module):
         self.encoder = encoder
         self.predictor = predictor
         self.normalizer = encoder.normalizer
+
+    def eval(self) -> "HumanMotionGenerator":
+        """Set models to evaluation mode."""
+        self.encoder.eval()
+        self.predictor.eval()
+        return self
+
+    def train(self, mode: bool = True) -> "HumanMotionGenerator":
+        """Set models to training mode."""
+        self.encoder.train(mode)
+        self.predictor.train(mode)
+        return self
+
+    def parameters(self):
+        """Yield parameters from both encoder and predictor."""
+        for p in self.encoder.parameters():
+            yield p
+        for p in self.predictor.parameters():
+            yield p
+
+    def to(self, device):
+        """Move models to device."""
+        self.encoder = self.encoder.to(device)
+        self.predictor = self.predictor.to(device)
+        return self
 
     def generate_sequence(
         self,
@@ -821,8 +798,6 @@ class HumanMotionGenerator(nn.Module):
         Returns:
             position_history: (B, N+num_frames, 22, 3) - Global joint positions including initial history
         """
-        from utils.train_utils import extract_prev_frame_features
-
         self.eval()
         with torch.no_grad():
             # Handle text encoding
@@ -895,12 +870,7 @@ class HumanMotionGenerator(nn.Module):
                 ]  # (B, 22, out_dim)
 
                 # ========================================
-                # Step C: Extract prev_frame_features (261D) from RAW features
-                # ========================================
-                prev_frame_features = extract_prev_frame_features(last_frame)
-
-                # ========================================
-                # Step D: Flow matching ODE loop
+                # Step C: Flow matching ODE loop
                 # x_t starts as random noise (already in normalized space conceptually)
                 # ========================================
                 x_t = torch.randn((B, 72), device=device)
@@ -913,16 +883,12 @@ class HumanMotionGenerator(nn.Module):
                         history_features=context_cond,
                         noise_level=t,
                         noisy_target=x_t,
-                        prev_frame_features=prev_frame_features,
-                        normalize=True,  # Normalize prev_frame_features internally
                     )
 
                     v_uncond = self.predictor(
                         history_features=context_uncond,
                         noise_level=t,
                         noisy_target=x_t,
-                        prev_frame_features=prev_frame_features,
-                        normalize=True,  # Normalize prev_frame_features internally
                     )
 
                     # Classifier-free guidance
@@ -979,7 +945,9 @@ class HumanMotionGenerator(nn.Module):
             normalizer: Optional FeatureNormalizer for raw feature normalization
         """
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
+        checkpoint = torch.load(
+            checkpoint_path, map_location=device, weights_only=False
+        )
 
         # Initialize Motion History Encoder (Transformer-based)
         encoder = MotionHistoryEncoder(
