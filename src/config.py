@@ -65,7 +65,7 @@ class Config:
     # Training settings
     batch_size: int = 192
     learning_rate: float = 1e-4
-    num_epochs: int = 300
+    num_epochs: int = 1000
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
@@ -74,19 +74,19 @@ class Config:
     cfg_dropout: float = 0.1  # Dropout probability for CFG
 
     # Horizon settings
-    horizon: int = 16  # Maximum/target horizon for training
+    horizon: int = 40  # Maximum/target horizon for training
 
     # Curriculum learning settings
-    curriculum_start: Optional[int] = None  # Initial horizon (None = no curriculum)
-    curriculum_step: int = 8  # Frames to increase per step
-    curriculum_step_epochs: int = 10  # Epochs per horizon level
+    curriculum_start: Optional[int] = 10  # Initial horizon (None = no curriculum)
+    curriculum_step: int = 10  # Frames to increase per step
+    curriculum_step_epochs: int = 150  # Epochs per horizon level
 
     # Data loading
     num_workers: int = 4
     pin_memory: bool = True
 
     # Inference settings
-    num_inference_steps: int = 10  # Number of flow matching steps
+    num_inference_steps: int = 20  # Number of flow matching steps
     guidance_scale: float = 1.0  # CFG scale for inference
 
     # Validation settings

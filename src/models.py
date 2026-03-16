@@ -28,6 +28,7 @@ from utils.motion_utils import (
     flow_output_to_271d,
     RootPositionTracker,
     FeatureNormalizer,
+    extract_prev_frame_features,
 )
 
 
@@ -616,8 +617,17 @@ class FlowMatchingPredictor(nn.Module):
         )  # noisy joint RIC positions
 
         self.fusion_proj = nn.Linear(
-            2 * model_dim, model_dim
-        )  # fusion of history and noisy target
+            3 * model_dim, model_dim
+        )  # fusion of history, noisy target, and prev_frame_features
+
+        # Prev frame projections (root + joints)
+        self.input_proj_prev_root = nn.Linear(9, model_dim)  # root: height + vel + rot
+        self.input_proj_prev_joint = nn.Linear(
+            12, model_dim
+        )  # joints: RIC + rot + velocity
+
+        # --- Learnable bias for when prev_frame_features is None ---
+        self.null_prev_bias = nn.Parameter(torch.zeros(joint_count, model_dim))
 
         # --- Spatial Transformer ---
         encoder_layer = nn.TransformerEncoderLayer(
@@ -664,6 +674,9 @@ class FlowMatchingPredictor(nn.Module):
         history_features: torch.Tensor,  # (B, 22, per_joint_dim)
         noise_level: torch.Tensor,  # (B,)
         noisy_target: Optional[torch.Tensor] = None,  # (B, 72) - in normalized space
+        prev_frame_features: Optional[
+            torch.Tensor
+        ] = None,  # (B, 261) - prev frame features
         temporal_progress: Optional[torch.Tensor] = None,
     ):
         """
@@ -673,6 +686,7 @@ class FlowMatchingPredictor(nn.Module):
             history_features: (B, 22, per_joint_dim) - Context from MotionHistoryEncoder
             noise_level: (B,) - Flow time t in [0,1]
             noisy_target: (B, 72) - Current noisy state x_t (already in normalized space)
+            prev_frame_features: (B, 261) - Features from previous frame (root 9D + joints 252D)
             temporal_progress: (B,) - Optional normalized frame progress
 
         Returns:
@@ -698,8 +712,33 @@ class FlowMatchingPredictor(nn.Module):
             [noisy_root_proj, noisy_joint_proj], dim=1
         )  # (B,22,model_dim)
 
-        # --- Combine condition + noisy ---
-        x = torch.cat([cond_proj, noisy_proj], dim=-1)  # (B,22,2*model_dim)
+        # --- Handle prev_frame_features ---
+        if prev_frame_features is None:
+            # Use learned bias when not provided (backwards compatible)
+            prev_proj = self.null_prev_bias.unsqueeze(0).expand(
+                B, -1, -1
+            )  # (B, 22, model_dim)
+        else:
+            # Split into root and joints
+            prev_root = prev_frame_features[:, :9]  # (B, 9)
+            prev_joints = prev_frame_features[:, 9:].reshape(
+                B, J - 1, -1
+            )  # (B, 21, 12)
+
+            # Project separately and concatenate
+            prev_root_proj = self.input_proj_prev_root(prev_root).unsqueeze(
+                1
+            )  # (B, 1, model_dim)
+            prev_joints_proj = self.input_proj_prev_joint(
+                prev_joints
+            )  # (B, 21, model_dim)
+
+            prev_proj = torch.cat(
+                [prev_root_proj, prev_joints_proj], dim=1
+            )  # (B, 22, model_dim)
+
+        # --- Combine condition + noisy + prev_frame_features ---
+        x = torch.cat([cond_proj, noisy_proj, prev_proj], dim=-1)  # (B,22,3*model_dim)
         x = self.fusion_proj(x)  # (B,22,model_dim)
 
         # --- Add time embedding ---
@@ -877,11 +916,15 @@ class HumanMotionGenerator:
                 for step in range(num_steps):
                     t = torch.full((B,), step * dt, device=device)
 
+                    # Extract prev_frame_features from last_frame (271D -> 261D)
+                    prev_features = extract_prev_frame_features(last_frame)  # (B, 261)
+
                     # Only conditional prediction (no CFG)
                     v_t = self.predictor(
                         history_features=context_cond,
                         noise_level=t,
                         noisy_target=x_t,
+                        prev_frame_features=prev_features,
                     )
 
                     x_t = x_t + v_t * dt
@@ -921,7 +964,7 @@ class HumanMotionGenerator:
     def load_from_checkpoint(
         cls,
         checkpoint_path: Union[str, Path],
-        config: Config,
+        config: Config,  # type: ignore
         device: str = "cpu",
         normalizer: Optional[FeatureNormalizer] = None,
     ) -> "HumanMotionGenerator":
@@ -939,6 +982,9 @@ class HumanMotionGenerator:
         checkpoint = torch.load(
             checkpoint_path, map_location=device, weights_only=False
         )
+
+        if "config" in checkpoint:
+            config: Config = checkpoint["config"]
 
         # Initialize Motion History Encoder (Transformer-based)
         encoder = MotionHistoryEncoder(

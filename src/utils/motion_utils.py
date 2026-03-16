@@ -712,6 +712,39 @@ def flow_output_to_displacements(
     return displacements
 
 
+def extract_prev_frame_features(frame: torch.Tensor) -> torch.Tensor:
+    """
+    Extract 261D features from 271D previous frame.
+
+    261D Output Format:
+        [0:9]     Root: height(1) + vel(2) + rot_6d(6)
+        [9:261]   Joints: 21 x 12D (RIC + rot + vel) = 252D
+
+    Args:
+        frame: (B, 271) single frame in RAW format
+
+    Returns:
+        features: (B, 261)
+    """
+    # Root features (9D): height + velocity + rotation
+    root_height = frame[:, 0:1]
+    root_vel = frame[:, 1:3]
+    root_rot6d = frame[:, 69:75]
+    root_features = torch.cat([root_height, root_vel, root_rot6d], dim=-1)  # (B, 9)
+
+    # Joint features: 21 joints x 12D each (RIC + rotation + velocity)
+    # RIC: [6:69] = 63D for 21 joints
+    # Rotations: [75:201] = 126D for 21 joints
+    # Velocities: [204:267] = 63D for 21 joints
+    joint_ric = frame[:, 6:69]  # (B, 63)
+    joint_rot = frame[:, 75:201]  # (B, 126)
+    joint_vel = frame[:, 204:267]  # (B, 63)
+
+    joint_features = torch.cat([joint_ric, joint_rot, joint_vel], dim=-1)  # (B, 252)
+
+    return torch.cat([root_features, joint_features], dim=-1)  # (B, 261)
+
+
 def flow_output_to_271d(
     flow_output: torch.Tensor,  # (B, 72)
     prev_frame: torch.Tensor,  # (B, 271)

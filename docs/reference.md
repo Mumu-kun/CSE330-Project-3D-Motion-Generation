@@ -48,6 +48,36 @@ feature_slices: 0:3(global_root) 3:69(RIC pos 22x3) 69:201(RIC rot 22x6) 201:267
 
 - **Face joints**: `[2, 1, 17, 16]`
 - **Right foot**: `[8, 11]`
+
+## Troubleshooting
+
+### Test 7: HumanMotionGenerator Shape Mismatch
+
+**Error:**
+```
+mat1 and mat2 shapes cannot be multiplied (21x12 and 261x64)
+```
+
+**Root Cause:**
+In [`FlowMatchingPredictor.forward()`](src/models.py:719), the code attempts to project joint features (252D = 21×12) through a linear layer designed for 261D input:
+
+```python
+prev_joints = prev_frame_features[:, 9:].reshape(B, J - 1, -1)  # (B, 21, 12)
+prev_joints_proj = self.input_proj_prev_frame(prev_joints)  # Expects 261D!
+```
+
+**Fix:**
+The fix was applied in commit `e639754` ("refactor: remove prev_frame_features from FlowMatchingPredictor"). The solution removes `prev_frame_features` from the predictor entirely and uses a simpler fusion approach:
+
+1. Remove `input_proj_prev_frame`, `input_proj_prev_root`, and `input_proj_prev_joint` layers
+2. Remove `prev_frame_features` parameter from `FlowMatchingPredictor.forward()`
+3. Use `fusion_proj = nn.Linear(2 * model_dim, model_dim)` for concatenating history + noisy target
+
+**Verification:**
+Run Test 7 after applying the fix:
+```bash
+python -m pytest tests/test_training_loop.py::test_human_motion_generator -v
+```
 - **Left foot**: `[7, 10]`
 
 ---

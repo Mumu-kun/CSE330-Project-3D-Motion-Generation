@@ -30,6 +30,7 @@ from utils.motion_utils import (
     FeatureNormalizer,
     RootPositionTracker,
     flow_output_to_271d,
+    extract_prev_frame_features,
 )
 
 
@@ -421,6 +422,11 @@ def train(
                     # Extract clean targets
                     clean_targets = extract_clean_target(targets_flat)
 
+                    # Extract prev_frame_features from previous frames
+                    # prev_frames: (B, N, 271) - previous frames before current target
+                    prev_flat = prev_frames.reshape(B * N, 271)  # (B*N, 271)
+                    prev_features = extract_prev_frame_features(prev_flat)  # (B*N, 261)
+
                     # Flow matching: sample t and create noisy target
                     t = torch.rand(B * N, device=device)
                     noise = torch.randn_like(clean_targets)
@@ -434,6 +440,7 @@ def train(
                         history_features=contexts_flat,
                         noise_level=t,
                         noisy_target=x_t,
+                        prev_frame_features=prev_features,
                     )
 
                     # Loss: velocity field prediction
@@ -809,10 +816,15 @@ def validate(
             noise = torch.randn_like(clean_target)
             x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
 
+            # Extract prev_frame_features from last frame of history
+            prev_frame = hist[:, -1]  # (B, 271)
+            prev_features = extract_prev_frame_features(prev_frame)  # (B, 261)
+
             pred = predictor(
                 history_features=context,
                 noise_level=t,
                 noisy_target=x_t,
+                prev_frame_features=prev_features,
             )
 
             target_v = clean_target - noise
