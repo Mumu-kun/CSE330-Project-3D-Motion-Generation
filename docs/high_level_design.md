@@ -13,141 +13,77 @@ The generation process follows a "Conditioned Denoising" paradigm:
 
 ## 2. Model Architecture
 
-### A. Motion History Encoder (Transformer-based Context Encoder)
+### A. Motion History Encoder (GRU-based Context Encoder)
 
-The encoder uses a **Spatiotemporal Transformer** architecture to process motion history and text conditioning.
+The encoder uses a **GRU (Gated Recurrent Unit)** architecture to process motion history and text conditioning.
 
 #### Forward Pass Data Pipeline
 
 ```
-Input: text(B, l_seq, 512), input_features(B, T, 271)
+Input: motion_seq(B, T, 271), text_emb(B, 512)
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  1. BATCH SIZE DETERMINATION                                │
-│     B = input_features.shape[0] or text.shape[0] or 1       │
+│  1. TEXT PROJECTION                                         │
+│     text_proj = Linear(text_emb)           # (B, text_proj_dim)│
+│     t_scaled = text_scale * text_proj       # Apply text scale │
+│     t_rep = t_scaled.unsqueeze(1).expand(B, T, -1)  # (B,T,D)│
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  2. TEXT CONDITIONING HANDLING                              │
-│     if text is None:                                        │
-│         text = null_text_embedding.expand(B, l_seq, 512)    │
-│     elif text.shape[0] == 1:                                │
-│         text = text.expand(B, l_seq, 512)  # Broadcast      │
-│     L_text = text.shape[1]                                  │
+│  2. INITIALIZE GRU HIDDEN STATE                             │
+│     h0 = text_to_hidden(text_emb)       # (B, hidden_dim)  │
+│     h0 = h0.unsqueeze(0).repeat(num_layers, 1, 1)  # (L,B,H)│
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  3. MOTION FEATURES HANDLING                                │
-│     if input_features is None:                              │
-│         T = 1, input_features = null_history.expand(B,T,271)│
-│     else:                                                   │
-│         T = input_features.shape[1]                         │
-│     if normalize and normalizer exists:                     │
-│         input_features = normalizer.normalize(input_features)│
+│  3. CONCATENATE MOTION + TEXT                               │
+│     gru_input = cat([motion_seq, t_rep], dim=-1)           │
+│                                     # (B, T, motion_dim + text_proj_dim)│
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  4. TEXT TOKENS PREPARATION                                 │
-│     text_tokens = text_projection(text)     # (B,L_text,D)  │
-│     text_tokens = text_tokens.unsqueeze(2)  # (B,L_text,1,D)│
-│     text_tokens = text_tokens.expand(B,L_text,22,D)         │
-│                         # Replicate for all 22 joints       │
+│  4. GRU FORWARD PASS                                        │
+│     h_seq, h_next = gru(gru_input, h0)  # h_seq: (B,T,H) │
+│     h_last = h_seq[:, -1, :]             # Last timestep  │
+│                                     # (B, hidden_dim)     │
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  5. GLOBAL TOKEN EXTRACTION (16D per timestep)              │
-│     Extract from input_features:                            │
-│       root_height_y  = [:,:,0:1]                            │
-│       root_vel_x     = [:,:,1:2]                            │
-│       root_vel_z     = [:,:,2:3]                            │
-│       root_rot_6d    = [:,:,69:75]                          │
-│       root_local_vel = [:,:,201:204]                        │
-│       foot_contacts  = [:,:,267:271]                        │
-│     global_features = cat([...], dim=-1)    # (B,T,16)      │
-│     global_token = global_proj(global_features) # (B,T,D)   │
-│     global_token = global_token.unsqueeze(2) # (B,T,1,D)    │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  6. TRACK TOKENS EXTRACTION (12D per joint per timestep)    │
-│     Extract from input_features:                            │
-│       ric = [:,:,6:69].view(B,T,21,3)    # 21 joints        │
-│       rot = [:,:,75:201].view(B,T,21,6)  # 21 joints        │
-│       vel = [:,:,204:267].view(B,T,21,3) # 21 joints        │
-│     track_features = cat([ric,rot,vel], dim=-1) # (B,T,21,12)│
-│     track_tokens = track_proj(track_features)   # (B,T,21,D)│
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  7. MOTION TOKENS ASSEMBLY                                  │
-│     motion_tokens = cat([global_token, track_tokens], dim=2)│
-│                                     # (B,T,22,D)            │
-│     kinematic_emb = kinematic_encoder(arange(22)) # (22,D)  │
-│     motion_tokens = motion_tokens + kinematic_emb.view(1,1,22,D)│
-│                                     # Add position bias     │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  8. SPATIOTEMPORAL SEQUENCE CONCATENATION                   │
-│     x = cat([text_tokens, motion_tokens], dim=1)            │
-│                                     # (B, L_text+T, 22, D)  │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  9. SPATIOTEMPORAL TRANSFORMER (4 layers)                   │
-│     for block in blocks:                                    │
-│         x = block(x)  # See SpatiotemporalBlock below      │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  10. OUTPUT EXTRACTION                                      │
-│      x = final_norm(x)                  # (B,L_text+T,22,D) │
-│      x = x[:, -T:]                       # (B,T,22,D)       │
-│      out = output_proj(x)                # (B,T,22,out_dim) │
+│  5. MLP TO PER-JOINT TOKENS                                 │
+│     joint_tokens = global_to_joints(h_last)                 │
+│                                     # (B, 22 * per_joint_dim)│
+│     history_features = joint_tokens.view(B, 22, per_joint_dim)│
+│                                     # (B, 22, per_joint_dim)│
 └─────────────────────────────────────────────────────────────┘
 
-Output: (B, T, 22, per_joint_out_dim)
+Output: history_features(B, 22, per_joint_dim)
 ```
 
-#### SpatiotemporalBlock Data Flow
+#### Step Function (for AR inference)
+
+For autoregressive generation, the encoder provides a `step()` method:
 
 ```
-Input: x(B, T, S, D)  where S=22 joints
+Input: x_t(B, 271), text_emb(B, 512), h(Optional[L, B, H])
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  1. SPATIAL ATTENTION (within each timestep)                │
-│     x_spatial = x.reshape(B*T, S, D)  # Merge batch+time    │
-│     residual = x_spatial                                    │
-│     x_spatial = spatial_norm1(x_spatial)                    │
-│     attn_out = spatial_attn(x_spatial, x_spatial, x_spatial)│
-│     x_spatial = residual + dropout(attn_out)                │
-│     residual = x_spatial                                    │
-│     x_spatial = residual + dropout(ffn(spatial_norm2(x)))   │
-│     x = x_spatial.reshape(B, T, S, D)  # Restore shape      │
+│  1. PREPARE SINGLE TIMESTEP INPUT                          │
+│     motion_in = x_t.unsqueeze(1)         # (B, 1, 271)    │
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  2. TEMPORAL ATTENTION (per joint stream)                   │
-│     x = x.transpose(1, 2)            # (B, S, T, D)         │
-│     x_temporal = x.reshape(B*S, T, D) # Merge batch+joints  │
-│     x_temporal = temporal_block(x_temporal)  # Causal RoPE  │
-│     x = x_temporal.reshape(B, S, T, D) # Restore shape      │
-│     x = x.transpose(1, 2)            # (B, T, S, D)         │
+│  2. RUN GRU BLOCK (same as forward pass)                   │
+│     history_features, h_next = _gru_block(motion_in, text_emb, h)│
 └─────────────────────────────────────────────────────────────┘
 
-Output: x(B, T, S, D)
+Output: history_features(B, 22, per_joint_dim), h_next(L, B, H)
 ```
 
 ---
@@ -408,18 +344,19 @@ Output: position_history(B, N+num_frames, 22, 3)
 
 ## 4. Training Configuration
 
-| Parameter            | Value | Description                  |
-| :------------------- | :---- | :--------------------------- |
-| `model_dim`          | 128   | Transformer hidden dimension |
-| `num_encoder_layers` | 4     | MotionHistoryEncoder layers  |
-| `num_flow_layers`    | 3     | FlowMatchingPredictor layers |
-| `per_joint_out_dim`  | 64    | Context vector per joint     |
-| `batch_size`         | 100   | Training batch size          |
-| `learning_rate`      | 1e-4  | Adam learning rate           |
-| `num_epochs`         | 200   | Total training epochs        |
-| `dropout`            | 0.1   | Dropout rate                 |
-| `ema_decay`          | 0.999 | EMA decay for validation     |
-| `cfg_dropout`        | 0.1   | CFG dropout probability      |
+| Parameter               | Value | Description                                      |
+| :---------------------- | :---- | :----------------------------------------------- |
+| `encoder_hidden_dim`    | 256   | GRU hidden dimension                             |
+| `encoder_num_layers`    | 2     | MotionHistoryEncoder GRU layers                  |
+| `encoder_per_joint_dim` | 64    | Per-joint context vector dimension               |
+| `predictor_model_dim`   | 128   | FlowMatchingPredictor hidden dimension           |
+| `predictor_num_layers`  | 2     | FlowMatchingPredictor spatial transformer layers |
+| `batch_size`            | 192   | Training batch size                              |
+| `learning_rate`         | 1e-4  | Adam learning rate                               |
+| `num_epochs`            | 1000  | Total training epochs                            |
+| `dropout`               | 0.1   | Dropout rate                                     |
+| `ema_decay`             | 0.999 | EMA decay for validation                         |
+| `cfg_dropout`           | 0.1   | CFG dropout probability                          |
 
 ### Progressive Horizon Curriculum
 
@@ -509,8 +446,6 @@ sequenceDiagram
 ## 8. Why This Architecture?
 
 - **Flow Matching**: Offers stable training dynamics compared to GANs, with faster inference than diffusion models
-- **Spatiotemporal Transformer**: Captures both spatial joint relationships and temporal motion dynamics
-- **RoPE Temporal Encoding**: Provides better extrapolation for variable-length sequences
 - **Kinematic Chain Bias**: Ensures anatomically plausible motion by encoding skeletal hierarchy
 - **Dual-Stage Design**: Separates context understanding (Encoder) from generation (Predictor)
 - **HumanML3D Compatible**: Works with standard datasets and BVH visualization tools

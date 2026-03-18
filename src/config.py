@@ -17,7 +17,7 @@ Note: Root X,Z are stored as velocities for autoregressive stability.
 
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Any
 
 
 @dataclass
@@ -25,12 +25,12 @@ class Config:
     """Configuration class for the motion generation pipeline."""
 
     # Device settings
-    device: str = "cuda"  # "cuda" or "cpu"
+    device: Any = "cuda"  # "cuda" or "cpu" or torch.device
     seed: int = 42
 
     # Data paths and directories
     dataset_path: Path = Path("./dataset/humanml3d-subset")
-    output_path: Path = Path("./generation")
+    output_path: Path = Path("./output")
     checkpoint_dir: Path = Path("./checkpoints")
 
     # Motion format settings (271D custom format from motion_utils.py)
@@ -49,23 +49,33 @@ class Config:
         slice(267, 271),  # foot contacts (4D)
     )
 
-    # Model architecture - MotionHistoryEncoder
-    text_embedding_dim: int = 512  # CLIP embedding size
-    per_joint_out_dim: int = 64  # Context vector size per joint
-    max_text_seq_len: int = 1  # CLIP max sequence length
-    model_dim: int = 128  # Primary embedding size
-    num_encoder_layers: int = 4  # Transformer layers
-    dropout: float = 0.1
+    # =============================================================================
+    # MotionHistoryEncoder (GRU-based) Configuration
+    # =============================================================================
+    encoder_motion_dim: int = 271  # Input motion feature dimension
+    encoder_text_dim: int = 512  # CLIP embedding size
+    encoder_text_proj_dim: int = 128  # Text projection dimension
+    encoder_hidden_dim: int = 256  # GRU hidden size
+    encoder_per_joint_dim: int = 64  # Output per-joint context dimension
+    encoder_num_layers: int = 3  # GRU layers
+    encoder_num_joints: int = 22  # Number of joints
+    encoder_text_scale: float = 1.0  # Text conditioning scale
+    encoder_dropout: float = 0.1  # Dropout between GRU layers
 
-    # Model architecture - FlowMatchingPredictor
-    num_flow_layers: int = 2  # Spatial Transformer layers
-    num_heads: int = 4  # Attention heads
-    time_embed_dim: int = 64  # Sinusoidal time embedding dimension
+    # =============================================================================
+    # FlowMatchingPredictor Configuration
+    # =============================================================================
+    predictor_per_joint_dim: int = 64  # Must match encoder_per_joint_dim
+    predictor_model_dim: int = 128  # Spatial transformer hidden dim
+    predictor_num_layers: int = 2  # Spatial transformer layers
+    predictor_num_heads: int = 4  # Attention heads
+    predictor_time_embed_dim: int = 64  # Sinusoidal time embedding
+    predictor_dropout: float = 0.1  # Dropout rate
 
     # Training settings
     batch_size: int = 192
     learning_rate: float = 1e-4
-    num_epochs: int = 1000
+    num_epochs: int = 2000
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
@@ -77,9 +87,15 @@ class Config:
     horizon: int = 40  # Maximum/target horizon for training
 
     # Curriculum learning settings
-    curriculum_start: Optional[int] = 10  # Initial horizon (None = no curriculum)
-    curriculum_step: int = 10  # Frames to increase per step
-    curriculum_step_epochs: int = 150  # Epochs per horizon level
+    # Set to None to disable curriculum (use fixed horizon from horizon field)
+    curriculum: Optional[list[dict[str, int]]] = field(
+        default_factory=lambda: [
+            {"horizon": 5, "epochs": 400},
+            {"horizon": 10, "epochs": 800},
+            {"horizon": 20, "epochs": 1200},
+            {"horizon": 40, "epochs": 2000},
+        ]
+    )
 
     # Data loading
     num_workers: int = 4

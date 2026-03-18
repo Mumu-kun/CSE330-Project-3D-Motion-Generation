@@ -54,75 +54,16 @@ class CLIPEncoder(torch.nn.Module):
         # Determine device dynamically
         device = next(self.model.parameters()).device
 
-        embeddings_list = []
+        inputs = self.tokenizer(
+            text, padding=True, truncation=True, return_tensors="pt"
+        ).to(device)
+        outputs = self.model(**inputs)
 
-        for caption in text:
-            # Tokenize without padding/truncation to check length
-            tokens = self.tokenizer(caption, return_tensors="pt", truncation=False)
-            input_ids = tokens["input_ids"][0]
-            seq_len = len(input_ids)
+        # Use the pooler_output for a global representation of the sentence
+        # Shape: (Batch_Size, 512)
+        embeddings = outputs.pooler_output
 
-            if seq_len <= self.max_length:
-                # Short text: encode directly
-                inputs = self.tokenizer(
-                    caption,
-                    padding=True,
-                    truncation=True,
-                    max_length=self.max_length,
-                    return_tensors="pt",
-                ).to(device)
-                output = self.model(**inputs)
-                embedding = output.pooler_output  # (1, 512)
-            else:
-                # Long text: chunk and average
-                chunk_embeddings = []
-
-                # Split into overlapping chunks
-                # Start from position 1 to skip BOS token for chunks
-                stride = self.max_length - 2  # Leave room for BOS and EOS
-
-                for start_idx in range(0, seq_len - 1, stride):
-                    end_idx = min(start_idx + self.max_length - 1, seq_len - 1)
-
-                    # Extract chunk tokens (keep BOS at start, EOS at end)
-                    if start_idx == 0:
-                        chunk_ids = input_ids[: end_idx + 1]
-                    else:
-                        # Add BOS token at the beginning
-                        bos_token = torch.tensor([self.tokenizer.bos_token_id or 49406])
-                        chunk_ids = torch.cat(
-                            [bos_token, input_ids[start_idx : end_idx + 1]]
-                        )
-
-                    # Ensure EOS token at the end
-                    if chunk_ids[-1] != self.tokenizer.eos_token_id:
-                        eos_token = torch.tensor([self.tokenizer.eos_token_id or 49407])
-                        chunk_ids = torch.cat([chunk_ids, eos_token])
-
-                    # Truncate if still too long
-                    if len(chunk_ids) > self.max_length:
-                        chunk_ids = chunk_ids[: self.max_length - 1]
-                        eos_token = torch.tensor([self.tokenizer.eos_token_id or 49407])
-                        chunk_ids = torch.cat([chunk_ids, eos_token])
-
-                    # Encode chunk
-                    attention_mask = torch.ones_like(chunk_ids)
-                    inputs = {
-                        "input_ids": chunk_ids.unsqueeze(0).to(device),
-                        "attention_mask": attention_mask.unsqueeze(0).to(device),
-                    }
-                    output = self.model(**inputs)
-                    chunk_embeddings.append(output.pooler_output)
-
-                # Average all chunk embeddings
-                embedding = torch.stack(chunk_embeddings, dim=0).mean(dim=0)  # (1, 512)
-
-            embeddings_list.append(embedding)
-
-        # Stack all embeddings
-        embeddings = torch.cat(embeddings_list, dim=0)  # (B, 512)
-
-        return embeddings.unsqueeze(1)  # (B, 1, 512)
+        return embeddings
 
     @property
     def embedding_dim(self) -> int:

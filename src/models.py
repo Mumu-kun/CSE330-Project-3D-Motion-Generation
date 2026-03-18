@@ -80,465 +80,129 @@ class KinematicChainEncoder(nn.Module):
         return torch.cat([self.chain_emb(chains), self.depth_emb(depths)], dim=-1)
 
 
-class Rotary(nn.Module):
-    def __init__(self, dim, base=10000):
-        super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq)
-        self.seq_len_cached = None
-        self.cos_cached = None
-        self.sin_cached = None
-
-    def forward(self, x):
-        # x: (B, H, T, D)
-        seq_len = x.shape[2]
-
-        if seq_len != self.seq_len_cached:
-            self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=x.device).type_as(self.inv_freq)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1)
-
-            self.cos_cached = emb.cos()[None, None, :, :]  # (1,1,T,D)
-            self.sin_cached = emb.sin()[None, None, :, :]
-
-        return self.cos_cached, self.sin_cached
-
-
-def rotate_half(x):
-    x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
-def apply_rotary_pos_emb(q, k, cos, sin):
-    q = (q * cos) + (rotate_half(q) * sin)
-    k = (k * cos) + (rotate_half(k) * sin)
-    return q, k
-
-
-class TemporalAttentionWithRoPE(nn.Module):
-    def __init__(self, model_dim: int, nhead: int, dropout: float = 0.1):
-        super().__init__()
-
-        assert model_dim % nhead == 0, "model_dim must be divisible by nhead"
-
-        self.model_dim = model_dim
-        self.nhead = nhead
-        self.head_dim = model_dim // nhead
-
-        # QKV projection
-        self.qkv_proj = nn.Linear(model_dim, model_dim * 3)
-        self.out_proj = nn.Linear(model_dim, model_dim)
-
-        # Rotary embedding
-        self.rope = Rotary(self.head_dim)
-
-        self.dropout = dropout
-
-    def forward(self, x, causal_mask=None):
-        """
-        x: (B, T, D)
-        causal_mask: (T, T) bool mask where True = masked
-        """
-
-        B, T, D = x.shape
-
-        # ----------------------------
-        # QKV projection
-        # ----------------------------
-        qkv = self.qkv_proj(x)  # (B, T, 3D)
-        qkv = qkv.view(B, T, 3, self.nhead, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, T, Hd)
-
-        q, k, v = qkv.unbind(0)  # each: (B, H, T, Hd)
-
-        # ----------------------------
-        # Apply RoPE to Q and K
-        # ----------------------------
-        cos, sin = self.rope(q)  # (1,1,T,Hd)
-        q, k = apply_rotary_pos_emb(q, k, cos, sin)
-
-        # ----------------------------
-        # Scaled Dot-Product Attention
-        # ----------------------------
-        # scaled_dot_product_attention expects:
-        # (B, H, T, Hd)
-        # and supports bool mask directly
-
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.dropout if self.training else 0.0, is_causal=True
-        )  # (B, H, T, Hd)
-
-        # ----------------------------
-        # Merge heads
-        # ----------------------------
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(B, T, D)
-
-        out = self.out_proj(attn_output)
-
-        return out
-
-
-class TemporalTransformerBlock(nn.Module):
-    def __init__(self, model_dim, nhead, dropout=0.1):
-        super().__init__()
-
-        self.norm1 = nn.LayerNorm(model_dim)
-        self.attn = TemporalAttentionWithRoPE(model_dim, nhead, dropout)
-
-        self.norm2 = nn.LayerNorm(model_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(model_dim, model_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(model_dim * 4, model_dim),
-        )
-
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, causal_mask=None):
-        # PreNorm Attention
-        x = x + self.dropout(self.attn(self.norm1(x), causal_mask))
-
-        # PreNorm FFN
-        x = x + self.dropout(self.ffn(self.norm2(x)))
-
-        return x
-
-
-class SpatiotemporalBlock(nn.Module):
-    def __init__(self, model_dim, nhead, dropout):
-        super().__init__()
-
-        # ================= SPATIAL =================
-        self.spatial_norm1 = nn.LayerNorm(model_dim)
-        self.spatial_attn = nn.MultiheadAttention(
-            embed_dim=model_dim,
-            num_heads=nhead,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.spatial_dropout = nn.Dropout(dropout)
-
-        self.spatial_norm2 = nn.LayerNorm(model_dim)
-        self.spatial_ffn = nn.Sequential(
-            nn.Linear(model_dim, model_dim * 4),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(model_dim * 4, model_dim),
-        )
-
-        # ================= TEMPORAL =================
-        self.temporal_block = TemporalTransformerBlock(
-            model_dim=model_dim,
-            nhead=nhead,
-            dropout=dropout,
-        )
-
-    def forward(self, x):
-        """
-        x: (B, T, S, D)
-        """
-
-        B, T, S, D = x.shape
-
-        # ============================================
-        # 1️⃣ Spatial Attention (within frame)
-        # ============================================
-
-        x_spatial = x.reshape(B * T, S, D)
-
-        # --- Attention ---
-        residual = x_spatial
-        x_spatial = self.spatial_norm1(x_spatial)
-
-        attn_out, _ = self.spatial_attn(
-            x_spatial,
-            x_spatial,
-            x_spatial,
-            need_weights=False,
-        )
-
-        x_spatial = residual + self.spatial_dropout(attn_out)
-
-        # --- FFN ---
-        residual = x_spatial
-        x_spatial = self.spatial_norm2(x_spatial)
-        x_spatial = residual + self.spatial_dropout(self.spatial_ffn(x_spatial))
-
-        x = x_spatial.reshape(B, T, S, D)
-
-        # ============================================
-        # 2️⃣ Temporal Attention (per joint stream)
-        # ============================================
-
-        x = x.transpose(1, 2)  # (B, S, T, D)
-        x_temporal = x.reshape(B * S, T, D)
-
-        x_temporal = self.temporal_block(x_temporal)
-
-        x = x_temporal.reshape(B, S, T, D)
-        x = x.transpose(1, 2)
-
-        return x
-
-
 class MotionHistoryEncoder(nn.Module):
-    """
-    ARFM Feature Fusion Transformer - Motion History Encoder.
-
-    Replaces GRU-based encoder with a spatiotemporal transformer architecture:
-    1. Input Preparation:
-       - CLIP Text Sequence (B, l_seq, 512) → Linear → Text Prefix Tokens (l_seq tokens)
-       - Per-timestep Global Features → Linear → Global Token (1 per timestep)
-       - Per-timestep Per-track Local Features + KinematicChainEncoder → Linear → Track Tokens (22 per timestep)
-    2. Spatiotemporal Sequence: Concat [Text Prefix (l_seq×22); per timestep: [Global (1); Track (21)]] → (B, l_seq + L_past, 22, d_model)
-    3. Positional Encoding: Temporal (RoPE/sinusoidal) + Spatial (learnable)
-    4. Transformer Stack (4 layers): Temporal Causal + Spatial Bidirectional + Shared FFN
-    5. Output: Last timestep track features  (B, 22, d_model)
-    """
-
     def __init__(
         self,
-        frame_feature_dim: int,  # Custom Feature Dimension 271D
-        text_embedding_dim: int,  # CLIP embedding dimension (e.g., 512)
-        per_joint_out_dim: int,
+        frame_feature_dim: int,  # e.g. 271
+        text_embedding_dim: int,  # e.g. 512
+        text_proj_dim: int,  # e.g. 128
+        model_dim: int,  # GRU hidden size H
+        per_joint_out_dim: int,  # D_joint, must match FlowMatchingPredictor model_dim
+        num_layers: int = 2,
         joint_count: int = 22,
-        model_dim: int = 256,
-        num_layers: int = 4,  # Transformer layers (default 4)
-        max_text_seq_len: int = 1,  # CLIP max sequence length
-        dropout: float = 0.1,
+        text_scale: float = 1.0,
+        dropout: float = 0.0,  # dropout between GRU layers if num_layers > 1
         normalizer: Optional[
-            "FeatureNormalizer"
-        ] = None,  # For normalizing raw features
+            FeatureNormalizer
+        ] = None,  # Feature normalizer for normalization
     ) -> None:
         super().__init__()
 
         self.frame_feature_dim = frame_feature_dim
         self.text_embedding_dim = text_embedding_dim
-        self.per_joint_out_dim = per_joint_out_dim
-
+        self.text_proj_dim = text_proj_dim
         self.model_dim = model_dim
+        self.per_joint_out_dim = per_joint_out_dim
         self.num_layers = num_layers
         self.joint_count = joint_count
-        self.max_text_seq_len = max_text_seq_len
-
-        # Store normalizer for raw feature normalization
+        self.text_scale = text_scale
         self.normalizer = normalizer
 
-        # Attention config
-        self.nhead = model_dim // 64
-        self.head_dim = model_dim // self.nhead
-        assert (
-            self.head_dim * self.nhead == model_dim
-        ), "model_dim must be divisible by nhead"
+        # Text → initial hidden state
+        self.text_to_hidden = nn.Linear(text_embedding_dim, model_dim)
 
-        # ========== 1. Input Projections ==========
+        self.text_proj = nn.Linear(text_embedding_dim, text_proj_dim)
 
-        # Text projection: CLIP sequence embedding (B, l_seq, 512) → (B, l_seq, model_dim)
-        self.text_projection = nn.Linear(text_embedding_dim, model_dim)
-
-        # Global/root features projection: global/root features → Global Token
-        # 271D format global features (16D):
-        # - root_height_y (1D) from [0]
-        # - root_vel_x (1D) from [1]
-        # - root_vel_z (1D) from [2]
-        # - root_rot_6d (6D) from [69:75]
-        # - root_local_vel (3d) from [201:204]
-        # - foot_contacts (4D) from [267:271]
-        self.global_feature_dim = 16
-        self.global_proj = nn.Linear(self.global_feature_dim, model_dim)
-
-        # Non Root Track features projection: local features → Track Tokens
-        # 271D format track features:
-        # - RIC positions (3D) from [6:69] for 21 joints
-        # - Rotations (6D) from [75:201] for 21 joints
-        # - Local velocities (3D) from [204:267] for 21 joints
-        # Kinematic embedding is added as bias after projection (not concatenated)
-        self.track_feature_dim = 12  # local features only
-        self.track_proj = nn.Linear(self.track_feature_dim, model_dim)
-
-        # ========== 2. Kinematic Chain Encoder (reuse existing) ==========
-        self.kinematic_encoder = KinematicChainEncoder(model_dim)
-
-        # ========== 4. Transformer Stack ==========
-
-        self.blocks = nn.ModuleList(
-            [
-                SpatiotemporalBlock(
-                    model_dim=model_dim,
-                    nhead=self.nhead,
-                    dropout=dropout,
-                )
-                for _ in range(num_layers)
-            ]
+        # GRU over time, input is motion + text at each frame
+        self.gru = nn.GRU(
+            input_size=frame_feature_dim + text_proj_dim,
+            hidden_size=model_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0.0,
         )
 
-        # Layer norms
-        self.final_norm = nn.LayerNorm(model_dim)
-
-        self.dropout = nn.Dropout(dropout)
-
-        # ========== 5. Output Projection ==========
-        # Project to per_joint_out_dim
-        self.output_proj = nn.Linear(model_dim, per_joint_out_dim)
-
-        # Null tokens for zero-shot generation
-        self.null_history = nn.Parameter(torch.zeros(1, 1, frame_feature_dim))
-        self.null_text_embedding = nn.Parameter(
-            torch.zeros(1, max_text_seq_len, text_embedding_dim)
+        # Shared MLP: global GRU hidden (B, H) → all joints (B, 22 * D_joint)
+        self.global_to_joints = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.ReLU(),
+            nn.Linear(model_dim, joint_count * per_joint_out_dim),
         )
 
-        # Initialize weights
-        self._init_weights()
+    def init_hidden(self, text_emb: torch.Tensor) -> torch.Tensor:
+        """
+        text_emb: (B, text_dim)
+        Returns h0: (num_layers, B, hidden_dim)
+        """
+        h0 = self.text_to_hidden(text_emb)  # (B, H)
+        h0 = h0.unsqueeze(0).repeat(self.num_layers, 1, 1)
+        return h0  # (L, B, H)
 
-    def _init_weights(self):
-        """Initialize linear and embedding weights."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.xavier_uniform_(module.weight)
-
-    def forward(
+    def _gru_block(
         self,
-        text: Optional[torch.Tensor],
-        input_features: Optional[torch.Tensor] = None,
-        total_duration: Optional[torch.Tensor] = None,
-        batch_size: Optional[int] = None,
-        return_all_timesteps: bool = False,
-        normalize: bool = True,
-    ) -> torch.Tensor:
+        motion_in: torch.Tensor,  # (B, T_step, motion_dim)
+        text_emb: torch.Tensor,  # (B, text_dim)
+        h: Optional[torch.Tensor],  # (L, B, H) or None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        ARFM Feature Fusion Transformer forward pass.
+        Shared core: runs GRU on motion_in with text conditioning and returns:
+          history_features: (B, 22, per_joint_dim) from the LAST timestep in this block
+          h_next: (L, B, H)
+        """
+        B, T_step, _ = motion_in.shape
 
-        Args:
-            text:           (B, l_seq, 512) CLIP sequence embeddings or None
-            input_features: (B, T_hist, frame_feature_dim) - Optional motion history (RAW features)
-            total_duration: (B, 1) Normalized total frames (Optional, not used in this version)
-            batch_size:     Optional batch size for null history case
-            normalize:      If True and normalizer is set, normalize input_features (default: True)
-                            Set to False during training when normalization is handled externally
+        if h is None:
+            h = self.init_hidden(text_emb)  # (L, B, H)
 
+        # Repeat scaled text over time
+        text_proj = self.text_proj(text_emb)
+        t_rep = self.text_scale * text_proj  # (B, text_proj_dim)
+        t_rep = t_rep.unsqueeze(1).expand(B, T_step, -1)  # (B, T_step, text_proj_dim)
+
+        # GRU input
+        gru_in = torch.cat([motion_in, t_rep], dim=-1)  # (B, T_step, motion+text)
+
+        # GRU forward
+        h_seq, h_next = self.gru(gru_in, h)  # h_seq: (B, T_step, H)
+        h_t = h_seq[:, -1, :]  # last timestep in this block, (B, H)
+
+        # Shared MLP to per-joint tokens
+        joint_tokens = self.global_to_joints(h_t)  # (B, 22 * D_joint)
+        history_features = joint_tokens.view(
+            B, self.joint_count, self.per_joint_out_dim
+        )  # (B, 22, D_joint)
+
+        return history_features, h_next
+
+    def forward(self, motion_seq: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
+        """
+        motion_seq: (B, T, motion_dim)  full history window
+        text_emb:   (B, text_dim)       global text embedding
         Returns:
-            joint_features: (B, 22, per_joint_out_dim) - Encoded per-joint context
+          history_features: (B, 22, per_joint_dim)
         """
-        # 1) Determine Batch Size
-        if input_features is not None:
-            B = input_features.shape[0]
-        elif text is not None:
-            B = text.shape[0]
-        elif batch_size is not None:
-            B = batch_size
-        else:
-            B = 1
+        history_features, _ = self._gru_block(motion_seq, text_emb, h=None)
+        return history_features
 
-        device = next(self.parameters()).device
-
-        # 2) Handle text conditioning (now expects sequence embeddings)
-        if text is None:
-            # Use null text embedding sequence
-            text = self.null_text_embedding.to(device).expand(
-                B, -1, -1
-            )  # (B, l_seq, 512)
-        else:
-            # text should be (B, l_seq, 512) sequence embeddings
-            if text.shape[0] != B:
-                if text.shape[0] == 1:
-                    text = text.expand(B, -1, -1)
-                else:
-                    raise ValueError(
-                        f"Batch mismatch: text tensor({text.shape[0]}) vs batch({B})"
-                    )
-
-        # Get actual text sequence length
-        L_text = text.shape[1]
-
-        # 3) Handle motion features (use null token if none)
-        if input_features is None:
-            T = 1
-            input_features = self.null_history.to(device).expand(B, T, -1)
-        else:
-            T = input_features.shape[1]
-
-        # Normalize raw features if normalizer is provided and normalize=True
-        if self.normalizer is not None and normalize:
-            input_features = self.normalizer.normalize(input_features)
-
-        S = self.joint_count
-
-        # ========== INPUT PREPARATION ==========
-
-        # --- Text Prefix Tokens (from CLIP sequence) ---
-        # Project CLIP embeddings to model dimension
-        text_tokens = self.text_projection(text)  # (B, L_text, D)
-        text_tokens = text_tokens.unsqueeze(2).expand(
-            B, L_text, S, self.model_dim
-        )  # (B, L_text, 22, D)
-
-        # ----- Global Features (16D) -----
-        root_height_y = input_features[:, :, 0:1]
-        root_vel_x = input_features[:, :, 1:2]
-        root_vel_z = input_features[:, :, 2:3]
-        root_rot_6d = input_features[:, :, 69:75]
-        root_local_vel = input_features[:, :, 201:204]
-        foot_contacts = input_features[:, :, 267:271]
-
-        global_features = torch.cat(
-            [
-                root_height_y,
-                root_vel_x,
-                root_vel_z,
-                root_rot_6d,
-                root_local_vel,
-                foot_contacts,
-            ],
-            dim=-1,
-        )  # (B, T, 16)
-
-        global_token = self.global_proj(global_features)  # (B, T, D)
-        global_token = global_token.unsqueeze(2)  # (B, T, 1, D)
-
-        # --- Per-timestep Per-track Local Features ---
-        ric = input_features[:, :, 6:69].view(B, T, 21, 3)
-        rot = input_features[:, :, 75:201].view(B, T, 21, 6)
-        vel = input_features[:, :, 204:267].view(B, T, 21, 3)
-
-        track_features = torch.cat([ric, rot, vel], dim=-1)  # (B, T, 21, 12)
-        track_tokens = self.track_proj(track_features)  # (B, T, 21, D)
-
-        # Combine global and track tokens
-        motion_tokens = torch.cat([global_token, track_tokens], dim=2)  # (B, T, 22, D)
-
-        # Add kinematic chain embeddings as bias (position bias)
-        joint_ids = torch.arange(self.joint_count, device=device)
-        kinematic_emb = self.kinematic_encoder(joint_ids)  # (22, D)
-        motion_tokens = motion_tokens + kinematic_emb.unsqueeze(0).unsqueeze(
-            0
-        )  # (B, T_hist, 22, D)
-
-        x = torch.cat([text_tokens, motion_tokens], dim=1)
-        # Shape: (B, L_text + T, 22, D)
-
-        x = self.dropout(x)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.final_norm(x)  # (B, L_text + T, 22, D)
-
-        x = x[:, -T:]  # (B, T, 22, D)
-
-        out = self.output_proj(x)  # (B, T, 22, out_dim)
-
-        return out
+    def step(
+        self,
+        x_t: torch.Tensor,  # (B, motion_dim)  single frame features
+        text_emb: torch.Tensor,  # (B, text_dim)
+        h: Optional[torch.Tensor],  # (L, B, H) or None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        One-step update for AR inference.
+        Returns:
+          history_features: (B, 22, per_joint_dim)  summary up to this frame
+          h_next: (L, B, H)  next hidden state to carry forward
+        """
+        motion_in = x_t.unsqueeze(1)  # (B, 1, motion_dim)
+        history_features, h_next = self._gru_block(motion_in, text_emb, h)
+        return history_features, h_next
 
     @property
     def output_dim(self) -> int:
-        """Output dimension of the context encoder."""
+        # Per-joint dimension exposed to FlowMatchingPredictor
         return self.per_joint_out_dim
 
 
@@ -869,6 +533,8 @@ class HumanMotionGenerator:
             if input_features is None:
                 root_pos = torch.zeros((B, 3), device=device)  # (B, 3) - absolute XYZ
                 root_tracker = RootPositionTracker(root_pos)
+                # Initialize with a zero frame for cold start
+                feature_history = torch.zeros((B, 1, 271), device=device)  # (B, 1, 271)
             else:
                 # Seeded: use input_features
                 if input_features.ndim == 2:
@@ -897,14 +563,13 @@ class HumanMotionGenerator:
                     :, -horizon_frames:, :
                 ]  # (B, horizon, 271)
 
+                # Prepare text embedding: (B, 1, 512) -> (B, 512)
+                text_emb = text.squeeze(1) if text.dim() == 3 else text
+
                 context_cond = self.encoder(
-                    batch_size=B,
-                    text=text,
-                    input_features=encoder_input,  # Only last horizon frames
-                    normalize=True,  # Normalize internally for inference
-                )[
-                    :, -1, :, :
-                ]  # (B, 22, out_dim)
+                    encoder_input,
+                    text_emb,
+                )  # (B, 22, per_joint_dim)
 
                 # ========================================
                 # Step C: Flow matching ODE loop
@@ -986,27 +651,28 @@ class HumanMotionGenerator:
         if "config" in checkpoint:
             config: Config = checkpoint["config"]
 
-        # Initialize Motion History Encoder (Transformer-based)
+        # Initialize Motion History Encoder (GRU-based)
         encoder = MotionHistoryEncoder(
-            frame_feature_dim=config.motion_dim,
-            text_embedding_dim=config.text_embedding_dim,
-            per_joint_out_dim=config.per_joint_out_dim,
-            joint_count=config.num_joints,
-            model_dim=config.model_dim,
-            num_layers=config.num_encoder_layers,
-            max_text_seq_len=config.max_text_seq_len,
-            dropout=config.dropout,
+            frame_feature_dim=config.encoder_motion_dim,
+            text_embedding_dim=config.encoder_text_dim,
+            text_proj_dim=config.encoder_text_proj_dim,
+            model_dim=config.encoder_hidden_dim,
+            per_joint_out_dim=config.encoder_per_joint_dim,
+            num_layers=config.encoder_num_layers,
+            joint_count=config.encoder_num_joints,
+            text_scale=config.encoder_text_scale,
+            dropout=config.encoder_dropout,
             normalizer=normalizer,
         ).to(device)
 
         # Initialize Flow Matching Predictor
         predictor = FlowMatchingPredictor(
-            per_joint_dim=config.per_joint_out_dim,
-            model_dim=config.model_dim,
-            num_layers=config.num_flow_layers,
-            joint_count=config.num_joints,
-            time_embed_dim=config.time_embed_dim,
-            dropout=config.dropout,
+            per_joint_dim=config.predictor_per_joint_dim,
+            model_dim=config.predictor_model_dim,
+            num_layers=config.predictor_num_layers,
+            joint_count=config.encoder_num_joints,
+            time_embed_dim=config.predictor_time_embed_dim,
+            dropout=config.predictor_dropout,
             normalizer=normalizer,
         ).to(device)
 

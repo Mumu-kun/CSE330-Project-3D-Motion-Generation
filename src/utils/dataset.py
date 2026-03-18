@@ -30,15 +30,12 @@ class Text2MotionDataset(Dataset):
         mean: np.ndarray,
         std: np.ndarray,
         split: str = "train",
-        feature_dims: tuple[slice, ...] | None = None,
     ):
         self.config = config
-        self.feature_dims = (
-            feature_dims if feature_dims is not None else config.feature_dims
-        )
         self.max_length = 20
         self.pointer = 0
         self.max_motion_length = config.max_motion_length
+        self.current_horizon = config.max_motion_length
         min_motion_len = 40
 
         # Derive paths from config.dataset_path
@@ -126,13 +123,14 @@ class Text2MotionDataset(Dataset):
             except Exception as e:
                 pass
 
-        name_list, length_list = new_name_list, length_list
+        name_length_pairs = list(zip(new_name_list, length_list))
+        name_length_pairs.sort(key=lambda x: x[1])  # Sort by length
 
+        self.name_list = [pair[0] for pair in name_length_pairs]
+        self.length_arr = np.array([pair[1] for pair in name_length_pairs])
+        self.data_dict = data_dict
         self.mean = torch.from_numpy(mean).float()
         self.std = torch.from_numpy(std).float()
-        self.length_arr = np.array(length_list)
-        self.data_dict = data_dict
-        self.name_list = name_list
 
         # --- Text Embedding Caching ---
         self.text_cache_path = config.dataset_path / "text_embeddings_cache.pt"
@@ -226,32 +224,9 @@ class Text2MotionDataset(Dataset):
         # Normalization is handled externally via FeatureNormalizer
         # motion = (motion - self.mean) / self.std  # REMOVED
 
-        # ===== DETERMINE TARGET LENGTH =====
-        # The m_length modification logic from config
-        m_length = original_length
-        if self.config.unit_length < 10:
-            coin2 = np.random.choice(["single", "single", "double"])
-        else:
-            coin2 = "single"
-
-        if coin2 == "double":
-            m_length = (
-                m_length // self.config.unit_length - 1
-            ) * self.config.unit_length
-        else:
-            m_length = (m_length // self.config.unit_length) * self.config.unit_length
-
-        # Clamp to actual available data
-        m_length = min(m_length, len(motion))
-        m_length = max(1, m_length)  # At least 1 frame
-
-        # ===== TRUNCATE TO TARGET LENGTH =====
-        motion = motion[:m_length]
-        joints = joints[:m_length]
-
         # ===== PAD OR TRUNCATE TO MAX_MOTION_LENGTH =====
-        target_len = self.max_motion_length
-        current_len = len(motion)
+        target_len = self.current_horizon
+        current_len = original_length
 
         if current_len < target_len:
             # Pad with zeros
@@ -282,9 +257,9 @@ class Text2MotionDataset(Dataset):
                 dim=0,
             )
         elif current_len > target_len:
-            # Truncate
-            motion = motion[:target_len]
-            joints = joints[:target_len]
+            start_idx = random.randint(0, current_len - self.current_horizon)
+            motion = motion[start_idx : start_idx + self.current_horizon]
+            joints = joints[start_idx : start_idx + self.current_horizon]
 
         # ===== FINAL SANITY CHECK =====
         assert (
@@ -306,12 +281,31 @@ class Text2MotionDataset(Dataset):
 
         # text_embedding shape: (77, 512) - CLIP sequence embeddings
         # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
-        return caption, motion, joints, m_length, text_embedding
+        return caption, motion, joints, original_length, text_embedding
 
-    def reset_min_len(self, length):
+    def reset_min_len(self, length: int | None = None):
+        if length is None:
+            self.pointer = 0
+            return
         assert length <= self.max_motion_length
         self.pointer = np.searchsorted(self.length_arr, length)
         print("Pointer Pointing at %d" % self.pointer)
+
+    def set_horizon(self, horizon: int | None = None):
+        """
+        Set the horizon for the dataset.
+        If horizon is None, use the default horizon.
+        If horizon is an integer, set the horizon to that value.
+        Dynamic horizon update with filtering.
+        """
+        if horizon is None:
+            self.current_horizon = self.max_motion_length
+            self.reset_min_len()  # Reset pointer to start
+            return
+
+        assert 1 <= horizon <= self.max_motion_length
+        self.current_horizon = horizon
+        self.reset_min_len(horizon)  # Auto-filter
 
 
 # CLIP constants
@@ -400,9 +394,7 @@ def create_dataloader(
     mean = np.load(mean_path)
     std = np.load(std_path)
 
-    dataset_obj = Text2MotionDataset(
-        config, mean, std, split, feature_dims=config.feature_dims
-    )
+    dataset_obj = Text2MotionDataset(config, mean, std, split)
 
     # Create FeatureNormalizer for external normalization
     normalizer = FeatureNormalizer(

@@ -2,10 +2,10 @@
 
 ## Overview
 
-| Property         | Value                                                                         |
-| :--------------- | :---------------------------------------------------------------------------- |
-| **Architecture** | MotionHistoryEncoder (ARFM Transformer) + FlowMatchingPredictor (Transformer) |
-| **Dataset**      | HumanML3D 271D features, 22 joints, 20fps                                     |
+| Property         | Value                                                            |
+| :--------------- | :--------------------------------------------------------------- |
+| **Architecture** | MotionHistoryEncoder (GRU) + FlowMatchingPredictor (Transformer) |
+| **Dataset**      | HumanML3D 271D features, 22 joints, 20fps                        |
 
 ## Constants
 
@@ -51,34 +51,35 @@ feature_slices: 0:3(global_root) 3:69(RIC pos 22x3) 69:201(RIC rot 22x6) 201:267
 
 ## Troubleshooting
 
-### Test 7: HumanMotionGenerator Shape Mismatch
+### Issue: Cold Start Generation Fails
 
 **Error:**
 ```
-mat1 and mat2 shapes cannot be multiplied (21x12 and 261x64)
+cannot access local variable 'feature_history' where it is not associated with a value
 ```
 
 **Root Cause:**
-In [`FlowMatchingPredictor.forward()`](src/models.py:719), the code attempts to project joint features (252D = 21×12) through a linear layer designed for 261D input:
-
-```python
-prev_joints = prev_frame_features[:, 9:].reshape(B, J - 1, -1)  # (B, 21, 12)
-prev_joints_proj = self.input_proj_prev_frame(prev_joints)  # Expects 261D!
-```
+In [`HumanMotionGenerator.generate_sequence()`](src/models.py:533), when `input_features` is `None` (cold start), the code creates a `RootPositionTracker` but doesn't initialize `feature_history`. The loop then fails when trying to access `feature_history[:, -1]`.
 
 **Fix:**
-The fix was applied in commit `e639754` ("refactor: remove prev_frame_features from FlowMatchingPredictor"). The solution removes `prev_frame_features` from the predictor entirely and uses a simpler fusion approach:
+Initialize `feature_history` with a zero frame when `input_features` is `None`:
 
-1. Remove `input_proj_prev_frame`, `input_proj_prev_root`, and `input_proj_prev_joint` layers
-2. Remove `prev_frame_features` parameter from `FlowMatchingPredictor.forward()`
-3. Use `fusion_proj = nn.Linear(2 * model_dim, model_dim)` for concatenating history + noisy target
+```python
+if input_features is None:
+    root_pos = torch.zeros((B, 3), device=device)
+    root_tracker = RootPositionTracker(root_pos)
+    # Initialize with a zero frame for cold start
+    feature_history = torch.zeros((B, 1, 271), device=device)
+else:
+    # ... existing logic
+```
 
 **Verification:**
-Run Test 7 after applying the fix:
 ```bash
-python -m pytest tests/test_training_loop.py::test_human_motion_generator -v
+python tests/test_human_motion_generator.py
 ```
-- **Left foot**: `[7, 10]`
+
+All 8 tests should pass including cold start and checkpoint loading.
 
 ---
 
@@ -193,38 +194,67 @@ train(
 
 *Source: [`src/models.py`](src/models.py)*
 
-### MotionHistoryEncoder (ARFM Feature Fusion Transformer)
+### MotionHistoryEncoder (GRU-based Context Encoder)
 
 #### Input/Output
 
-| Tensor    | Shape                           | Description                     |
-| :-------- | :------------------------------ | :------------------------------ |
-| `text`    | `(B, l_seq, 512)`               | CLIP sequence embeddings        |
-| `history` | `(B, T, 271)`                   | RAW motion features             |
-| `output`  | `(B, T, 22, per_joint_out_dim)` | Context vectors (all timesteps) |
+| Tensor       | Shape                    | Description                         |
+| :----------- | :----------------------- | :---------------------------------- |
+| `motion_seq` | `(B, T, 271)`            | Motion features (raw or normalized) |
+| `text_emb`   | `(B, 512)`               | CLIP text embedding (pooled)        |
+| `output`     | `(B, 22, per_joint_dim)` | Per-joint context vectors           |
 
 #### `__init__` Parameters
 
-- `normalizer: Optional[FeatureNormalizer]` — for normalizing raw features
+| Parameter            | Type                          | Description                              |
+| :------------------- | :---------------------------- | :--------------------------------------- |
+| `frame_feature_dim`  | `int`                         | Input motion feature dimension (271)     |
+| `text_embedding_dim` | `int`                         | Text embedding dimension (512 from CLIP) |
+| `text_proj_dim`      | `int`                         | Text projection dimension                |
+| `model_dim`          | `int`                         | GRU hidden dimension                     |
+| `per_joint_out_dim`  | `int`                         | Output per-joint dimension               |
+| `num_layers`         | `int`                         | Number of GRU layers (default: 2)        |
+| `joint_count`        | `int`                         | Number of joints (default: 22)           |
+| `text_scale`         | `float`                       | Text conditioning scale (default: 1.0)   |
+| `dropout`            | `float`                       | Dropout between GRU layers               |
+| `normalizer`         | `Optional[FeatureNormalizer]` | Feature normalizer for preprocessing     |
 
-#### `forward()` Parameters
+#### `forward()` Signature
 
-- `normalize: bool = True` — if True and normalizer set, normalize input_features
-  - Set to `False` during training (normalization handled externally)
-  - Set to `True` during inference (models normalize internally)
+```python
+def forward(self, motion_seq: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
+    """
+    motion_seq: (B, T, motion_dim)  full history window
+    text_emb:   (B, text_dim)       global text embedding
+    Returns:
+      history_features: (B, 22, per_joint_dim)
+    """
+```
+
+#### `step()` Signature (for AR inference)
+
+```python
+def step(
+    self,
+    x_t: torch.Tensor,        # (B, motion_dim) single frame
+    text_emb: torch.Tensor,    # (B, text_dim)
+    h: Optional[torch.Tensor], # (L, B, H) or None
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    One-step update for AR inference.
+    Returns:
+      history_features: (B, 22, per_joint_dim)
+      h_next: (L, B, H) next hidden state
+    """
+```
 
 #### Architecture
 
-1. **Text Prefix Tokens**: CLIP sequence `(B, l_seq, 512)` → linear → `(B, l_seq, d_model)`
-2. **Global Token**: per-timestep global features (16D) → linear → 1 token/timestep
-   - `root_height_y(1) + root_vel_x(1) + root_vel_z(1) + root_rot_6d(6) + root_local_vel(3) + foot_contacts(4) = 16D`
-3. **Track Tokens**: per-timestep local features (12D) → linear → add kinematic bias → 21 tokens/timestep
-   - `RIC positions(3) + rotation_6d(6) + local_velocity(3) = 12D` per joint
-   - Kinematic embedding added as position bias (not concatenated)
-4. **Spatiotemporal Sequence**: `[Text Prefix (l_seq × 22); Motion (T × 22)]` → `(B, l_seq+T, 22, d_model)`
-5. **Transformer Stack (4 layers)**: Spatiotemporal blocks with temporal causal + spatial bidirectional attention
-   - Each block: Spatial Attention (bidirectional over 22 joints) + Temporal Attention (causal with RoPE)
-6. **Output**: Last timestep features → `(B, T, 22, per_joint_out_dim)`, caller takes `[:, -1, :, :]` → `(B, 22, per_joint_out_dim)`
+1. **Text Projection**: `Linear(text_embedding_dim, text_proj_dim)` → project CLIP embedding
+2. **Text to Hidden**: `Linear(text_embedding_dim, model_dim)` → initialize GRU hidden state
+3. **GRU**: `input_size=motion_dim + text_proj_dim`, `hidden_size=model_dim`
+4. **MLP**: `Linear(model_dim, model_dim) → ReLU → Linear(model_dim, joint_count * per_joint_dim)`
+5. **Output**: Reshape to `(B, joint_count, per_joint_dim)`
 
 ---
 
@@ -373,27 +403,38 @@ Both grow with each generated frame using `flow_output_to_271d` and `RootPositio
 
 ### Model Parameters
 
-| Parameter            | Value     | Description                   |
-| :------------------- | :-------- | :---------------------------- |
-| `text_proj`          | 512 → 128 | CLIP embedding projection     |
-| `joint_proj`         | 12 → 128  | Per-joint feature projection  |
-| `model_dim`          | 128       | Transformer hidden dimension  |
-| `transformer_layers` | 4         | MotionHistoryEncoder layers   |
-| `max_text_seq_len`   | 1         | CLIP sequence length (pooled) |
-| `heads`              | 2         | Attention heads               |
-| `dropout`            | 0.1       | Dropout rate                  |
-| `flow_layers`        | 3         | FlowMatchingPredictor layers  |
-| `time_embed_dim`     | 64        | Sinusoidal time embedding     |
+| Parameter               | Value | Description                    |
+| :---------------------- | :---- | :----------------------------- |
+| `encoder_motion_dim`    | 271   | Input motion feature dimension |
+| `encoder_text_dim`      | 512   | CLIP embedding dimension       |
+| `encoder_text_proj_dim` | 128   | Text projection dimension      |
+| `encoder_hidden_dim`    | 256   | GRU hidden dimension           |
+| `encoder_per_joint_dim` | 64    | Per-joint output dimension     |
+| `encoder_num_layers`    | 2     | Number of GRU layers           |
+| `encoder_num_joints`    | 22    | Number of joints               |
+| `encoder_text_scale`    | 1.0   | Text conditioning scale        |
+| `encoder_dropout`       | 0.1   | GRU dropout rate               |
+
+### FlowMatchingPredictor Parameters
+
+| Parameter                  | Value | Description                      |
+| :------------------------- | :---- | :------------------------------- |
+| `predictor_per_joint_dim`  | 64    | Must match encoder_per_joint_dim |
+| `predictor_model_dim`      | 128   | Spatial transformer hidden dim   |
+| `predictor_num_layers`     | 2     | Spatial transformer layers       |
+| `predictor_num_heads`      | 4     | Attention heads                  |
+| `predictor_time_embed_dim` | 64    | Sinusoidal time embedding        |
+| `predictor_dropout`        | 0.1   | Dropout rate                     |
 
 ### Training Parameters
 
-| Parameter             | Value |
-| :-------------------- | :---- |
-| `batch_size`          | 100   |
-| `learning_rate`       | 1e-4  |
-| `epochs`              | 200   |
-| `flow_loss_weight`    | 1.0   |
-| `context_loss_weight` | 0.1   |
+| Parameter       | Value | Description              |
+| :-------------- | :---- | :----------------------- |
+| `batch_size`    | 192   | Training batch size      |
+| `learning_rate` | 1e-4  | Adam learning rate       |
+| `num_epochs`    | 1000  | Total training epochs    |
+| `ema_decay`     | 0.999 | EMA decay for validation |
+| `cfg_dropout`   | 0.1   | CFG dropout probability  |
 
 ---
 

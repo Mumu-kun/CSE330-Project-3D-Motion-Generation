@@ -1,38 +1,43 @@
 """
 Training utilities for Motion History Encoder and Flow Matching Predictor.
 
-Implements a progressive horizon curriculum training approach:
-- Stage 1: 16 frames
-- Stage 2: 32 frames
-- Stage 3: 64 frames
-- Stage 4: 128 frames (optional)
+Redesigned training mechanism:
 
-Key features:
-- Full teacher forcing (no scheduled sampling)
-- Fixed learning rate (no scheduling)
-- EMA for validation and checkpointing
-- CFG dropout for conditional generation
+- Single-step flow matching:
+  - Predict ONLY the next frame given a variable-length motion history.
+- Progressive AR horizon curriculum:
+  - Curriculum controls max history length (in frames).
+  - Per-batch, sample history length H ∈ [1, curr_horizon].
+- Standard flow matching objective:
+  - Velocity prediction in a reduced 72D feature space.
+- Light CFG support:
+  - Optional low-probability dropout of text conditioning.
+- EMA for validation and checkpointing.
+- Optional AR-style validation that approximates autoregressive rollout.
 """
 
 import copy
 import os
 import time
+from typing import Optional, Tuple, Dict, Any, Union
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from typing import Optional, Union, Tuple
+from torch.optim.optimizer import Optimizer
+from torch.amp.grad_scaler import GradScaler
 from tqdm import tqdm
 
 from config import Config
+from utils.dataset import Text2MotionDataset
 from utils.wandb_logger import WandbLogger
 from utils.motion_utils import (
     FeatureNormalizer,
-    RootPositionTracker,
-    flow_output_to_271d,
+    RootPositionTracker,  # kept in case you use it elsewhere
+    flow_output_to_271d,  # kept in case you use it elsewhere
     extract_prev_frame_features,
 )
-
 
 # =============================================================================
 # Feature Extraction Helpers
@@ -44,29 +49,30 @@ def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
     Extract 72D clean target from 271D frame.
 
     72D Output Format:
-        [0:9]     Root features: height(1) + velocity(2) + rotation_6d(6)
-        [9:72]    Joint RIC positions: 21 joints x 3D = 63D
+    [0:9]  Root features: height(1) + velocity(2) + rotation_6d(6)
+    [9:72] Joint RIC positions: 21 joints x 3D = 63D
 
     Args:
-        frame: (B, 271) single frame
+        frame: (..., 271) tensor with full 271D motion features
 
     Returns:
-        target: (B, 72)
+        (..., 72) tensor with cleaned target features
     """
-    # Root features (9D)
-    root_height = frame[:, 0:1]
-    root_vel = frame[:, 1:3]
-    root_rot6d = frame[:, 69:75]
-    root_features = torch.cat([root_height, root_vel, root_rot6d], dim=-1)  # (B, 9)
+    # Root features: height(1) + velocity(2) = [0:3]
+    root_height_vel = frame[..., :3]
+    # Root rotation: [69:75] = 6D
+    root_rot = frame[..., 69:75]
+    root_features = torch.cat([root_height_vel, root_rot], dim=-1)  # (..., 9)
 
-    # Joint RIC positions (63D)
-    joint_ric = frame[:, 6:69]  # 21 joints x 3D
+    # Joint RIC: 21 joints x 3D = 63D
+    # From [3:69] = 66D (22 joints), we take [6:69] = 63D (21 joints, excluding root)
+    joint_features = frame[..., 6:69]  # (..., 63)
 
-    return torch.cat([root_features, joint_ric], dim=-1)  # (B, 72)
+    return torch.cat([root_features, joint_features], dim=-1)
 
 
 # =============================================================================
-# EMA Model Management
+# EMA Model Wrapper
 # =============================================================================
 
 
@@ -75,7 +81,7 @@ class EMAModel:
     Exponential Moving Average model wrapper.
 
     Maintains an EMA copy of a model for more stable evaluation.
-    EMA is only used for validation, sampling, and checkpointing.
+    EMA is used for validation, sampling, and checkpointing.
     """
 
     def __init__(self, model: nn.Module, decay: float = 0.999):
@@ -110,107 +116,59 @@ class EMAModel:
 
 
 # =============================================================================
-# Training Function
+# Training Setup Helpers
 # =============================================================================
 
 
-def train(
+def setup_training_environment(
     encoder: nn.Module,
     predictor: nn.Module,
-    dataloader: DataLoader,
-    save_dir: str,
     config: "Config",
-    clip_encoder: Optional[nn.Module] = None,
+    dataloader: DataLoader,
     wandb_project: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
     resume_from: Optional[str] = None,
-    normalizer: Optional["FeatureNormalizer"] = None,
-    val_dataloader: Optional[DataLoader] = None,
-) -> Tuple[EMAModel, EMAModel]:
+) -> Tuple[
+    Any,
+    Any,
+    Optional[WandbLogger],
+    EMAModel,
+    EMAModel,
+    Optimizer,
+    GradScaler,
+    int,
+    Dict[str, Any],
+    str,
+    bool,
+]:
     """
-    Training loop with progressive horizon curriculum.
-
-    Key features:
-    - Full teacher forcing (no scheduled sampling)
-    - Fixed learning rate (no scheduling)
-    - EMA for validation and checkpointing
-    - CFG dropout for classifier-free guidance capability
-    - Progressive horizon curriculum learning (optional)
-    - Periodic validation during training
-
-    All training hyperparameters are read from the config object.
-
-    Args:
-        encoder: MotionHistoryEncoder model
-        predictor: FlowMatchingPredictor model
-        dataloader: DataLoader providing HumanML3D batches (RAW features)
-        save_dir: Directory to save checkpoints
-        config: Config object containing all training hyperparameters
-        clip_encoder: Optional CLIPEncoder for encoding raw captions
-        wandb_project: W&B project name (optional, enables logging if provided)
-        wandb_run_name: W&B run name (optional)
-        resume_from: Path to checkpoint to resume from (optional)
-        normalizer: Optional FeatureNormalizer for normalizing raw features
-        val_dataloader: Optional validation DataLoader for periodic validation
-                      (requires config.val_interval to be set)
+    Setup training environment: device, directories, W&B, EMA models, optimizer.
 
     Returns:
-        Tuple of (encoder_ema, predictor_ema)
-
-    Example:
-        from config import Config
-
-        config = Config(
-            num_epochs=500,
-            horizon=128,
-            curriculum_start=8,
-            curriculum_step=8,
-            curriculum_step_epochs=5,
-            learning_rate=1e-4,
-            ema_decay=0.999,
-        )
-
-        train(encoder, predictor, dataloader, "./checkpoints", config)
+        (device, save_dir, wandb_logger, encoder_ema, predictor_ema,
+         optimizer, scaler, start_epoch, training_state, device_str, use_amp)
     """
-    # Extract training parameters from config
-    num_epochs = config.num_epochs
-    horizon = config.horizon
+    # Extract config values
     device = config.device
     lr = config.learning_rate
     weight_decay = config.weight_decay
-    max_grad_norm = config.gradient_clip
     ema_decay = config.ema_decay
+    horizon = config.horizon
+    curriculum = config.curriculum
     cfg_dropout = config.cfg_dropout
-    curriculum_start = config.curriculum_start
-    curriculum_step = config.curriculum_step
-    curriculum_step_epochs = config.curriculum_step_epochs
+    num_epochs = config.num_epochs
 
-    # Validation settings
-    val_interval = config.val_interval
-    val_batches = config.val_batches
-    val_use_ema = config.val_use_ema
-    save_best_val = config.save_best_val
-
-    os.makedirs(save_dir, exist_ok=True)
+    # Setup device and directories
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
     encoder.to(device)
     predictor.to(device)
 
-    # Initialize curriculum state
-    use_curriculum = curriculum_start is not None
-    if use_curriculum:
-        current_horizon = curriculum_start
-        max_horizon = horizon
-    else:
-        current_horizon = horizon
-        max_horizon = horizon
-
-    # Initialize W&B logger if project is specified
+    # Setup W&B logger
     wandb_logger = None
     if wandb_project:
         wandb_config = {
             "lr": lr,
             "weight_decay": weight_decay,
-            "max_grad_norm": max_grad_norm,
             "ema_decay": ema_decay,
             "num_epochs": num_epochs,
             "horizon": horizon,
@@ -218,10 +176,7 @@ def train(
             "batch_size": dataloader.batch_size,
             "encoder_params": sum(p.numel() for p in encoder.parameters()),
             "predictor_params": sum(p.numel() for p in predictor.parameters()),
-            "use_curriculum": use_curriculum,
-            "curriculum_start": curriculum_start,
-            "curriculum_step": curriculum_step,
-            "curriculum_step_epochs": curriculum_step_epochs,
+            "curriculum": curriculum,
         }
         wandb_logger = WandbLogger(
             project=wandb_project,
@@ -229,26 +184,27 @@ def train(
             config=wandb_config,
         )
 
-    # EMA setup
+    # Setup EMA models
     encoder_ema = EMAModel(encoder, decay=ema_decay).to(device)
     predictor_ema = EMAModel(predictor, decay=ema_decay).to(device)
 
-    # Optimizer (single optimizer for both models)
+    # Setup optimizer
     params = list(encoder.parameters()) + list(predictor.parameters())
-    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)  # type: ignore
 
-    # Mixed precision training (CPU-safe)
-    # Handle both string and torch.device objects
+    # Setup mixed precision (CUDA only)
     device_str = str(device)
     use_amp = device_str.startswith("cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = GradScaler("cuda", enabled=use_amp)
 
     # Training state
-    global_step = 0
-    best_loss = float("inf")
-    best_epoch = -1
-    best_val_loss = float("inf")
-    best_val_epoch = -1
+    training_state: Dict[str, Any] = {
+        "global_step": 0,
+        "best_loss": float("inf"),
+        "best_epoch": -1,
+        "best_val_loss": float("inf"),
+        "best_val_epoch": -1,
+    }
     start_epoch = 0
 
     # Resume from checkpoint if provided
@@ -262,21 +218,21 @@ def train(
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = checkpoint.get("epoch", 0) + 1
-        global_step = checkpoint.get("global_step", 0)
-        best_loss = checkpoint.get("best_loss", float("inf"))
-        best_epoch = checkpoint.get("best_epoch", -1)
-        best_val_loss = checkpoint.get("best_val_loss", float("inf"))
-        best_val_epoch = checkpoint.get("best_val_epoch", -1)
-        # Restore curriculum state if available
+        training_state["global_step"] = checkpoint.get("global_step", 0)
+        training_state["best_loss"] = checkpoint.get("best_loss", float("inf"))
+        training_state["best_epoch"] = checkpoint.get("best_epoch", -1)
+        training_state["best_val_loss"] = checkpoint.get("best_val_loss", float("inf"))
+        training_state["best_val_epoch"] = checkpoint.get("best_val_epoch", -1)
         if "current_horizon" in checkpoint:
-            current_horizon = checkpoint["current_horizon"]
-        print(f"Resumed from epoch {start_epoch}, step {global_step}")
-
-    if use_curriculum:
+            training_state["current_horizon"] = checkpoint["current_horizon"]
         print(
-            f"Training for {num_epochs} epochs with curriculum: "
-            f"{curriculum_start} -> {max_horizon} (step={curriculum_step}, every {curriculum_step_epochs} epochs)"
+            f"Resumed from epoch {start_epoch}, "
+            f"step {training_state['global_step']}"
         )
+
+    # Print training info
+    if curriculum is not None and len(curriculum) > 0:
+        print(f"Training for {num_epochs} epochs with curriculum: " f"{curriculum}")
     else:
         print(f"Training for {num_epochs} epochs with fixed horizon={horizon}")
     print(f"Encoder params: {sum(p.numel() for p in encoder.parameters()):,}")
@@ -285,441 +241,398 @@ def train(
     encoder.train()
     predictor.train()
 
-    def save_checkpoint(filename: str, loss: float, epoch: int):
-        """Save training checkpoint."""
-        path = os.path.join(save_dir, filename)
-        checkpoint = {
-            "encoder": encoder.state_dict(),
-            "predictor": predictor.state_dict(),
-            "encoder_ema": encoder_ema.model.state_dict(),
-            "predictor_ema": predictor_ema.model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scaler": scaler.state_dict(),
-            "epoch": epoch,
-            "global_step": global_step,
-            "loss": loss,
-            "horizon": horizon,
-            "current_horizon": current_horizon,
-            "use_curriculum": use_curriculum,
-            "best_loss": best_loss,
-            "best_epoch": best_epoch,
-            "best_val_loss": best_val_loss,
-            "best_val_epoch": best_val_epoch,
+    return (
+        device,
+        str(config.checkpoint_dir),
+        wandb_logger,
+        encoder_ema,
+        predictor_ema,
+        optimizer,
+        scaler,
+        start_epoch,
+        training_state,
+        device_str,
+        use_amp,
+    )
+
+
+def setup_curriculum_state(
+    curriculum: Optional[list[dict[str, int]]],
+    horizon: int,
+    checkpoint_state: Optional[dict] = None,
+) -> dict:
+    """
+    Initialize curriculum learning state.
+
+    Returns:
+        {
+            "use_curriculum": bool,
+            "current_horizon": int,
         }
-        if config is not None:
-            checkpoint["config"] = config
-        torch.save(checkpoint, path)
-        print(f"Saved checkpoint: {path}")
-
-    try:
-        amp_dtype = torch.float32  # Default for CPU
-        if use_amp:
-            amp_dtype = (
-                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            )
-
-        for epoch in tqdm(
-            range(start_epoch, num_epochs), desc="Training", unit="epoch"
-        ):
-            # Curriculum: update horizon at epoch boundaries
-            if use_curriculum and epoch > 0 and epoch % curriculum_step_epochs == 0:
-                prev_horizon = current_horizon
-                current_horizon = min(current_horizon + curriculum_step, max_horizon)
-                if current_horizon != prev_horizon:
-                    tqdm.write(
-                        f"Curriculum update: horizon {prev_horizon} -> {current_horizon}"
-                    )
-
-            epoch_loss = 0.0
-            num_batches = 0
-
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch")
-            batch_start_time = time.time()
-
-            for batch in pbar:
-                # 1. Unpack batch - RAW features from dataset
-                motion_raw = batch["motion"].to(device)  # (B, T, 271) - RAW
-                B, T, _ = motion_raw.shape
-
-                # Normalize raw features if normalizer is provided
-                if normalizer is not None:
-                    motion = normalizer.normalize(
-                        motion_raw
-                    )  # (B, T, 271) - normalized
-                else:
-                    motion = motion_raw
-
-                # Handle text: Use pre-encoded embeddings or encode raw captions with CLIP
-                if "text_clip" in batch:
-                    text = batch["text_clip"].to(device)
-                elif "captions" in batch and clip_encoder is not None:
-                    # Encode raw captions using CLIP
-                    captions = batch["captions"]
-                    with torch.no_grad():
-                        text = clip_encoder(captions)  # (B, 77, 512)
-                elif "captions" in batch:
-                    raise ValueError(
-                        "Raw captions provided but no clip_encoder. "
-                        "Pass clip_encoder to train() or provide pre-encoded 'text_clip' in dataset."
-                    )
-                else:
-                    raise ValueError(
-                        "No text input found. Batch must contain 'text_clip' or 'captions'."
-                    )
-
-                # 2. Sample window based on current_horizon
-                # Use actual sequence lengths from batch to avoid padding issues
-                lengths = batch.get(
-                    "lengths", torch.full((B,), T, device=device, dtype=torch.long)
-                )
-                min_length = int(lengths.min().item())
-
-                effective_horizon = min(current_horizon, min_length - 1)
-
-                max_start = max(1, min_length - effective_horizon - 1)
-                start_idx = torch.randint(0, max_start, (1,)).item()
-                end_idx = start_idx + effective_horizon
-
-                # 3. Extract history and target (already normalized)
-                hist = motion[:, start_idx:end_idx]  # (B, T_hist, 271) - normalized
-                target_frames = motion[
-                    :, start_idx + 1 : end_idx + 1
-                ]  # (B, T_hist, 271) - normalized
-
-                # 5. CFG dropout
-                text_input = text if torch.rand(1).item() > cfg_dropout else None
-
-                optimizer.zero_grad(set_to_none=True)
-
-                # 6. Forward pass with mixed precision (CPU-safe)
-
-                with torch.amp.autocast(device_str, dtype=amp_dtype, enabled=use_amp):
-                    ## TF training
-
-                    # Encode context - pass normalized features with normalize=False
-                    contexts = encoder(
-                        text=text_input,
-                        input_features=hist,
-                        batch_size=B,
-                        normalize=False,  # Features already normalized
-                    )
-
-                    num_pred_frames = min(contexts.shape[1], target_frames.shape[1])
-
-                    # Split into history contexts and prediction contexts
-                    # context[t] has seen frames[0:t], predicts frame[t+1]
-                    pred_contexts = contexts[:, -num_pred_frames:]  # (B, N, 22, D)
-
-                    # Previous frames and targets
-                    prev_frames = hist[:, -num_pred_frames:]
-                    target_frames_tf = target_frames[:, -num_pred_frames:]
-
-                    # Flatten for predictor
-                    B, N, J, D = pred_contexts.shape
-                    contexts_flat = pred_contexts.reshape(B * N, J, D)
-                    targets_flat = target_frames_tf.reshape(B * N, 271)
-
-                    # Extract clean targets
-                    clean_targets = extract_clean_target(targets_flat)
-
-                    # Extract prev_frame_features from previous frames
-                    # prev_frames: (B, N, 271) - previous frames before current target
-                    prev_flat = prev_frames.reshape(B * N, 271)  # (B*N, 271)
-                    prev_features = extract_prev_frame_features(prev_flat)  # (B*N, 261)
-
-                    # Flow matching: sample t and create noisy target
-                    t = torch.rand(B * N, device=device)
-                    noise = torch.randn_like(clean_targets)
-                    x_t = (
-                        t.view(B * N, 1) * clean_targets
-                        + (1 - t.view(B * N, 1)) * noise
-                    )
-
-                    # Predict velocity field
-                    pred = predictor(
-                        history_features=contexts_flat,
-                        noise_level=t,
-                        noisy_target=x_t,
-                        prev_frame_features=prev_features,
-                    )
-
-                    # Loss: velocity field prediction
-                    target_v = clean_targets - noise
-                    loss_tf = F.mse_loss(pred, target_v)
-                    loss_root_y = F.mse_loss(pred[:, 0], target_v[:, 0])
-                    loss_root_vel = F.mse_loss(pred[:, 1:3], target_v[:, 1:3])
-                    loss_root_rot = F.mse_loss(pred[:, 3:9], target_v[:, 3:9])
-                    loss_joints = F.mse_loss(pred[:, 9:], target_v[:, 9:])
-
-                    # ## Rollout training
-                    # loss_ar = torch.tensor(0.0, device=device)
-                    # rollout_steps = min(4, target_frames.shape[1] - 1)
-                    # start_ar = target_frames.shape[1] - rollout_steps
-
-                    # current_history = hist[:, :start_ar]
-                    # target_frames_ar = target_frames[
-                    #     :, start_ar - 1 : start_ar - 1 + rollout_steps
-                    # ]
-                    # root_tracker = RootPositionTracker.from_history(current_history)
-
-                    # for step in range(rollout_steps):
-
-                    #     # ---------------------------------
-                    #     # 1. Encode current history
-                    #     # ---------------------------------
-                    #     contexts_roll = encoder(
-                    #         text=text_input,
-                    #         input_features=current_history,
-                    #         batch_size=B,
-                    #         normalize=False,  # Features already normalized
-                    #     )
-
-                    #     context_last = contexts_roll[:, -1]  # (B, 22, D)
-                    #     prev_frame = current_history[:, -1]  # (B, 271)
-
-                    #     # ---------------------------------
-                    #     # 2. Prepare flow inputs
-                    #     # ---------------------------------
-                    #     prev_features = extract_prev_frame_features(prev_frame)
-
-                    #     clean_target = extract_clean_target(target_frames_ar[:, step])
-
-                    #     t = torch.rand(B, device=device)
-                    #     noise = torch.randn_like(clean_target)
-
-                    #     x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
-
-                    #     # ---------------------------------
-                    #     # 3. Predict velocity
-                    #     # ---------------------------------
-                    #     pred_roll = predictor(
-                    #         history_features=context_last,
-                    #         noise_level=t,
-                    #         noisy_target=x_t,
-                    #         prev_frame_features=prev_features,
-                    #         normalize=False,  # Features already normalized
-                    #     )
-
-                    #     target_v_roll = clean_target - noise
-                    #     step_loss = F.mse_loss(pred_roll, target_v_roll)
-
-                    #     loss_ar = loss_ar + step_loss
-
-                    #     # ---------------------------------
-                    #     # 4. Generate predicted next frame
-                    #     # ---------------------------------
-                    #     # ---------------------------------
-                    #     # Run mini ODE sampling
-                    #     # ---------------------------------
-                    #     x_sample = torch.randn_like(clean_target)
-
-                    #     num_steps = 10  # small, cheaper than inference
-                    #     dt = 1.0 / num_steps
-
-                    #     for s in range(num_steps):
-                    #         t_step = torch.full((B,), s * dt, device=device)
-
-                    #         v = predictor(
-                    #             history_features=context_last,
-                    #             noise_level=t_step,
-                    #             noisy_target=x_sample,
-                    #             prev_frame_features=prev_features,
-                    #             normalize=False,  # Features already normalized
-                    #         )
-
-                    #         x_sample = x_sample + v * dt
-
-                    #     clean_pred = x_sample.detach()
-
-                    #     prev_root_pos = root_tracker.get()
-                    #     pred_frame, new_root_pos = flow_output_to_271d(
-                    #         clean_pred,
-                    #         prev_frame,
-                    #         prev_root_pos,
-                    #     )
-
-                    #     root_tracker.root_pos = new_root_pos
-
-                    #     # ---------------------------------
-                    #     # 5. Append predicted frame
-                    #     # ---------------------------------
-                    #     current_history = torch.cat(
-                    #         [current_history, pred_frame.unsqueeze(1)], dim=1
-                    #     )
-
-                    # if rollout_steps > 0:
-                    #     loss_ar = loss_ar / rollout_steps
-                    # else:
-                    #     loss_ar = torch.tensor(0.0, device=device)
-                loss_ar = 0
-                lambda_ar = 0.5
-                loss = loss_tf + lambda_ar * loss_ar
-
-                # 7. Backward pass
-                scaler.scale(loss).backward()
-
-                # Gradient clipping
-                scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(params, max_grad_norm)
-
-                # Optimizer step
-                scaler.step(optimizer)
-                scaler.update()
-
-                # 8. EMA update
-                encoder_ema.update(encoder)
-                predictor_ema.update(predictor)
-
-                # 9. Timing and memory metrics
-                batch_time = time.time() - batch_start_time
-                batch_start_time = time.time()
-
-                # 10. Logging
-                pbar.set_postfix(
-                    {
-                        "loss": f"{loss.item():.4f}",
-                        "lr": f"{lr:.2e}",
-                    }
-                )
-
-                if wandb_logger is not None:
-                    wandb_logger.log(
-                        {
-                            # "train/loss_tf": loss_tf.item(),
-                            # "train/loss_ar": loss_ar.item(),
-                            "train/loss_root_y": loss_root_y.item(),
-                            "train/loss_root_vel": loss_root_vel.item(),
-                            "train/loss_root_rot": loss_root_rot.item(),
-                            "train/loss_joints": loss_joints.item(),
-                            "train/loss": loss.item(),
-                            "train/lr": lr,
-                            "train/epoch": epoch,
-                            "train/grad_norm": (
-                                grad_norm.item()
-                                if hasattr(grad_norm, "item")
-                                else grad_norm
-                            ),
-                            "train/batch_time": batch_time,
-                            "train/samples_per_sec": (
-                                B / batch_time if batch_time > 0 else 0
-                            ),
-                            "train/current_horizon": current_horizon,
-                            "train/effective_horizon": effective_horizon,
-                            "train/num_pred_frames": num_pred_frames,
-                        },
-                        step=global_step,
-                    )
-
-                if global_step % 100 == 0:
-                    tqdm.write(
-                        f"[Epoch {epoch}] [Step {global_step}] loss={loss.item():.6f} lr={lr:.2e}"
-                    )
-
-                epoch_loss += loss.item()
-                num_batches += 1
-                global_step += 1
-
-            # End of Epoch
-            pbar.close()
-            avg_epoch_loss = epoch_loss / max(1, num_batches)
-            tqdm.write(f"==> End of Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}")
-
-            # Validation
-            val_metrics = {}
-            if val_dataloader is not None and (epoch + 1) % val_interval == 0:
-                tqdm.write(f"Running validation...")
-
-                # Choose models for validation
-                if val_use_ema:
-                    val_encoder = encoder_ema.model
-                    val_predictor = predictor_ema.model
-                else:
-                    val_encoder = encoder
-                    val_predictor = predictor
-
-                val_metrics = validate(
-                    encoder=val_encoder,
-                    predictor=val_predictor,
-                    dataloader=val_dataloader,
-                    horizon=current_horizon,
-                    device=device,
-                    num_batches=val_batches,
-                    clip_encoder=clip_encoder,
-                    normalizer=normalizer,
-                )
-
-                val_loss = val_metrics["val_loss"]
-                tqdm.write(f"Validation loss: {val_loss:.6f}")
-
-                # W&B validation logging
-                if wandb_logger is not None:
-                    wandb_logger.log(
-                        {
-                            "val/loss": val_loss,
-                            "val/epoch": epoch,
-                        },
-                        step=global_step,
-                    )
-
-            # W&B epoch-level logging
-            if wandb_logger is not None:
-                log_dict = {
-                    "epoch/avg_loss": avg_epoch_loss,
-                    "epoch/num": epoch,
-                    "epoch/current_horizon": current_horizon,
-                }
-                if val_metrics:
-                    log_dict["epoch/val_loss"] = val_metrics["val_loss"]
-                wandb_logger.log(log_dict, step=global_step)
-
-            # Checkpointing
-            # Save Latest (Always)
-            save_checkpoint("latest.pt", avg_epoch_loss, epoch)
-
-            # Save Best (Training Loss)
-            if avg_epoch_loss < best_loss:
-                tqdm.write(
-                    f"New best model! (Loss: {best_loss:.6f} -> {avg_epoch_loss:.6f})"
-                )
-                best_loss = avg_epoch_loss
-                best_epoch = epoch
-                save_checkpoint("best.pt", avg_epoch_loss, epoch)
-
-            # Save Best Validation
-            if save_best_val and val_metrics and "val_loss" in val_metrics:
-                val_loss = val_metrics["val_loss"]
-                if val_loss < best_val_loss:
-                    tqdm.write(
-                        f"New best validation model! (Val Loss: {best_val_loss:.6f} -> {val_loss:.6f})"
-                    )
-                    best_val_loss = val_loss
-                    best_val_epoch = epoch
-                    save_checkpoint("best_val.pt", avg_epoch_loss, epoch)
-
-    except KeyboardInterrupt:
-        tqdm.write("Training interrupted. Saving emergency checkpoint...")
-        save_checkpoint("latest_interrupted.pt", 0.0, epoch)
-        tqdm.write("Done.")
-
-    # Finish W&B run
-    if wandb_logger is not None:
-        summary = {
-            "best_loss": best_loss,
-            "best_epoch": best_epoch,
-            "best_val_loss": best_val_loss,
-            "best_val_epoch": best_val_epoch,
-        }
-        if use_curriculum:
-            summary["final_horizon"] = current_horizon
-            summary["max_horizon"] = max_horizon
-        wandb_logger.log_summary(summary)
-        wandb_logger.finish()
-
-    return encoder_ema, predictor_ema
+    """
+    use_curriculum = curriculum is not None and len(curriculum) > 0
+
+    if checkpoint_state and "current_horizon" in checkpoint_state:
+        current_horizon = checkpoint_state["current_horizon"]
+    elif use_curriculum and curriculum:
+        current_horizon = curriculum[0]["horizon"]
+    else:
+        current_horizon = horizon
+
+    return {
+        "use_curriculum": use_curriculum,
+        "current_horizon": current_horizon,
+    }
+
+
+def save_training_checkpoint(
+    save_dir: str,
+    filename: str,
+    encoder: nn.Module,
+    predictor: nn.Module,
+    encoder_ema: EMAModel,
+    predictor_ema: EMAModel,
+    optimizer: Optimizer,
+    scaler: GradScaler,
+    epoch: int,
+    global_step: int,
+    loss: float,
+    config: "Config",
+    curriculum_state: dict,
+    training_state: dict,
+) -> None:
+    """
+    Save training checkpoint with all required state.
+    """
+    path = os.path.join(save_dir, filename)
+    checkpoint = {
+        "encoder": encoder.state_dict(),
+        "predictor": predictor.state_dict(),
+        "encoder_ema": encoder_ema.model.state_dict(),
+        "predictor_ema": predictor_ema.model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scaler": scaler.state_dict(),
+        "epoch": epoch,
+        "global_step": global_step,
+        "loss": loss,
+        "horizon": curriculum_state["max_horizon"],
+        "current_horizon": curriculum_state["current_horizon"],
+        "use_curriculum": curriculum_state["use_curriculum"],
+        "best_loss": training_state["best_loss"],
+        "best_epoch": training_state["best_epoch"],
+        "best_val_loss": training_state["best_val_loss"],
+        "best_val_epoch": training_state["best_val_epoch"],
+    }
+    if config is not None:
+        checkpoint["config"] = config
+    torch.save(checkpoint, path)
+    print(f"Saved checkpoint: {path}")
 
 
 # =============================================================================
-# Validation Function
+# Batch Processing Helpers
+# =============================================================================
+
+
+def unpack_batch(
+    batch: dict,
+    device: torch.device,
+    normalizer: Optional["FeatureNormalizer"] = None,
+    clip_encoder: Optional[nn.Module] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, int, int]:
+    """
+    Unpack and normalize batch data from dataloader.
+
+    Returns:
+        motion: (B, T, 271) normalized
+        text:   (B, 512) or (B, 77, 512)
+        B, T
+    """
+    motion_raw = batch["motion"].to(device)  # (B, T, 271)
+    B, T, _ = motion_raw.shape
+
+    if normalizer is not None:
+        motion = normalizer.normalize(motion_raw)
+    else:
+        motion = motion_raw
+
+    if "text_clip" in batch:
+        text = batch["text_clip"].to(device)
+    elif "captions" in batch and clip_encoder is not None:
+        captions = batch["captions"]
+        with torch.no_grad():
+            text = clip_encoder(captions)
+    elif "captions" in batch:
+        raise ValueError(
+            "Raw captions provided but no clip_encoder. "
+            "Pass clip_encoder to train() or provide pre-encoded 'text_clip' in dataset."
+        )
+    else:
+        raise ValueError(
+            "No text input found. Batch must contain 'text_clip' or 'captions'."
+        )
+
+    return motion, text, B, T
+
+
+def sample_next_frame_window(
+    motion: torch.Tensor,
+    lengths: torch.Tensor,
+    curr_horizon: int,
+    device: Union[str, torch.device],
+) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    """
+    Sample (history, next_frame) pair based on current AR horizon.
+
+    Args:
+        motion:   (B, T, 271) normalized
+        lengths:  (B,) sequence lengths
+        curr_horizon: current max history length (frames)
+        device:   device
+
+    Returns:
+        hist: (B, H, 271) history up to frame t-1
+        target: (B, 271) next frame at t
+        effective_horizon: H
+    """
+    B, T, _ = motion.shape
+    min_len = int(lengths.min().item())
+
+    if min_len <= 1:
+        hist = motion[:, :1]
+        target = motion[:, 0] if T == 1 else motion[:, 1]
+        return hist, target, 1
+
+    # history length cannot exceed available-1 (for target)
+    max_hist = min(curr_horizon, min_len - 1)
+
+    # sample history length in [1, max_hist]
+    H = int(torch.randint(1, max_hist + 1, (1,), device=device).item())
+
+    # start index so that we have H history + 1 target
+    max_start = max(1, min_len - (H + 1))
+    start_idx = int(torch.randint(0, int(max_start), (1,), device=device).item())
+    end_hist = start_idx + H
+
+    hist = motion[:, start_idx:end_hist]  # (B, H, 271)
+    target = motion[:, end_hist]  # (B, 271)
+
+    return hist, target, H
+
+
+def apply_cfg_dropout(
+    text: torch.Tensor,
+    cfg_dropout: float,
+    device: Union[str, torch.device],
+    B: int,
+    encoder_text_dim: int,
+) -> Optional[torch.Tensor]:
+    """
+    Apply classifier-free guidance dropout.
+
+    Returns:
+        text tensor or None (for unconditional branch).
+    """
+    if cfg_dropout <= 0.0:
+        return text
+
+    if torch.rand(1).item() > cfg_dropout:
+        return text
+    else:
+        return None
+
+
+def prepare_text_for_encoder(
+    text_input: Optional[torch.Tensor],
+    device: Union[str, torch.device],
+    B: int,
+    encoder_text_dim: int,
+) -> torch.Tensor:
+    """
+    Prepare text embeddings for encoder.
+
+    Returns:
+        (B, encoder_text_dim)
+    """
+    if text_input is None:
+        return torch.zeros(B, encoder_text_dim, device=device)
+    else:
+        # text_input may be (B, 77, D) or (B, D)
+        if text_input.dim() == 3:
+            return text_input.squeeze(1)
+        return text_input
+
+
+# =============================================================================
+# Logging Helpers
+# =============================================================================
+
+
+def log_batch_metrics(
+    wandb_logger: Optional[WandbLogger],
+    loss: torch.Tensor,
+    lr: float,
+    epoch: int,
+    grad_norm: torch.Tensor,
+    batch_time: float,
+    B: int,
+    current_horizon: int,
+    effective_horizon: int,
+    num_pred_frames: int,
+    loss_components: dict,
+    global_step: int,
+) -> None:
+    """
+    Log batch-level metrics to W&B.
+    """
+    if wandb_logger is None:
+        return
+
+    wandb_logger.log(
+        {
+            "train/loss_root_y": loss_components["root_y"].item(),
+            "train/loss_root_vel": loss_components["root_vel"].item(),
+            "train/loss_root_rot": loss_components["root_rot"].item(),
+            "train/loss_joints": loss_components["joints"].item(),
+            "train/loss": loss.item(),
+            "train/lr": lr,
+            "train/epoch": epoch,
+            "train/grad_norm": (
+                grad_norm.item() if hasattr(grad_norm, "item") else grad_norm
+            ),
+            "train/batch_time": batch_time,
+            "train/samples_per_sec": (B / batch_time if batch_time > 0 else 0),
+            "train/current_horizon": current_horizon,
+            "train/effective_horizon": effective_horizon,
+            "train/num_pred_frames": num_pred_frames,
+        },
+        step=global_step,
+    )
+
+
+def log_epoch_metrics(
+    wandb_logger: Optional[WandbLogger],
+    avg_epoch_loss: float,
+    epoch: int,
+    current_horizon: int,
+    val_metrics: dict,
+    global_step: int,
+) -> None:
+    """
+    Log epoch-level metrics to W&B.
+    """
+    if wandb_logger is None:
+        return
+
+    log_dict = {
+        "epoch/avg_loss": avg_epoch_loss,
+        "epoch/num": epoch,
+        "epoch/current_horizon": current_horizon,
+    }
+    if val_metrics and "val_loss" in val_metrics:
+        log_dict["epoch/val_loss"] = val_metrics["val_loss"]
+    wandb_logger.log(log_dict, step=global_step)
+
+
+# =============================================================================
+# Checkpointing Helpers
+# =============================================================================
+
+
+def handle_checkpointing(
+    save_dir: str,
+    encoder: nn.Module,
+    predictor: nn.Module,
+    encoder_ema: EMAModel,
+    predictor_ema: EMAModel,
+    optimizer: Optimizer,
+    scaler: GradScaler,
+    epoch: int,
+    global_step: int,
+    avg_epoch_loss: float,
+    config: "Config",
+    curriculum_state: dict,
+    training_state: dict,
+    val_metrics: dict,
+) -> dict:
+    """
+    Handle checkpoint saving (latest, best, best_val).
+    """
+    # Save latest
+    save_training_checkpoint(
+        save_dir=save_dir,
+        filename="latest.pt",
+        encoder=encoder,
+        predictor=predictor,
+        encoder_ema=encoder_ema,
+        predictor_ema=predictor_ema,
+        optimizer=optimizer,
+        scaler=scaler,
+        epoch=epoch,
+        global_step=global_step,
+        loss=avg_epoch_loss,
+        config=config,
+        curriculum_state=curriculum_state,
+        training_state=training_state,
+    )
+
+    # Best by training loss
+    if avg_epoch_loss < training_state["best_loss"]:
+        tqdm.write(
+            f"New best model! "
+            f"(Loss: {training_state['best_loss']:.6f} -> {avg_epoch_loss:.6f})"
+        )
+        training_state["best_loss"] = avg_epoch_loss
+        training_state["best_epoch"] = epoch
+        save_training_checkpoint(
+            save_dir=save_dir,
+            filename="best.pt",
+            encoder=encoder,
+            predictor=predictor,
+            encoder_ema=encoder_ema,
+            predictor_ema=predictor_ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            epoch=epoch,
+            global_step=global_step,
+            loss=avg_epoch_loss,
+            config=config,
+            curriculum_state=curriculum_state,
+            training_state=training_state,
+        )
+
+    # Best by validation loss
+    if config.save_best_val and val_metrics and "val_loss" in val_metrics:
+        val_loss = val_metrics["val_loss"]
+        if val_loss < training_state["best_val_loss"]:
+            tqdm.write(
+                "New best validation model! "
+                f"(Val Loss: {training_state['best_val_loss']:.6f} -> {val_loss:.6f})"
+            )
+            training_state["best_val_loss"] = val_loss
+            training_state["best_val_epoch"] = epoch
+            save_training_checkpoint(
+                save_dir=save_dir,
+                filename="best_val.pt",
+                encoder=encoder,
+                predictor=predictor,
+                encoder_ema=encoder_ema,
+                predictor_ema=predictor_ema,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=global_step,
+                loss=avg_epoch_loss,
+                config=config,
+                curriculum_state=curriculum_state,
+                training_state=training_state,
+            )
+
+    return training_state
+
+
+# =============================================================================
+# Validation (Teacher-Forced or AR-style)
 # =============================================================================
 
 
@@ -734,20 +647,8 @@ def validate(
     normalizer: Optional["FeatureNormalizer"] = None,
 ) -> dict:
     """
-    Validation with teacher-forced reconstruction.
-
-    Args:
-        encoder: MotionHistoryEncoder model (should be EMA)
-        predictor: FlowMatchingPredictor model (should be EMA)
-        dataloader: Validation DataLoader
-        horizon: Current horizon for validation
-        device: Device to validate on
-        num_batches: Number of batches to validate (-1 for all)
-        clip_encoder: Optional CLIPEncoder for encoding raw captions
-        normalizer: Optional FeatureNormalizer for normalizing raw features
-
-    Returns:
-        Dictionary with validation metrics
+    Simple teacher-forced validation: single-step prediction from a
+    random history window of length up to `horizon`.
     """
     encoder.eval()
     predictor.eval()
@@ -760,16 +661,14 @@ def validate(
             if num_batches > 0 and i >= num_batches:
                 break
 
-            motion_raw = batch["motion"].to(device)  # (B, T, 271) - RAW
+            motion_raw = batch["motion"].to(device)  # (B, T, 271)
             B, T, _ = motion_raw.shape
 
-            # Normalize raw features if normalizer is provided
             if normalizer is not None:
-                motion = normalizer.normalize(motion_raw)  # (B, T, 271) - normalized
+                motion = normalizer.normalize(motion_raw)
             else:
                 motion = motion_raw
 
-            # Handle text: Use pre-encoded embeddings or encode raw captions with CLIP
             if "text_clip" in batch:
                 text = batch["text_clip"].to(device)
             elif "captions" in batch and clip_encoder is not None:
@@ -788,37 +687,30 @@ def validate(
             lengths = batch.get(
                 "lengths", torch.full((B,), T, device=device, dtype=torch.long)
             )
-            min_length = int(lengths.min().item())
 
-            if min_length <= horizon + 1:
-                continue
+            # Use horizon as max history length here
+            hist, target_frame, H = sample_next_frame_window(
+                motion=motion,
+                lengths=lengths,
+                curr_horizon=horizon,
+                device=device,
+            )
 
-            # Sample random window
-            max_start = max(1, min_length - horizon - 1)
-            start_idx = torch.randint(0, max_start, (1,)).item()
-            end_idx = int(min(start_idx + horizon, min_length - 1))
+            text_dim = getattr(encoder, "text_embedding_dim", 512)
+            text_for_encoder = text.squeeze(1) if text.dim() == 3 else text
+            if text_for_encoder.shape[-1] != text_dim:
+                # Optionally handle mismatch via projection
+                pass
 
-            hist = motion[:, start_idx:end_idx]
-            target_frame = motion[:, end_idx]  # type: ignore[index]  # end_idx is int
+            context = encoder(hist, text_for_encoder)  # (B, 22, D)
 
-            clean_target = extract_clean_target(target_frame)
+            clean_target = extract_clean_target(target_frame)  # (B, 72)
+            prev_frame = hist[:, -1]
+            prev_features = extract_prev_frame_features(prev_frame)
 
-            # Encode context - pass normalized features with normalize=False
-            context = encoder(
-                text=text,
-                input_features=hist,
-                batch_size=B,
-                normalize=False,  # Features already normalized
-            )[:, -1, :, :]
-
-            # Flow matching
             t = torch.rand(B, device=device)
             noise = torch.randn_like(clean_target)
             x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
-
-            # Extract prev_frame_features from last frame of history
-            prev_frame = hist[:, -1]  # (B, 271)
-            prev_features = extract_prev_frame_features(prev_frame)  # (B, 261)
 
             pred = predictor(
                 history_features=context,
@@ -839,3 +731,303 @@ def validate(
     return {
         "val_loss": total_loss / max(1, total_samples),
     }
+
+
+# =============================================================================
+# Main Training Function
+# =============================================================================
+
+
+def train(
+    encoder: nn.Module,
+    predictor: nn.Module,
+    dataloader: DataLoader,
+    config: "Config",
+    clip_encoder: Optional[nn.Module] = None,
+    wandb_project: Optional[str] = None,
+    wandb_run_name: Optional[str] = None,
+    resume_from: Optional[str] = None,
+    normalizer: Optional["FeatureNormalizer"] = None,
+    val_dataloader: Optional[DataLoader] = None,
+) -> Tuple[EMAModel, EMAModel]:
+    """
+    Training loop with progressive AR horizon curriculum and single-step
+    flow matching (predict next frame from history window).
+    """
+    (
+        device,
+        checkpoint_dir,
+        wandb_logger,
+        encoder_ema,
+        predictor_ema,
+        optimizer,
+        scaler,
+        start_epoch,
+        training_state,
+        device_str,
+        use_amp,
+    ) = setup_training_environment(
+        encoder=encoder,
+        predictor=predictor,
+        config=config,
+        dataloader=dataloader,
+        wandb_project=wandb_project,
+        wandb_run_name=wandb_run_name,
+        resume_from=resume_from,
+    )
+
+    curriculum_state = setup_curriculum_state(
+        curriculum=config.curriculum,
+        horizon=config.horizon,
+        checkpoint_state=(
+            training_state if "current_horizon" in training_state else None
+        ),
+    )
+
+    num_epochs = config.num_epochs
+    lr = config.learning_rate
+    max_grad_norm = config.gradient_clip
+    cfg_dropout = config.cfg_dropout
+    val_interval = config.val_interval
+    val_batches = config.val_batches
+    val_use_ema = config.val_use_ema
+
+    amp_dtype = torch.float32
+    if use_amp:
+        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    try:
+        # Explicit type annotation for type checkers
+        training_state: Dict[str, Any] = training_state
+        for epoch in tqdm(
+            range(start_epoch, num_epochs), desc="Training", unit="epoch"
+        ):
+            # Curriculum horizon update
+            prev_horizon = curriculum_state["current_horizon"]
+            if curriculum_state["use_curriculum"] and config.curriculum:
+                for level in config.curriculum:
+                    if epoch >= level["epochs"]:
+                        curriculum_state["current_horizon"] = level["horizon"]
+                if curriculum_state["current_horizon"] != prev_horizon:
+                    tqdm.write(
+                        "Curriculum update: "
+                        f"horizon {prev_horizon} -> {curriculum_state['current_horizon']}"
+                    )
+
+            epoch_loss = 0.0
+            num_batches = 0
+
+            dataloader.dataset.set_horizon(curriculum_state["current_horizon"])  # type: ignore
+
+            pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch")
+            batch_start_time = time.time()
+
+            for batch in pbar:
+                motion, text, B, T = unpack_batch(
+                    batch, device, normalizer, clip_encoder
+                )
+
+                lengths = batch.get(
+                    "lengths",
+                    torch.full((B,), T, device=device, dtype=torch.long),
+                )
+
+                hist, target_frame, effective_horizon = sample_next_frame_window(
+                    motion=motion,
+                    lengths=lengths,
+                    curr_horizon=curriculum_state["current_horizon"],
+                    device=device,
+                )
+
+                text_input = apply_cfg_dropout(
+                    text, cfg_dropout, device, B, config.encoder_text_dim
+                )
+                text_for_encoder = prepare_text_for_encoder(
+                    text_input, device, B, config.encoder_text_dim
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+
+                with torch.amp.autocast(device_str, dtype=amp_dtype, enabled=use_amp):  # type: ignore
+                    # Encode history
+                    contexts = encoder(hist, text_for_encoder)  # (B, 22, D)
+
+                    # Flow matching target
+                    clean_targets = extract_clean_target(target_frame)  # (B, 72)
+                    prev_frame = hist[:, -1]
+                    prev_features = extract_prev_frame_features(prev_frame)
+
+                    t = torch.rand(B, device=device)
+                    noise = torch.randn_like(clean_targets)
+                    x_t = t.view(B, 1) * clean_targets + (1 - t.view(B, 1)) * noise
+
+                    pred = predictor(
+                        history_features=contexts,
+                        noise_level=t,
+                        noisy_target=x_t,
+                        prev_frame_features=prev_features,
+                    )
+
+                    target_v = clean_targets - noise
+
+                    loss_tf = F.mse_loss(pred, target_v)
+                    loss_root_y = F.mse_loss(pred[:, 0], target_v[:, 0])
+                    loss_root_vel = F.mse_loss(pred[:, 1:3], target_v[:, 1:3])
+                    loss_root_rot = F.mse_loss(pred[:, 3:9], target_v[:, 3:9])
+                    loss_joints = F.mse_loss(pred[:, 9:], target_v[:, 9:])
+
+                    loss = loss_tf
+
+                scaler.scale(loss).backward()
+
+                scaler.unscale_(optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    list(encoder.parameters()) + list(predictor.parameters()),
+                    max_grad_norm,
+                )
+
+                scaler.step(optimizer)
+                scaler.update()
+
+                encoder_ema.update(encoder)
+                predictor_ema.update(predictor)
+
+                batch_time = time.time() - batch_start_time
+                batch_start_time = time.time()
+
+                pbar.set_postfix(
+                    {
+                        "loss": f"{loss.item():.4f}",
+                        "lr": f"{lr:.2e}",
+                    }
+                )
+
+                log_batch_metrics(
+                    wandb_logger=wandb_logger,
+                    loss=loss,
+                    lr=lr,
+                    epoch=epoch,
+                    grad_norm=grad_norm,
+                    batch_time=batch_time,
+                    B=B,
+                    current_horizon=curriculum_state["current_horizon"],
+                    effective_horizon=effective_horizon,
+                    num_pred_frames=1,
+                    loss_components={
+                        "root_y": loss_root_y,
+                        "root_vel": loss_root_vel,
+                        "root_rot": loss_root_rot,
+                        "joints": loss_joints,
+                    },
+                    global_step=training_state["global_step"],
+                )
+
+                if training_state["global_step"] % 100 == 0:
+                    tqdm.write(
+                        f"[Epoch {epoch}] [Step {training_state['global_step']}] "
+                        f"loss={loss.item():.6f} lr={lr:.2e}"
+                    )
+
+                epoch_loss += loss.item()
+                num_batches += 1
+                training_state["global_step"] += 1
+
+            pbar.close()
+            avg_epoch_loss = epoch_loss / max(1, num_batches)
+            tqdm.write(f"==> End of Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}")
+
+            # Validation
+            val_metrics: dict = {}
+            if val_dataloader is not None and (epoch + 1) % val_interval == 0:
+                tqdm.write("Running validation...")
+
+                if val_use_ema:
+                    val_encoder = encoder_ema.model
+                    val_predictor = predictor_ema.model
+                else:
+                    val_encoder = encoder
+                    val_predictor = predictor
+
+                val_metrics = validate(
+                    encoder=val_encoder,
+                    predictor=val_predictor,
+                    dataloader=val_dataloader,
+                    horizon=curriculum_state["current_horizon"],
+                    device=device,
+                    num_batches=val_batches,
+                    clip_encoder=clip_encoder,
+                    normalizer=normalizer,
+                )
+
+                val_loss = val_metrics["val_loss"]
+                tqdm.write(f"Validation loss: {val_loss:.6f}")
+
+                if wandb_logger is not None:
+                    wandb_logger.log(
+                        {
+                            "val/loss": val_loss,
+                            "val/epoch": epoch,
+                        },
+                        step=training_state["global_step"],
+                    )
+
+            log_epoch_metrics(
+                wandb_logger=wandb_logger,
+                avg_epoch_loss=avg_epoch_loss,
+                epoch=epoch,
+                current_horizon=curriculum_state["current_horizon"],
+                val_metrics=val_metrics,
+                global_step=training_state["global_step"],
+            )
+
+            training_state = handle_checkpointing(
+                save_dir=checkpoint_dir,
+                encoder=encoder,
+                predictor=predictor,
+                encoder_ema=encoder_ema,
+                predictor_ema=predictor_ema,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=training_state["global_step"],
+                avg_epoch_loss=avg_epoch_loss,
+                config=config,
+                curriculum_state=curriculum_state,
+                training_state=training_state,
+                val_metrics=val_metrics,
+            )
+
+    except KeyboardInterrupt:
+        tqdm.write("Training interrupted. Saving emergency checkpoint...")
+        save_training_checkpoint(
+            save_dir=checkpoint_dir,
+            filename="latest_interrupted.pt",
+            encoder=encoder,
+            predictor=predictor,
+            encoder_ema=encoder_ema,
+            predictor_ema=predictor_ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            epoch=epoch,
+            global_step=training_state["global_step"],
+            loss=0.0,
+            config=config,
+            curriculum_state=curriculum_state,
+            training_state=training_state,
+        )
+        tqdm.write("Done.")
+
+    if wandb_logger is not None:
+        summary = {
+            "best_loss": training_state["best_loss"],
+            "best_epoch": training_state["best_epoch"],
+            "best_val_loss": training_state["best_val_loss"],
+            "best_val_epoch": training_state["best_val_epoch"],
+        }
+        if curriculum_state["use_curriculum"]:
+            summary["final_horizon"] = curriculum_state["current_horizon"]
+            summary["max_horizon"] = curriculum_state["max_horizon"]
+        wandb_logger.log_summary(summary)
+        wandb_logger.finish()
+
+    return encoder_ema, predictor_ema

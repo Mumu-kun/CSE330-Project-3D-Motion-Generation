@@ -40,10 +40,10 @@ def get_test_config():
     config.device = "cpu"  # Use CPU for testing
     config.batch_size = 2
     config.num_epochs = 1
-    config.model_dim = 64  # Smaller for faster testing
-    config.num_encoder_layers = 1
-    config.num_flow_layers = 1
-    config.per_joint_out_dim = 32
+    config.encoder_hidden_dim = 256  # Smaller for faster testing
+    config.encoder_num_layers = 1
+    config.predictor_num_layers = 1
+    config.encoder_per_joint_dim = 64
     return config
 
 
@@ -103,7 +103,7 @@ def test_extract_clean_target():
     assert torch.allclose(target[:, :9], expected_root), "Root target mismatch!"
     print("Root target: OK")
 
-    # Joint RIC: 21 x 3 = 63D
+    # Joint RIC: 21 x 3 = 63D (excluding root joint at index 0)
     expected_joints = frame[:, 6:69]
     assert torch.allclose(target[:, 9:], expected_joints), "Joint RIC mismatch!"
     print("Joint RIC: OK")
@@ -129,13 +129,14 @@ def test_model_initialization():
     # Initialize encoder
     encoder = MotionHistoryEncoder(
         frame_feature_dim=config.motion_dim,
-        text_embedding_dim=config.text_embedding_dim,
-        per_joint_out_dim=config.per_joint_out_dim,
+        text_embedding_dim=config.encoder_text_dim,
+        text_proj_dim=config.encoder_text_proj_dim,
+        per_joint_out_dim=config.encoder_per_joint_dim,
         joint_count=config.num_joints,
-        model_dim=config.model_dim,
-        num_layers=config.num_encoder_layers,
-        max_text_seq_len=config.max_text_seq_len,
-        dropout=config.dropout,
+        model_dim=config.encoder_hidden_dim,
+        num_layers=config.encoder_num_layers,
+        text_scale=config.encoder_text_scale,
+        dropout=config.encoder_dropout,
         normalizer=normalizer,
     )
 
@@ -145,12 +146,12 @@ def test_model_initialization():
 
     # Initialize predictor
     predictor = FlowMatchingPredictor(
-        per_joint_dim=config.per_joint_out_dim,
-        model_dim=config.model_dim,
-        num_layers=config.num_flow_layers,
+        per_joint_dim=config.predictor_per_joint_dim,
+        model_dim=config.predictor_model_dim,
+        num_layers=config.predictor_num_layers,
         joint_count=config.num_joints,
-        time_embed_dim=config.time_embed_dim,
-        dropout=config.dropout,
+        time_embed_dim=config.predictor_time_embed_dim,
+        dropout=config.predictor_dropout,
         normalizer=normalizer,
     )
 
@@ -183,24 +184,22 @@ def test_encoder_forward(encoder, config):
     device = config.device
 
     # Create mock inputs (RAW features - unnormalized)
-    text = torch.randn(B, config.max_text_seq_len, config.text_embedding_dim)
+    text = torch.randn(B, config.encoder_text_dim)
     motion = torch.randn(B, T, config.motion_dim)
 
     # Forward pass with normalize=True (inference mode)
     with torch.no_grad():
         output = encoder(
-            text=text,
-            input_features=motion,
-            batch_size=B,
-            normalize=True,  # Models normalize internally
+            motion_seq=motion,
+            text_emb=text.squeeze(1),  # (B, text_dim)
         )
 
     print(f"Input text shape: {text.shape}")
     print(f"Input motion shape: {motion.shape}")
     print(f"Output shape: {output.shape}")
 
-    # Check output shape: (B, T, 22, per_joint_out_dim)
-    expected_shape = (B, T, config.num_joints, config.per_joint_out_dim)
+    # Check output shape: (B, 22, per_joint_out_dim)
+    expected_shape = (B, config.num_joints, config.encoder_per_joint_dim)
     assert (
         output.shape == expected_shape
     ), f"Expected {expected_shape}, got {output.shape}"
@@ -228,7 +227,7 @@ def test_predictor_forward(predictor, config):
     device = config.device
 
     # Create mock inputs
-    history_features = torch.randn(B, config.num_joints, config.per_joint_out_dim)
+    history_features = torch.randn(B, config.num_joints, config.encoder_per_joint_dim)
     noise_level = torch.rand(B)
     noisy_target = torch.randn(B, 72)  # 72D flow output
 
@@ -273,7 +272,7 @@ def test_training_iteration(encoder, predictor, config):
 
     # Create mock batch (RAW features - unnormalized)
     motion = torch.randn(B, T, config.motion_dim)
-    text = torch.randn(B, config.max_text_seq_len, config.text_embedding_dim)
+    text = torch.randn(B, config.encoder_text_dim)  # (B, text_dim)
     lengths = torch.tensor([T, T - 5])  # Variable lengths
 
     # Get normalizer
@@ -293,41 +292,32 @@ def test_training_iteration(encoder, predictor, config):
     print(f"Target frames shape: {target_frames.shape}")
 
     # Encode context (normalize=False since already normalized)
+    # The encoder returns (B, 22, per_joint_dim) - last timestep's features
     contexts = encoder(
-        text=text,
-        input_features=hist,
-        batch_size=B,
-        normalize=False,  # Already normalized
+        motion_seq=hist,
+        text_emb=text,
     )
 
     print(f"Context shape: {contexts.shape}")
 
-    # Prepare predictor inputs
-    num_pred_frames = min(contexts.shape[1], target_frames.shape[1])
-    pred_contexts = contexts[:, -num_pred_frames:]
-    prev_frames = hist[:, -num_pred_frames:]
-    targets = target_frames[:, -num_pred_frames:]
+    # For training iteration, we predict ONE frame at a time
+    # Get the last target frame as our prediction target
+    # target_frames shape: (B, horizon, 271), get last frame: (B, 271)
+    target = target_frames[:, -1, :]  # (B, 271)
 
-    # Flatten
-    B_eff = B * num_pred_frames
-    contexts_flat = pred_contexts.reshape(
-        B_eff, config.num_joints, config.per_joint_out_dim
-    )
-    targets_flat = targets.reshape(B_eff, config.motion_dim)
-
-    # Extract clean targets
-    clean_targets = extract_clean_target(targets_flat)
+    # Extract clean target (72D)
+    clean_targets = extract_clean_target(target)  # (B, 72)
 
     print(f"Clean targets shape: {clean_targets.shape}")
 
     # Flow matching
-    t = torch.rand(B_eff)
+    t = torch.rand(B)
     noise = torch.randn_like(clean_targets)
-    x_t = t.view(B_eff, 1) * clean_targets + (1 - t.view(B_eff, 1)) * noise
+    x_t = t.view(B, 1) * clean_targets + (1 - t.view(B, 1)) * noise
 
-    # Predict
+    # Predict (no prev_frame_features needed for basic test)
     pred = predictor(
-        history_features=contexts_flat,
+        history_features=contexts,
         noise_level=t,
         noisy_target=x_t,
     )
@@ -371,7 +361,7 @@ def test_human_motion_generator(encoder, predictor, config):
     num_steps = 3  # Small for testing
 
     # Create mock text input (pre-encoded)
-    text = torch.randn(B, config.max_text_seq_len, config.text_embedding_dim)
+    text = torch.randn(B, config.encoder_text_dim)
 
     # Create mock initial features
     input_features = torch.randn(B, 1, config.motion_dim)

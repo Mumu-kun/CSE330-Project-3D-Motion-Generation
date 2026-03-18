@@ -32,3 +32,5 @@ results/
 # External
 momask-codes/
 *_cache/
+sample_data/humanml3d-subset
+sample_data/archive.zip
