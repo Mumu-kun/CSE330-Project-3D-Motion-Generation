@@ -396,28 +396,11 @@ def sample_next_frame_window(
         effective_horizon: H
     """
     B, T, _ = motion.shape
-    min_len = int(lengths.min().item())
+    assert curr_horizon <= T - 1, f"curr_horizon {curr_horizon} > T-1 {T-1}"
+    hist = motion[:, 0:curr_horizon]  # (B, curr_horizon, 271)
+    target = motion[:, curr_horizon:]  # (B, T - curr_horizon, 271)
 
-    if min_len <= 1:
-        hist = motion[:, :1]
-        target = motion[:, 0] if T == 1 else motion[:, 1]
-        return hist, target, 1
-
-    # history length cannot exceed available-1 (for target)
-    max_hist = min(curr_horizon, min_len - 1)
-
-    # sample history length in [1, max_hist]
-    H = int(torch.randint(1, max_hist + 1, (1,), device=device).item())
-
-    # start index so that we have H history + 1 target
-    max_start = max(1, min_len - (H + 1))
-    start_idx = int(torch.randint(0, int(max_start), (1,), device=device).item())
-    end_hist = start_idx + H
-
-    hist = motion[:, start_idx:end_hist]  # (B, H, 271)
-    target = motion[:, end_hist]  # (B, 271)
-
-    return hist, target, H
+    return hist, target, curr_horizon
 
 
 def apply_cfg_dropout(
@@ -689,13 +672,14 @@ def validate(
             )
 
             # Use horizon as max history length here
-            hist, target_frame, H = sample_next_frame_window(
+            hist, target_frames, H = sample_next_frame_window(
                 motion=motion,
                 lengths=lengths,
                 curr_horizon=horizon,
                 device=device,
             )
 
+            target_frame = target_frames[:, 0]  # (B, 271)
             text_dim = getattr(encoder, "text_embedding_dim", 512)
             text_for_encoder = text.squeeze(1) if text.dim() == 3 else text
             if text_for_encoder.shape[-1] != text_dim:
@@ -816,8 +800,9 @@ def train(
 
             epoch_loss = 0.0
             num_batches = 0
+            pred_horizon = 1
 
-            dataloader.dataset.set_horizon(curriculum_state["current_horizon"])  # type: ignore
+            dataloader.dataset.set_horizon(curriculum_state["current_horizon"] + pred_horizon)  # type: ignore
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch")
             batch_start_time = time.time()
@@ -832,7 +817,7 @@ def train(
                     torch.full((B,), T, device=device, dtype=torch.long),
                 )
 
-                hist, target_frame, effective_horizon = sample_next_frame_window(
+                hist, target_frames, effective_horizon = sample_next_frame_window(
                     motion=motion,
                     lengths=lengths,
                     curr_horizon=curriculum_state["current_horizon"],
@@ -853,6 +838,7 @@ def train(
                     contexts = encoder(hist, text_for_encoder)  # (B, 22, D)
 
                     # Flow matching target
+                    target_frame = target_frames[:, 0]  # (B, 271)
                     clean_targets = extract_clean_target(target_frame)  # (B, 72)
                     prev_frame = hist[:, -1]
                     prev_features = extract_prev_frame_features(prev_frame)
