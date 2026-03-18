@@ -274,14 +274,18 @@ def setup_curriculum_state(
 
     if checkpoint_state and "current_horizon" in checkpoint_state:
         current_horizon = checkpoint_state["current_horizon"]
+        max_horizon = checkpoint_state["max_horizon"]
     elif use_curriculum and curriculum:
         current_horizon = curriculum[0]["horizon"]
+        max_horizon = curriculum[-1]["horizon"]
     else:
         current_horizon = horizon
+        max_horizon = horizon
 
     return {
         "use_curriculum": use_curriculum,
         "current_horizon": current_horizon,
+        "max_horizon": max_horizon,
     }
 
 
@@ -789,9 +793,11 @@ def train(
             # Curriculum horizon update
             prev_horizon = curriculum_state["current_horizon"]
             if curriculum_state["use_curriculum"] and config.curriculum:
-                for level in config.curriculum:
-                    if epoch >= level["epochs"]:
+                for level in reversed(config.curriculum):
+                    if epoch <= level["epochs"]:
                         curriculum_state["current_horizon"] = level["horizon"]
+                    else:
+                        break
                 if curriculum_state["current_horizon"] != prev_horizon:
                     tqdm.write(
                         "Curriculum update: "
