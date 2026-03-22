@@ -46,29 +46,23 @@ from utils.motion_utils import (
 
 def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
     """
-    Extract 72D clean target from 271D frame.
+    Extract per-joint 3D track targets from 271D frame.
 
-    72D Output Format:
-    [0:9]  Root features: height(1) + velocity(2) + rotation_6d(6)
-    [9:72] Joint RIC positions: 21 joints x 3D = 63D
+    Output format: 22 RIC tracks x 3D = (22, 3)
 
     Args:
         frame: (..., 271) tensor with full 271D motion features
 
     Returns:
-        (..., 72) tensor with cleaned target features
+        (..., 22, 3) tensor with RIC joint tracks
     """
-    # Root features: height(1) + velocity(2) = [0:3]
-    root_height_vel = frame[..., :3]
-    # Root rotation: [69:75] = 6D
-    root_rot = frame[..., 69:75]
-    root_features = torch.cat([root_height_vel, root_rot], dim=-1)  # (..., 9)
+    return frame[..., 3:69].reshape(*frame.shape[:-1], 22, 3)
 
-    # Joint RIC: 21 joints x 3D = 63D
-    # From [3:69] = 66D (22 joints), we take [6:69] = 63D (21 joints, excluding root)
-    joint_features = frame[..., 6:69]  # (..., 63)
 
-    return torch.cat([root_features, joint_features], dim=-1)
+def compute_global_relative_shifts(tracks: torch.Tensor) -> torch.Tensor:
+    """Compute global relative shifts to root track in 3D track space."""
+    root_track = tracks[:, :1, :]
+    return tracks - root_track
 
 
 # =============================================================================
@@ -702,53 +696,38 @@ def validate(
                 pass
 
             contexts = encoder(hist, text_for_encoder)  # (B, 22, D)
-            prev_frame = hist[:, -1]
-            prev_features = extract_prev_frame_features(prev_frame)
-
             # Flow matching target
             target_frame = target_frames[:, 0]  # (B, 271)
-            clean_targets = extract_clean_target(target_frame)  # (B, 72)
+            clean_targets = extract_clean_target(target_frame)  # (B, 22, 3)
 
-            x1_h = clean_targets[..., 0:1]
-            x1_vel = clean_targets[..., 1:3]
-            x1_rot = clean_targets[..., 3:9]
-            x1_joints = clean_targets[..., 9:]
-
-            x0_h = torch.randn_like(x1_h)
-            x0_joints = torch.randn_like(x1_joints)
+            x1 = clean_targets
+            x0 = torch.randn_like(x1)
 
             t = torch.rand(B, device=device)
-            t_ = t.view(B, 1)
+            t_ = t.view(B, 1, 1)
 
-            xt_h = t_ * x1_h + (1 - t_) * x0_h
-            xt_joints = t_ * x1_joints + (1 - t_) * x0_joints
-            xt = torch.cat([xt_h, xt_joints], dim=-1)
-
-            pred = predictor(
-                history_features=contexts,
-                noise_level=t,
-                noisy_target=xt,
-                prev_frame_features=prev_features,
+            xt = t_ * x1 + (1 - t_) * x0
+            relative_shifts = compute_global_relative_shifts(xt)
+            global_cond = torch.zeros(
+                (B, predictor.output_projection.in_features),
+                device=device,
+                dtype=contexts.dtype,
             )
 
-            pred_v_h = pred[..., 0:1]
-            pred_vel = pred[..., 1:3]
-            pred_rot = pred[..., 3:9]
-            pred_v_joints = pred[..., 9:]
-            pred_v_pos = torch.cat([pred_v_h, pred_v_joints], dim=-1)
+            output = predictor.forward(
+                track_features=contexts,
+                noised_tracks=xt,
+                timesteps=t,
+                relative_shifts=relative_shifts,
+                global_cond=global_cond,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
 
-            target_v_h = x1_h - x0_h
-            target_v_joints = x1_joints - x0_joints
-            target_v_pos = torch.cat([target_v_h, target_v_joints], dim=-1)
-
-            L_flow = F.smooth_l1_loss(pred_v_pos, target_v_pos)
-            cos_sim = F.cosine_similarity(pred_rot, x1_rot, dim=-1)
-            L_dir = (1 - cos_sim).mean()
-
-            L_vel = F.mse_loss(pred_vel, x1_vel)
-            L_rot = F.smooth_l1_loss(pred_rot, x1_rot)
-
-            loss = 1.0 * L_flow + 0.5 * L_dir + 1.0 * L_vel + 1.0 * L_rot
+            # Unpack tuple: (flow_prediction, hidden_states, attentions)
+            pred, _, _ = output
+            target_v = x1 - x0
+            loss = F.mse_loss(pred, target_v)
 
             total_loss += loss.item() * B
             total_samples += B
@@ -883,53 +862,38 @@ def train(
                     # Encode history
                     contexts = encoder(hist, text_for_encoder)  # (B, 22, D)
 
-                    prev_frame = hist[:, -1]
-                    prev_features = extract_prev_frame_features(prev_frame)
-
                     # Flow matching target
                     target_frame = target_frames[:, 0]  # (B, 271)
-                    clean_targets = extract_clean_target(target_frame)  # (B, 72)
+                    clean_targets = extract_clean_target(target_frame)  # (B, 22, 3)
 
-                    x1_h = clean_targets[..., 0:1]
-                    x1_vel = clean_targets[..., 1:3]
-                    x1_rot = clean_targets[..., 3:9]
-                    x1_joints = clean_targets[..., 9:]
-
-                    x0_h = torch.randn_like(x1_h)
-                    x0_joints = torch.randn_like(x1_joints)
+                    x1 = clean_targets
+                    x0 = torch.randn_like(x1)
 
                     t = torch.rand(B, device=device)
-                    t_ = t.view(B, 1)
+                    t_ = t.view(B, 1, 1)
 
-                    xt_h = t_ * x1_h + (1 - t_) * x0_h
-                    xt_joints = t_ * x1_joints + (1 - t_) * x0_joints
-                    xt = torch.cat([xt_h, xt_joints], dim=-1)
-
-                    pred = predictor(
-                        history_features=contexts,
-                        noise_level=t,
-                        noisy_target=xt,
-                        prev_frame_features=prev_features,
+                    xt = t_ * x1 + (1 - t_) * x0
+                    relative_shifts = compute_global_relative_shifts(xt)
+                    global_cond = torch.zeros(
+                        (B, predictor.output_projection.in_features),
+                        device=device,
+                        dtype=contexts.dtype,
                     )
 
-                    pred_v_h = pred[..., 0:1]
-                    pred_vel = pred[..., 1:3]
-                    pred_rot = pred[..., 3:9]
-                    pred_v_joints = pred[..., 9:]
-                    pred_v_pos = torch.cat([pred_v_h, pred_v_joints], dim=-1)
+                    output = predictor.forward(
+                        track_features=contexts,
+                        noised_tracks=xt,
+                        timesteps=t,
+                        relative_shifts=relative_shifts,
+                        global_cond=global_cond,
+                        output_attentions=False,
+                        output_hidden_states=False,
+                    )
 
-                    target_v_h = x1_h - x0_h
-                    target_v_joints = x1_joints - x0_joints
-                    target_v_pos = torch.cat([target_v_h, target_v_joints], dim=-1)
-
-                    L_flow = F.mse_loss(pred_v_pos, target_v_pos)
-                    cos_sim = F.cosine_similarity(pred_rot, x1_rot, dim=-1)
-                    L_dir = (1 - cos_sim).mean()
-
-                    L_vel = F.smooth_l1_loss(pred_vel, x1_vel)
-                    L_rot = F.smooth_l1_loss(pred_rot, x1_rot)
-
-                    loss = 1.0 * L_flow + 0.5 * L_dir + 1.0 * L_vel + 1.0 * L_rot
+                    # Unpack tuple: (flow_prediction, hidden_states, attentions)
+                    pred, _, _ = output
+                    target_v = x1 - x0
+                    loss = F.mse_loss(pred, target_v)
 
                 scaler.scale(loss).backward()
 
@@ -967,10 +931,7 @@ def train(
                     effective_horizon=effective_horizon,
                     num_pred_frames=1,
                     loss_components={
-                        "L_flow": L_flow.item(),
-                        "L_dir": L_dir.item(),
-                        "L_vel": L_vel.item(),
-                        "L_rot": L_rot.item(),
+                        "L_flow": loss.item(),
                     },
                     global_step=training_state["global_step"],
                 )

@@ -275,42 +275,41 @@ def step(
 #### Signature
 
 ```
-(context: Bx22x64, t: B, x_t: Bx72, progress) → v: Bx72
+(noised_tracks: Bx22xD, timesteps: B, global_cond: BxH,
+ track_features: Bx22xF, relative_shifts: Bx22xD|None)
+    -> (flow_prediction: Bx22xD, hidden_states|None, attentions|None)
 ```
 
 #### Inputs
 
-| Tensor              | Shape                    | Description                                |
-| :------------------ | :----------------------- | :----------------------------------------- |
-| `history_features`  | `(B, 22, per_joint_dim)` | Context from MotionHistoryEncoder          |
-| `noise_level`       | `(B,)`                   | Flow time t in [0,1]                       |
-| `noisy_target`      | `(B, 72)`                | Current noisy state x_t (normalized space) |
-| `temporal_progress` | `(B,)`                   | Optional normalized frame progress         |
+| Tensor            | Shape                  | Description                                              |
+| :---------------- | :--------------------- | :------------------------------------------------------- |
+| `noised_tracks`   | `(B, 22, D)`           | Current noisy track-space state in ODE integration       |
+| `timesteps`       | `(B,)` or `(B,1)`      | Flow time $t \in [0,1]$                                  |
+| `global_cond`     | `(B, H)`               | Global conditioning vector combined with time embedding  |
+| `track_features`  | `(B, 22, F)`           | Per-track context features from `MotionHistoryEncoder`   |
+| `relative_shifts` | `(B, 22, D)` or `None` | Optional precomputed relative shifts (used when enabled) |
 
-#### noisy_target Layout (72D)
+#### Output
 
-| Index    | Content                                        | Dimension |
-| :------- | :--------------------------------------------- | :-------- |
-| `[0:9]`  | Root: height(1) + velocity(2) + rotation_6d(6) | 9D        |
-| `[9:72]` | Joint RIC positions: 21 joints × 3D            | 63D       |
+| Tensor            | Shape                    | Description                                                      |
+| :---------------- | :----------------------- | :--------------------------------------------------------------- |
+| `flow_prediction` | `(B, 22, D)`             | Predicted flow field of clean next relative shift in track space |
+| `hidden_states`   | `Optional[List[Tensor]]` | Per-layer hidden states (when requested)                         |
+| `attentions`      | `Optional[List[Tensor]]` | Per-layer attention weights (when requested)                     |
 
-#### Output (72D)
+#### Prediction Goal
 
-| Index    | Content                                        | Dimension |
-| :------- | :--------------------------------------------- | :-------- |
-| `[0:9]`  | Root: height(1) + velocity(2) + rotation_6d(6) | 9D        |
-| `[9:72]` | Joint RIC: 21 × 3D                             | 63D       |
+The predictor is trained and used to model the flow field that transports noisy track-space states toward the clean next relative shift. During inference, ODE integration yields a clean next relative shift, which is then applied as displacement to current 22-track positions.
 
 #### Architecture
 
-1. History projection: `(B, 22, per_joint_dim)` → `(B, 22, model_dim)`
-2. Noisy target projection: `root(9D) + joints(63D)` → `(B, 22, model_dim)`
-3. Time embedding: sinusoidal → MLP → `(B, model_dim)`
-4. Kinematic bias: `KinematicChainEncoder` → `(22, model_dim)`
-5. Combine: `history + noisy + time + kinematic` → `(B, 22, model_dim)`
-6. Spatial Transformer: 2-4 layers of transformer encoder
-7. Output heads: `root_head → (B, 9)`, `joint_head → (B, 21, 3)`
-8. Concatenate: `(B, 72)`
+1. Concatenate `noised_tracks`, `track_features`, and optionally `relative_shifts`.
+2. Project concatenated per-track features to predictor hidden size.
+3. Embed `timesteps` with `SinusoidalEmbedder` and combine with `global_cond` for AdaLN conditioning.
+4. Process with stacked `SpatialTrackLayer` blocks (MHA + gated MLP, AdaLN-modulated, no attention masking).
+5. Apply output LayerNorm + output AdaLN modulation.
+6. Project to `out_channels` to produce `(B, 22, D)` flow prediction.
 
 ---
 
@@ -356,8 +355,8 @@ def step(
 #### Features
 
 - Integrates MotionHistoryEncoder and FlowMatchingPredictor
-- No longer uses `prev_frame_features` (removed from FlowMatchingPredictor)
-- Classifier-free guidance: `v = v_uncond + scale * (v_cond - v_uncond)`
+- Uses track-space ODE state `x_t` with shape `(B, 22, D)`
+- Uses relative-shift conditioning (`relative_shifts = x_t - x_t[:, :1, :]`) when enabled
 - Input text: `str`, `List[str]`, or pre-encoded tensor `(B, 1, 512)` from CLIPEncoder
 - `input_features`: Optional, shape `(B, N, 271)` or `(B, 271)` — initial motion history
 - `load_from_checkpoint`: Uses `config.max_text_seq_len` (not hardcoded 77)
@@ -388,12 +387,14 @@ Both grow with each generated frame using `flow_output_to_271d` and `RootPositio
 
 1. Extract `last_frame` from `feature_history (B, 271)`
 2. Get `prev_root_pos` from `RootPositionTracker.get()`
-3. Encode context from FULL `feature_history` with CFG (cond and uncond)
-4. Flow matching ODE loop → `flow_output (B, 72)`
-5. `flow_output_to_271d(flow_output, prev_frame, prev_root_pos)` → `(new_frame, new_root_pos)`
-6. `RootPositionTracker.update(new_frame)` → update root position
-7. Append `new_frame` to `feature_history`
-8. Final: Convert `feature_history` to positions via `features_to_positions`
+3. Encode context from `feature_history` to `context_cond (B, 22, per_joint_dim)`
+4. Initialize `x_t ~ N(0, I)` in track space `(B, 22, D)`
+5. ODE loop: predict `pred = predictor(...)[0]`, update `x_t = x_t + pred * dt`
+6. Interpret integrated `x_t` as clean next relative shift and apply displacement in track space
+7. Convert through current bridge to `flow_output_to_271d(...)` → `(new_frame, new_root_pos)`
+8. `RootPositionTracker.update(new_frame)` → update root position
+9. Append `new_frame` to `feature_history`
+10. Final: Convert `feature_history` to positions via `features_to_positions`
 
 ---
 
@@ -443,29 +444,30 @@ Both grow with each generated frame using `flow_output_to_271d` and `RootPositio
 ### Flow Matching
 
 ```
-x_t = t * clean + (1-t) * noise
-predict v = clean - noise
-loss = MSE(v_pred, v_target)
-```
-
-### Classifier-Free Guidance (CFG)
-
-```
-v = v_uncond + scale * (v_cond - v_uncond)
-x_t += v * dt
+x_t in R^(B x 22 x D)
+predict flow f_theta(x_t, t, cond) for clean next relative shift
+x_t <- x_t + f_theta(x_t, t, cond) * dt
+after integration: Delta_rel_next_clean = x_t
+next_tracks = current_tracks + Delta_rel_next_clean
 ```
 
 ### Inference (Canonical Round-trip)
 
 ```
-Initialize: history = input_features[:,-1:] or null_history
+Initialize: feature_history = input_features or zero cold-start frame
 
 Per frame:
-  1. last_frame → features_to_positions → prev_positions
-  2. CFG loop N steps → flow_output (72D)
-  3. flow_output_to_positions → new_positions
-  4. stack(prev_positions, new_positions) → sequence_joints_to_features → extract frame 1 → new_frame_271d
-  5. history = new_frame_271d.unsqueeze(1)
+    1. last_frame + text -> context_cond (B,22,F)
+    2. x_t = randn(B,22,D)
+    3. repeat N ODE steps:
+             relative_shifts = x_t - x_t[:, :1, :]
+             pred = predictor(noised_tracks=x_t, timesteps=t,
+                                                global_cond=zeros(B,H),
+                                                track_features=context_cond,
+                                                relative_shifts=relative_shifts)[0]
+             x_t = x_t + pred * dt
+    4. interpret x_t as clean next relative shift; displace current tracks
+    5. convert to 271D via flow_output_to_271d bridge and append to history
 ```
 
 ---
@@ -496,14 +498,14 @@ Per frame:
 #### Teacher Forcing Training (Primary)
 
 1. CFG dropout: `text_input = text if rand() > cfg_dropout else None`
-2. Encode context: `contexts = encoder(text=text_input, input_features=hist, normalize=False)`
-3. Extract prediction contexts: `pred_contexts = contexts[:, -num_pred_frames:]`
-4. Flatten for predictor: `contexts_flat(B*N, 22, D)`, `prev_flat(B*N, 271)`, `targets_flat(B*N, 271)`
-5. Extract features: `prev_features = extract_prev_frame_features(prev_flat)` → `(B*N, 261)`
-6. Extract clean targets: `clean_targets = extract_clean_target(targets_flat)` → `(B*N, 72)`
-7. Flow matching: sample `t ~ U(0,1)`, create `x_t = t*clean + (1-t)*noise`
-8. Predict: `pred = predictor(contexts_flat, t, x_t, prev_features, normalize=False)`
-9. Loss: `loss_tf = MSE(pred, clean_targets - noise)`
+2. Encode per-track context from history using `MotionHistoryEncoder`
+3. Build clean next relative-shift target `Delta_rel_next_clean (B*N, 22, D)`
+4. Sample flow time `t ~ U(0,1)` and noise `eps ~ N(0,I)` in track space
+5. Construct noisy state: `x_t = t * Delta_rel_next_clean + (1 - t) * eps`
+6. Compute `relative_shifts = x_t - x_t[:, :1, :]` (if enabled)
+7. Predict flow: `pred = predictor(noised_tracks=x_t, timesteps=t, global_cond, track_features=contexts_flat, relative_shifts=relative_shifts)[0]`
+8. Target flow: `v_target = Delta_rel_next_clean - eps`
+9. Loss: `loss_tf = MSE(pred, v_target)`
 
 #### Rollout Training (Commented Out)
 
@@ -518,21 +520,16 @@ Per frame:
 - Gradient clipping: `clip_grad_norm_(params, max_grad_norm)`
 - EMA update every step: `encoder_ema.update(encoder)`, `predictor_ema.update(predictor)`
 
-### Feature Extraction Helpers
+### Track-Space Target Construction
 
-#### `extract_prev_frame_features(frame: Bx271) → (B, 261)`
+| Tensor                 | Shape          | Description                                               |
+| :--------------------- | :------------- | :-------------------------------------------------------- |
+| `Delta_rel_next_clean` | `(B*N, 22, D)` | Clean next relative shift target for flow matching        |
+| `eps`                  | `(B*N, 22, D)` | Gaussian noise used for interpolation target construction |
+| `x_t`                  | `(B*N, 22, D)` | Noisy interpolated state at flow time `t`                 |
+| `v_target`             | `(B*N, 22, D)` | Supervision target `Delta_rel_next_clean - eps`           |
 
-| Index     | Content                              | Dimension |
-| :-------- | :----------------------------------- | :-------- |
-| `[0:9]`   | Root: height(1) + vel(2) + rot_6d(6) | 9D        |
-| `[9:261]` | Joints: 21 × 12D (RIC + rot + vel)   | 252D      |
-
-#### `extract_clean_target(frame: Bx271) → (B, 72)`
-
-| Index    | Content                              | Dimension |
-| :------- | :----------------------------------- | :-------- |
-| `[0:9]`  | Root: height(1) + vel(2) + rot_6d(6) | 9D        |
-| `[9:72]` | Joint RIC: 21 × 3D                   | 63D       |
+Note: Legacy 72D/261D extraction paths may remain in compatibility code during migration, but the predictor objective is now defined in track space.
 
 ### EMA Model Management
 
@@ -592,15 +589,15 @@ visualization ← motion_utils
 
 *Update test files on code interface change; remove previous redundant tests if new test is written*
 
-| Test File                                                              | Purpose                                                                         |
-| :--------------------------------------------------------------------- | :------------------------------------------------------------------------------ |
-| [`tests/test_training_loop.py`](tests/test_training_loop.py)           | Training loop and HumanMotionGenerator verification (8 tests)                   |
-| [`tests/test_rotation_roundtrip.py`](tests/test_rotation_roundtrip.py) | Rotation roundtrip verification for flow_output_to_271d                         |
-| [`tests/test_flow_predictor.py`](tests/test_flow_predictor.py)         | FlowMatchingPredictor unit tests (I/O shapes: 72D noisy, 261D prev, 72D output) |
-| [`tests/test_motion_encoder.py`](tests/test_motion_encoder.py)         | MotionHistoryEncoder unit tests                                                 |
-| [`tests/test_nan_fix.py`](tests/test_nan_fix.py)                       | HumanMotionGenerator.generate_sequence() NaN fix verification                   |
-| [`tests/test_nan_debug.py`](tests/test_nan_debug.py)                   | Debug test for tracing NaN propagation                                          |
-| [`tests/test_pose_validation.py`](tests/test_pose_validation.py)       | Pose validation unit tests                                                      |
+| Test File                                                              | Purpose                                                                                                         |
+| :--------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------- |
+| [`tests/test_training_loop.py`](tests/test_training_loop.py)           | Training loop and HumanMotionGenerator verification (8 tests)                                                   |
+| [`tests/test_rotation_roundtrip.py`](tests/test_rotation_roundtrip.py) | Rotation roundtrip verification for flow_output_to_271d                                                         |
+| [`tests/test_flow_predictor.py`](tests/test_flow_predictor.py)         | FlowMatchingPredictor unit tests (I/O shapes: `(B,22,D)` noised tracks + per-track features -> `(B,22,D)` flow) |
+| [`tests/test_motion_encoder.py`](tests/test_motion_encoder.py)         | MotionHistoryEncoder unit tests                                                                                 |
+| [`tests/test_nan_fix.py`](tests/test_nan_fix.py)                       | HumanMotionGenerator.generate_sequence() NaN fix verification                                                   |
+| [`tests/test_nan_debug.py`](tests/test_nan_debug.py)                   | Debug test for tracing NaN propagation                                                                          |
+| [`tests/test_pose_validation.py`](tests/test_pose_validation.py)       | Pose validation unit tests                                                                                      |
 
 ---
 

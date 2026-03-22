@@ -12,7 +12,7 @@ sys.path.insert(0, "src")
 import torch
 import numpy as np
 from pathlib import Path
-from config import Config
+from config import Config, FlowMatchingPredictorConfig
 from models import MotionHistoryEncoder, FlowMatchingPredictor, HumanMotionGenerator
 from utils.motion_utils import FeatureNormalizer
 
@@ -43,14 +43,18 @@ def create_generator():
         normalizer=normalizer,
     )
 
+    # Initialize FlowMatchingPredictorConfig with new API
+    pred_config = FlowMatchingPredictorConfig()
+    pred_config.hidden_size = 256
+    pred_config.intermediate_size = 512
+    pred_config.num_hidden_layers = 2
+    pred_config.num_attention_heads = 4
+    pred_config.track_dimensionality = 3
+
     predictor = FlowMatchingPredictor(
-        per_joint_dim=64,
-        model_dim=128,
-        num_layers=2,
-        joint_count=22,
-        time_embed_dim=64,
-        dropout=0.1,
-        normalizer=normalizer,
+        feature_size=64,  # per_joint_out_dim from encoder
+        config=pred_config,
+        use_relative_shift=True,
     )
 
     generator = HumanMotionGenerator(encoder, predictor)

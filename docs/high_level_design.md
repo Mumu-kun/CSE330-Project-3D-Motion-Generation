@@ -6,8 +6,8 @@ This project focuses on generating high-quality 3D human motion sequences from t
 
 The generation process follows a "Conditioned Denoising" paradigm:
 1. **Context Construction**: Past motion history and text prompts are encoded into a rich latent representation using a spatiotemporal transformer.
-2. **Denoising Prediction**: A spatial transformer predicts the velocity field required to transport noisy samples toward the realistic data manifold.
-3. **Iterative Refinement**: This prediction is repeated over several steps (ODE integration) to reconstruct a clean motion frame.
+2. **Relative-Shift Flow Prediction**: A spatial transformer predicts the flow field of the clean next relative shift in joint-track space.
+3. **Iterative Refinement**: The predicted flow is integrated over ODE steps to obtain a clean next relative shift, then applied as displacement on the current 22 track positions.
 
 ---
 
@@ -90,115 +90,77 @@ Output: history_features(B, 22, per_joint_dim), h_next(L, B, H)
 
 ### B. Flow Matching Predictor (Spatial Transformer)
 
-The core generation engine that predicts velocity fields in joint space.
+The core generation engine that predicts velocity fields in track space for the next relative shift.
 
 #### Forward Pass Data Pipeline
 
 ```
-Input: history_features(B,22,64), noise_level(B,), 
-       noisy_target(B,72), prev_frame_features(B,261)
+Input: noised_tracks(B,22,D), timesteps(B,),
+             global_cond(B,H), track_features(B,22,F),
+             relative_shifts(B,22,D optional)
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  1. NORMALIZATION (if inference mode)                       │
-│     if normalizer exists and normalize=True:                │
-│         prev_frame_features = normalizer.normalize_prev_frame│
+│  1. FEATURE CONCATENATION                                   │
+│     x_in = cat([noised_tracks, track_features,              │
+│                 relative_shifts if enabled], dim=-1)        │
+│                                    # (B,22,input_dim)       │
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  2. PREV FRAME SPLIT                                        │
-│     if prev_frame_features is None:                         │
-│         prev_root = null_prev_root.expand(B, 9)             │
-│         prev_joints = null_prev_joint.expand(B, 21, 12)     │
-│     else:                                                   │
-│         prev_root = prev_frame_features[:, :9]    # (B,9)   │
-│         prev_joints = prev_frame_features[:, 9:]  # (B,252) │
-│         prev_joints = prev_joints.reshape(B, 21, 12)        │
+│  2. INPUT PROJECTION                                        │
+│     hidden = Linear(input_dim -> hidden_size)(x_in)         │
+│                                    # (B,22,H)               │
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  3. HISTORY PROJECTION                                      │
-│     history_proj = input_proj_history(history_features)     │
-│                                    # (B, 22, model_dim)     │
+│  3. TIME + GLOBAL CONDITIONING                              │
+│     t_emb = SinusoidalEmbedder(timesteps)   # (B,H)         │
+│     adaln_cond = t_emb + global_cond        # (B,H)         │
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  4. PREV FRAME PROJECTION                                   │
-│     prev_root_proj = proj_root(prev_root).unsqueeze(1)      │
-│                                    # (B, 1, model_dim)      │
-│     prev_joint_proj = proj_joint(prev_joints)               │
-│                                    # (B, 21, model_dim)     │
-│     prev_proj = cat([prev_root_proj, prev_joint_proj], dim=1)│
-│                                    # (B, 22, model_dim)     │
+│  4. SPATIAL TRACK TRANSFORMER STACK                         │
+│     Repeat N layers:                                         │
+│       - LayerNorm + AdaLN modulation                         │
+│       - MultiheadAttention over 22 tracks (no masking)       │
+│       - gated residual                                        │
+│       - LayerNorm + AdaLN + gated MLP residual               │
+│     hidden = SpatialTrackLayers(hidden, adaln_cond)          │
 └─────────────────────────────────────────────────────────────┘
                     │
                     ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  5. CONDITION COMBINATION                                   │
-│     cond_proj = history_proj + prev_proj  # (B,22,model_dim)│
-│     # Element-wise addition: history context + prev state   │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  6. NOISY TARGET PROJECTION                                 │
-│     if noisy_target is None:                                │
-│         noisy_target = randn(B, 72)                         │
-│     noisy_root = noisy_target[:, :9]           # (B, 9)     │
-│     noisy_joints = noisy_target[:, 9:].reshape(B, 21, 3)    │
-│     noisy_root_proj = proj_noisy_root(noisy_root).unsqueeze(1)│
-│     noisy_joint_proj = proj_noisy_joint(noisy_joints)       │
-│     noisy_proj = cat([noisy_root_proj, noisy_joint_proj], dim=1)│
-│                                    # (B, 22, model_dim)     │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  7. COMBINE CONDITION + NOISY                               │
-│     x = cond_proj + noisy_proj  # (B, 22, model_dim)        │
-│     # Element-wise addition of condition and noisy state    │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  8. TIME EMBEDDING                                          │
-│     t_emb = sinusoidal_time_embedding(noise_level)          │
-│                                    # (B, time_embed_dim)    │
-│     t_bias = time_mlp(t_emb)       # (B, model_dim)         │
-│     x = x + t_bias.unsqueeze(1)    # Add to all joints      │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  9. KINEMATIC BIAS                                          │
-│     joint_ids = arange(22)                                  │
-│     kinematic_bias = kinematic_encoder(joint_ids) # (22,D)  │
-│     x = x + kinematic_bias.unsqueeze(0) # Broadcast to batch│
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  10. SPATIAL TRANSFORMER (3 layers)                         │
-│      x = spatial_transformer(x)   # (B, 22, model_dim)      │
-│      # Bidirectional attention over 22 joints               │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  11. OUTPUT HEADS                                           │
-│      root_token = x[:, 0:1, :]        # (B, 1, model_dim)   │
-│      joint_tokens = x[:, 1:, :]       # (B, 21, model_dim)  │
-│      root_out = root_head(root_token) # (B, 1, 9)           │
-│      joint_out = joint_head(joint_tokens) # (B, 21, 3)      │
-│      pred_frame = cat([root_out.squeeze(1),                 │
-│                        joint_out.reshape(B, -1)], dim=-1)   │
-│                                    # (B, 72)                │
+│  5. OUTPUT PROJECTION                                       │
+│     hidden = LayerNorm(hidden)                              │
+│     (shift, scale) = AdaLN(adaln_cond).chunk(2)             │
+│     hidden = hidden * (1 + scale) + shift                   │
+│     flow = Linear(H -> D)(hidden)                           │
+│                                    # (B,22,D)               │
 └─────────────────────────────────────────────────────────────┘
 
-Output: pred_frame(B, 72) - predicted velocity field
+Output: flow(B,22,D) - predicted flow field in track space
+
+#### Prediction Goal
+
+For each frame, the model predicts the flow field of the clean next relative shift in 22-track space.
+
+```
+Given: current tracks P_curr in R^(B x 22 x D)
+Initialize: x_t ~ N(0, I) in R^(B x 22 x D)
+
+ODE integration:
+    x_t <- x_t + f_theta(x_t, t, context) * dt
+
+After N steps:
+    Delta_rel_next_clean = x_t
+
+Displacement update:
+    P_next = P_curr + Delta_rel_next_clean
+```
 ```
 
 ---
@@ -243,52 +205,42 @@ Input: text, num_frames, num_steps, guidance_scale, input_features
 │                    │                                        │
 │                    ▼                                        │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  3b. ENCODE CONTEXT (CFG)                             │  │
-│  │      context_cond = encoder(text, feature_history,    │  │
-│  │                            normalize=True)[:, -1, :, :]│  │
-│  │                         # (B, 22, 64)                 │  │
-│  │      context_uncond = encoder(None, feature_history,  │  │
-│  │                              normalize=True)[:, -1,:,:]│  │
-│  │                         # (B, 22, 64)                 │  │
+│  │  3b. ENCODE CONTEXT                                   │  │
+│  │      context = encoder(encoder_input, text_emb)       │  │
+│  │                         # (B, 22, per_joint_dim)      │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                    │                                        │
 │                    ▼                                        │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  3c. EXTRACT PREV FRAME FEATURES                      │  │
-│  │      prev_frame_features = extract_prev_frame_features│  │
-│  │                              (last_frame)  # (B, 261)  │  │
+│  │  3c. TRACK-SPACE ODE INITIALIZATION                   │  │
+│  │      x_t = randn(B, 22, D)                            │  │
+│  │      dt = 1.0 / num_steps                             │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                    │                                        │
 │                    ▼                                        │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  3d. FLOW MATCHING ODE LOOP                           │  │
-│  │      x_t = randn(B, 72)                               │  │
-│  │      dt = 1.0 / num_steps                             │  │
 │  │      for step in range(num_steps):                    │  │
 │  │          t = full((B,), step * dt)                    │  │
-│  │          v_cond = predictor(context_cond, t, x_t,     │  │
-│  │                              prev_frame_features,     │  │
-│  │                              normalize=True)          │  │
-│  │          v_uncond = predictor(context_uncond, t, x_t, │  │
-│  │                                prev_frame_features,   │  │
-│  │                                normalize=True)        │  │
-│  │          v_t = v_uncond + guidance_scale*(v_cond-v_uncond)│
-│  │          x_t = x_t + v_t * dt                         │  │
+│  │          rel = x_t - x_t[:, :1, :]                    │  │
+│  │          g = zeros(B, H)                              │  │
+│  │          pred = predictor(x_t, t, g, context, rel)[0] │  │
+│  │          x_t = x_t + pred * dt                        │  │
 │  └───────────────────────────────────────────────────────┘  │
 │                    │                                        │
 │                    ▼                                        │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  3e. DENORMALIZE OUTPUT                               │  │
-│  │      if normalizer:                                   │  │
-│  │          x_t = normalizer.denormalize_flow_output(x_t)│  │
+│  │  3e. INTERPRET ODE RESULT                             │  │
+│  │      clean_next_relative_shift = x_t                  │  │
+│  │      next_track_positions = current_positions         │  │
+│  │                             + clean_next_relative_shift│  │
 │  └───────────────────────────────────────────────────────┘  │
 │                    │                                        │
 │                    ▼                                        │
 │  ┌───────────────────────────────────────────────────────┐  │
-│  │  3f. CONVERT 72D → 271D                               │  │
-│  │      new_frame, new_root_pos = flow_output_to_271d(   │  │
-│  │          x_t, last_frame, prev_root_pos)              │  │
-│  │      # new_frame: (B, 271), new_root_pos: (B, 3)      │  │
+│  │  3f. CONVERT TO 271D FEATURE FRAME                     │  │
+│  │      Pack/convert and call flow_output_to_271d(...)    │  │
+│  │      to produce new_frame (B,271) and new_root_pos(B,3)│  │
 │  └───────────────────────────────────────────────────────┘  │
 │                    │                                        │
 │                    ▼                                        │
@@ -326,14 +278,23 @@ Output: position_history(B, N+num_frames, 22, 3)
 | `[201:267]` | Local Velocities | 22 joints × 3D velocities              |
 | `[267:271]` | Foot Contacts    | 4 binary contact flags                 |
 
-### Flow Matching Target (72D)
+### Flow Matching Target (72D, Legacy Bridge Format)
 
 | Index Range | Feature Type  | Description                              |
 | :---------- | :------------ | :--------------------------------------- |
 | `[0:9]`     | Root Features | Height(1) + Velocity(2) + Rotation_6d(6) |
 | `[9:72]`    | Joint RIC     | 21 joints × 3D RIC positions             |
 
-### Previous Frame Features (261D)
+### Track-Space Flow State (Current Predictor Interface)
+
+| Tensor            | Shape        | Description                                                   |
+| :---------------- | :----------- | :------------------------------------------------------------ |
+| `noised_tracks`   | `(B, 22, D)` | Current noisy track-space state used in ODE integration       |
+| `track_features`  | `(B, 22, F)` | Per-track conditional context from MotionHistoryEncoder       |
+| `relative_shifts` | `(B, 22, D)` | Relative offsets, typically computed as `x_t - x_t[:, :1, :]` |
+| `flow_prediction` | `(B, 22, D)` | Predicted flow field for clean next relative shift            |
+
+### Previous Frame Features (261D, Legacy Representation)
 
 | Index Range | Feature Type   | Description                              |
 | :---------- | :------------- | :--------------------------------------- |
@@ -377,15 +338,17 @@ graph TD
     CLIP --> Encoder
     Encoder --> Context[Context Vectors Bx22x64]
     
-    Noise[Gaussian Noise 72D] --> Predictor[FlowMatchingPredictor]
+    Noise[Gaussian Noise Bx22xD] --> Predictor[FlowMatchingPredictor]
     Context --> Predictor
-    PrevFrame[Previous Frame 261D] --> Predictor
+    Rel[Relative Shifts Bx22xD] --> Predictor
     Time[Flow Time t] --> Predictor
+    Global[Global Cond BxH] --> Predictor
     
-    Predictor --> Velocity[Velocity Field 72D]
-    Velocity --> Euler[Euler ODE Step]
-    Euler --> CleanFrame[Clean Frame 72D]
-    CleanFrame --> Convert[flow_output_to_271d]
+    Predictor --> Flow[Flow Field Bx22xD]
+    Flow --> Euler[Euler ODE Step]
+    Euler --> CleanShift[Clean Next Relative Shift Bx22xD]
+    CleanShift --> Displace[Displace Current 22 Tracks]
+    Displace --> Convert[Bridge + flow_output_to_271d]
     Convert --> NewFrame[New Frame 271D]
 ```
 
@@ -407,9 +370,10 @@ sequenceDiagram
         History->>MHE: Feature history
         MHE->>FMP: Context vectors
         loop N ODE steps
-            FMP->>ODE: Predict velocity
+            FMP->>ODE: Predict relative-shift flow field
             ODE->>FMP: Updated x_t
         end
+        ODE->>History: Apply clean next relative shift as displacement
         ODE->>History: Append new frame
     end
 ```

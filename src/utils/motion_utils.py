@@ -880,6 +880,133 @@ def flow_output_to_271d(
     return new_frame, new_root_pos
 
 
+def generated_positions_to_271d(
+    new_positions: torch.Tensor,  # (B, 22, 3) absolute global positions
+    prev_positions: Optional[
+        torch.Tensor
+    ] = None,  # (B, 22, 3) previous global positions
+    dataset_type: str = "t2m",
+    feet_thre: float = 0.002,
+    use_fk_for_ric: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute a single 271D feature frame from newly generated global joint positions.
+
+    This is the inverse of frame-wise reconstruction and is intended for autoregressive
+    generation loops where one new frame is produced at a time.
+
+    Feature layout:
+      [0:3]    root height Y (absolute), root velocity X, root velocity Z
+      [3:69]   22 RIC positions
+      [69:201] 22 6D rotations
+      [201:267]22 local velocities (root-local)
+      [267:271]foot contacts
+
+        Previous-frame context is provided via prev_positions.
+
+    If no previous context is given, this behaves like cold-start extraction:
+    root velocities, local velocities, and foot contacts are set to zeros.
+
+    Args:
+        new_positions: (B, 22, 3) generated global joint positions for current frame.
+        prev_positions: (B, 22, 3) previous absolute global positions.
+        dataset_type: Dataset key (default "t2m").
+        feet_thre: Foot contact threshold.
+        use_fk_for_ric: If True, compute RIC from FK-consistent positions.
+
+    Returns:
+        new_frame: (B, 271) extracted feature frame.
+        new_root_pos: (B, 3) absolute current root position.
+    """
+    if new_positions.ndim != 3 or new_positions.shape[-2:] != (22, 3):
+        raise ValueError(
+            f"Expected new_positions shape (B, 22, 3), got {new_positions.shape}"
+        )
+
+    B = new_positions.shape[0]
+    device = new_positions.device
+    dtype = new_positions.dtype
+
+    cfg = get_dataset_config(dataset_type)
+    raw_offsets = cfg["raw_offsets"].to(device=device, dtype=dtype)
+    kinematic_chain = cfg["kinematic_chain"]
+    face_joint_indx = cfg["face_joint_indx"]
+    fid_l = cfg["fid_l"]
+    fid_r = cfg["fid_r"]
+
+    # Resolve previous absolute positions.
+    if prev_positions is not None:
+        if prev_positions.shape != (B, 22, 3):
+            raise ValueError(
+                f"Expected prev_positions shape {(B, 22, 3)}, got {prev_positions.shape}"
+            )
+        prev_positions_resolved = prev_positions.to(device=device, dtype=dtype)
+    else:
+        prev_positions_resolved = None
+
+    # 1) Root features: absolute Y and velocity-form X/Z.
+    new_root_pos = new_positions[:, 0].clone()  # (B, 3)
+    root_height_y = new_root_pos[:, 1:2]
+    if prev_positions_resolved is None:
+        root_vel_x = torch.zeros((B, 1), device=device, dtype=dtype)
+        root_vel_z = torch.zeros((B, 1), device=device, dtype=dtype)
+    else:
+        root_vel_x = new_root_pos[:, 0:1] - prev_positions_resolved[:, 0, 0:1]
+        root_vel_z = new_root_pos[:, 2:3] - prev_positions_resolved[:, 0, 2:3]
+    root_features = torch.cat([root_height_y, root_vel_x, root_vel_z], dim=-1)  # (B,3)
+
+    # 2) IK and 6D rotations.
+    quaternions = _compute_ik(
+        new_positions, raw_offsets, kinematic_chain, face_joint_indx
+    )
+    rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
+    root_quat = quaternions[:, 0]  # (B,4)
+
+    # 3) RIC positions from either FK-consistent or direct global positions.
+    if use_fk_for_ric:
+        fk_positions = _forward_kinematics(
+            rotations_6d, new_root_pos, raw_offsets, kinematic_chain
+        )
+        ric_source = fk_positions
+    else:
+        ric_source = new_positions
+
+    ric = ric_source - ric_source[:, 0:1]
+    ric = qrot(root_quat.unsqueeze(1).expand(-1, 22, -1), ric)  # (B,22,3)
+
+    # 4) Local velocities and foot contacts.
+    if prev_positions_resolved is None:
+        local_vel = torch.zeros((B, 22, 3), device=device, dtype=dtype)
+        feet_l = torch.zeros((B, 2), device=device, dtype=dtype)
+        feet_r = torch.zeros((B, 2), device=device, dtype=dtype)
+    else:
+        pos_delta = new_positions - prev_positions_resolved
+        local_vel = qrot(root_quat.unsqueeze(1).expand(-1, 22, -1), pos_delta)
+
+        vel_l = new_positions[:, fid_l] - prev_positions_resolved[:, fid_l]
+        vel_r = new_positions[:, fid_r] - prev_positions_resolved[:, fid_r]
+        feet_l = (torch.sum(vel_l**2, dim=-1) < feet_thre).float()
+        feet_r = (torch.sum(vel_r**2, dim=-1) < feet_thre).float()
+
+    foot_contacts = torch.cat([feet_l, feet_r], dim=-1)  # (B,4)
+
+    # 5) Final 271D assembly.
+    new_frame = torch.cat(
+        [
+            root_features,
+            ric.reshape(B, -1),
+            rotations_6d.reshape(B, -1),
+            local_vel.reshape(B, -1),
+            foot_contacts,
+        ],
+        dim=-1,
+    )
+
+    return new_frame.to(device=device, dtype=dtype), new_root_pos.to(
+        device=device, dtype=dtype
+    )
+
+
 class RootPositionTracker:
     """
     Tracks absolute root position (X, Y, Z) for velocity-form representation.
@@ -961,225 +1088,3 @@ class RootPositionTracker:
         new_y = root_height
 
         self.root_pos = torch.cat([new_x, new_y, new_z], dim=-1)
-
-
-class IncrementalFeatureExtractor:
-    """
-    Stateful incremental feature extractor for frame-by-frame generation.
-
-    Used during inference/motion generation when processing one frame at a time.
-    Uses FK-based extraction for predicted joints to maintain kinematic consistency.
-
-    Feature Layout (271D) - Updated per normalization plan:
-        [0:3]   Root height Y, Root velocity X, Root velocity Z
-        [3:69]  22 RIC positions
-        [69:201] 22 6D rotations
-        [201:267] 22 local velocities
-        [267:271] Foot contacts
-
-    Note: Root X,Z are stored as velocities for autoregressive stability.
-    """
-
-    def __init__(
-        self,
-        dataset_type: str = "t2m",
-        feet_thre: float = 0.002,
-        device: torch.device = torch.device("cpu"),
-        dtype: torch.dtype = torch.float32,
-    ):
-        """
-        Initialize the incremental feature extractor.
-
-        Args:
-            dataset_type: Dataset type ("t2m" for HumanML3D)
-            feet_thre: Foot contact threshold
-            device: Torch device
-            dtype: Torch dtype
-        """
-        config = get_dataset_config(dataset_type)
-        self.raw_offsets = config["raw_offsets"].to(device).to(dtype)
-        self.kinematic_chain = config["kinematic_chain"]
-        self.face_joint_indx = config["face_joint_indx"]
-        self.fid_r = config["fid_r"]
-        self.fid_l = config["fid_l"]
-        self.feet_thre = feet_thre
-        self.device = device
-        self.dtype = dtype
-
-        # State for incremental extraction
-        self.prev_positions: Optional[torch.Tensor] = None
-        self.is_initialized = False
-
-    def initialize(self, initial_positions: torch.Tensor) -> torch.Tensor:
-        """
-        Initialize extractor with initial frame positions.
-
-        Args:
-            initial_positions: (B, 22, 3) initial joint positions
-
-        Returns:
-            Zero features for first frame (B, 271)
-        """
-        initial_positions = initial_positions.to(self.device).to(self.dtype)
-        B = initial_positions.shape[0]
-
-        # Store state
-        self.prev_positions = initial_positions.clone()
-
-        # Compute IK for initial frame
-        quaternions = _compute_ik(
-            initial_positions,
-            self.raw_offsets,
-            self.kinematic_chain,
-            self.face_joint_indx,
-        )
-
-        # Compute FK for RIC consistency
-        rotations_6d = quaternion_to_cont6d(quaternions)
-        root_pos = initial_positions[:, 0]
-        fk_positions = _forward_kinematics(
-            rotations_6d, root_pos, self.raw_offsets, self.kinematic_chain
-        )
-
-        # Store FK positions for next frame's velocity computation
-        self.prev_fk_positions = fk_positions
-
-        self.is_initialized = True
-
-        # Return zero features for first frame
-        return torch.zeros(B, 271, device=self.device, dtype=self.dtype)
-
-    def process_frame(self, positions: torch.Tensor) -> torch.Tensor:
-        """
-        Process a single frame and extract 271D features.
-
-        Args:
-            positions: (B, 22, 3) joint positions for current frame
-
-        Returns:
-            features: (B, 271) feature vectors
-        """
-        positions = positions.to(self.device).to(self.dtype)
-
-        if not self.is_initialized:
-            return self.initialize(positions)
-
-        B = positions.shape[0]
-
-        # === 1. Root features: height Y (absolute), velocity X, velocity Z ===
-        root_height_y = positions[:, 0, 1:2]  # (B, 1)
-        root_vel_x = positions[:, 0, 0:1] - self.prev_positions[:, 0, 0:1]  # (B, 1)
-        root_vel_z = positions[:, 0, 2:3] - self.prev_positions[:, 0, 2:3]  # (B, 1)
-        root_features = torch.cat(
-            [root_height_y, root_vel_x, root_vel_z], dim=-1
-        )  # (B, 3)
-
-        # === 2. IK for rotations ===
-        quaternions = _compute_ik(
-            positions, self.raw_offsets, self.kinematic_chain, self.face_joint_indx
-        )
-
-        # === 3. Root rotation ===
-        root_quat = quaternions[:, 0]  # (B, 4)
-
-        # === 4. RIC from FK positions ===
-        rotations_6d = quaternion_to_cont6d(quaternions)
-
-        # Get root position for FK (need absolute position)
-        global_root_pos = positions[:, 0]  # (B, 3)
-
-        # Compute FK for kinematic consistency
-        fk_positions = _forward_kinematics(
-            rotations_6d, global_root_pos, self.raw_offsets, self.kinematic_chain
-        )
-
-        # Compute RIC from FK positions
-        ric = fk_positions - fk_positions[:, 0:1]
-        ric = qrot(root_quat.unsqueeze(1).expand(-1, 22, -1), ric)
-
-        # === 5. Causal velocities ===
-        local_vel = qrot(
-            root_quat.unsqueeze(1).expand(-1, 22, -1), positions - self.prev_positions
-        )
-
-        # === 6. Foot contacts ===
-        foot_vel = positions - self.prev_positions
-        feet_l = (
-            torch.sum(foot_vel[:, self.fid_l] ** 2, dim=-1) < self.feet_thre
-        ).float()
-        feet_r = (
-            torch.sum(foot_vel[:, self.fid_r] ** 2, dim=-1) < self.feet_thre
-        ).float()
-
-        # === Update state ===
-        self.prev_positions = positions.clone()
-
-        # === Concatenate features ===
-        features = torch.cat(
-            [
-                root_features,  # [0:3] Root height Y, velocity X, velocity Z
-                ric.reshape(B, -1),
-                rotations_6d.reshape(B, -1),
-                local_vel.reshape(B, -1),
-                feet_l,
-                feet_r,
-            ],
-            dim=-1,
-        )
-
-        return features
-
-    def reset(self):
-        """Reset the extractor state."""
-        self.prev_positions = None
-        self.prev_fk_positions = None
-        self.is_initialized = False
-
-    def process_flow_output(
-        self,
-        flow_output: torch.Tensor,
-        prev_frame_271d: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Process 72D flow output and extract 271D features.
-
-        This is a convenience method that combines flow_output_to_positions()
-        with process_frame() for autoregressive generation.
-
-        Args:
-            flow_output: (B, 72) FlowMatchingPredictor output
-            prev_frame_271d: (B, 271) Previous frame features
-
-        Returns:
-            new_frame_271d: (B, 271) New frame features
-            new_positions: (B, 22, 3) New global joint positions
-        """
-        # Extract previous root info from 271D features
-        # Root position needs to be reconstructed from velocity form
-        prev_root_height = prev_frame_271d[:, 0:1]  # Y height (absolute)
-        # For X and Z, we need cumulative position tracking
-        # Use prev_positions if available, otherwise start from origin
-        if self.prev_positions is not None:
-            prev_root_pos = self.prev_positions[:, 0].clone()  # (B, 3)
-        else:
-            # Initialize from prev_frame_271d
-            prev_root_pos = torch.zeros(
-                flow_output.shape[0],
-                3,
-                device=flow_output.device,
-                dtype=flow_output.dtype,
-            )
-            prev_root_pos[:, 1] = prev_root_height.squeeze(-1)  # Y height
-
-        # Extract previous root rotation (6D)
-        prev_root_rot_6d = prev_frame_271d[:, 69:75]  # (B, 6)
-
-        # Convert 72D → positions
-        new_positions = flow_output_to_positions(
-            flow_output, prev_root_pos, prev_root_rot_6d
-        )
-
-        # Convert positions → 271D features
-        new_frame_271d = self.process_frame(new_positions)
-
-        return new_frame_271d, new_positions

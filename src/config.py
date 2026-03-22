@@ -21,6 +21,26 @@ from typing import Optional, Any
 
 
 @dataclass
+class FlowMatchingPredictorConfig:
+    hidden_size: int = 256
+    intermediate_size: int = 768
+    num_hidden_layers: int = 4
+    num_attention_heads: int = 8
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    attention_bias: bool = True
+    attention_dropout: float = 0.1
+    mlp_bias: bool = True
+    track_dimensionality: int = 3
+    global_cond_dim: int = 512  # clip embedding : 512D
+    head_dim: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.head_dim is None:
+            self.head_dim = self.hidden_size // self.num_attention_heads
+
+
+@dataclass
 class Config:
     """Configuration class for the motion generation pipeline."""
 
@@ -63,14 +83,25 @@ class Config:
     encoder_dropout: float = 0.1  # Dropout between GRU layers
 
     # =============================================================================
-    # FlowMatchingPredictor Configuration
+    # FlowMatchingPredictor Configuration (Spatial-Only with Flow Matching Timestep)
     # =============================================================================
-    predictor_per_joint_dim: int = 64  # Must match encoder_per_joint_dim
-    predictor_model_dim: int = 128  # Spatial transformer hidden dim
-    predictor_num_layers: int = 2  # Spatial transformer layers
-    predictor_num_heads: int = 4  # Attention heads
-    predictor_time_embed_dim: int = 64  # Sinusoidal time embedding
-    predictor_dropout: float = 0.1  # Dropout rate
+    # Uses new FlowMatchingPredictorConfig dataclass for structured configuration
+    # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
+    predictor_config: FlowMatchingPredictorConfig = field(
+        default_factory=lambda: FlowMatchingPredictorConfig(
+            hidden_size=256,
+            intermediate_size=768,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            hidden_act="silu",
+            rms_norm_eps=1e-6,
+            attention_bias=True,
+            attention_dropout=0.1,
+            mlp_bias=True,
+            track_dimensionality=3,
+            head_dim=None,
+        )
+    )
 
     # Training settings
     batch_size: int = 192
@@ -120,6 +151,15 @@ class Config:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)
+
+    def get_predictor_feature_size(self) -> int:
+        """
+        Compute input feature size for FlowMatchingPredictor.
+
+        For tokenized predictor inputs with shape (B, N, F), this returns F
+        (the per-joint feature width), not N * F.
+        """
+        return self.encoder_per_joint_dim
 
     def to_dict(self) -> dict:
         """Export the configuration as a serializable dictionary."""

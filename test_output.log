@@ -1,0 +1,68 @@
+
+======================================================================
+FlowMatchingPredictor New API Test Suite
+======================================================================
+
+======================================================================
+Test 1: FlowMatchingPredictor Initialization
+======================================================================
+[OK] Predictor initialized with 2,389,507 parameters
+[OK] Use relative shift: True
+[OK] Output channels (track_dimensionality): 3
+[PASS] Predictor initialization successful
+
+======================================================================
+Test 2: Forward Pass with Explicit 3D Relative Shifts
+======================================================================
+Input shapes:
+  track_features:  torch.Size([2, 22, 64])
+  noised_tracks:   torch.Size([2, 22, 3])
+  timesteps:       torch.Size([2])
+  global_cond:     torch.Size([2, 256])
+  relative_shifts: torch.Size([2, 22, 3])
+
+[OK] Forward pass completed
+  Output shape: torch.Size([2, 22, 3])
+[OK] Output shape correct: torch.Size([2, 22, 3])
+[OK] Output is numerically stable (no NaN/inf)
+[OK] Output value range: [0.0000, 0.0000] (max abs: 0.0000)
+[PASS] Forward pass with explicit shifts successful
+
+======================================================================
+Test 3: Forward Pass with None Relative Shifts (Auto-Zero)
+======================================================================
+Input shapes (no explicit shifts provided):
+  track_features:  torch.Size([2, 22, 64])
+  noised_tracks:   torch.Size([2, 22, 3])
+  timesteps:       torch.Size([2])
+  global_cond:     torch.Size([2, 256])
+  relative_shifts: None (should auto-zero)
+
+[OK] Forward pass completed with auto-zero shifts
+  Output shape: torch.Size([2, 22, 3])
+[OK] Output shape correct: torch.Size([2, 22, 3])
+[OK] Output is numerically stable (no NaN/inf)
+[OK] Comparing None vs explicit zeros:
+  Are outputs identical? True
+[PASS] Forward pass with None shifts (auto-zero) successful
+
+======================================================================
+Test 4: Global Conditioning is Required
+======================================================================
+Attempting forward pass WITHOUT global_cond (should fail)...
+[OK] Expected TypeError caught: FlowMatchingPredictor.forward() missing 1 required positional argument: 'global_...
+[OK] global_cond is correctly required
+[PASS] Global conditioning requirement enforced
+
+======================================================================
+Test 5: Batch Size Variation
+======================================================================
+[OK] B=1: output shape torch.Size([1, 22, 3]), stable
+[OK] B=2: output shape torch.Size([2, 22, 3]), stable
+[OK] B=4: output shape torch.Size([4, 22, 3]), stable
+[OK] B=8: output shape torch.Size([8, 22, 3]), stable
+[PASS] Batch size variation test successful
+
+======================================================================
+ALL TESTS PASSED [OK]
+======================================================================

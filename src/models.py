@@ -20,15 +20,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 from typing import Optional, List, Tuple, Union
-from config import Config
+from config import Config, FlowMatchingPredictorConfig
+from transformers.activations import ACT2FN
 
 from utils.motion_utils import (
-    features_to_positions,
-    flow_output_to_positions,
-    flow_output_to_271d,
-    RootPositionTracker,
+    sequence_joints_to_features,
+    generated_positions_to_271d,
     FeatureNormalizer,
-    extract_prev_frame_features,
 )
 
 
@@ -77,7 +75,9 @@ class KinematicChainEncoder(nn.Module):
         # joint_ids: (n_joints,)
         chains = self.joint_to_chain[joint_ids]
         depths = self.joint_to_depth[joint_ids]
-        return torch.cat([self.chain_emb(chains), self.depth_emb(depths)], dim=-1)
+        return torch.cat(
+            [self.chain_emb(chains), self.depth_emb(depths)], dim=-1
+        )  # (n_joints, model_dim)
 
 
 class MotionHistoryEncoder(nn.Module):
@@ -206,259 +206,365 @@ class MotionHistoryEncoder(nn.Module):
         return self.per_joint_out_dim
 
 
+class SinusoidalEmbedder(nn.Module):
+    """Embeds scalar timesteps into vector representations."""
+
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
+        super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+
+    @staticmethod
+    def timestep_embedding(
+        t: torch.Tensor, dim: int, max_period: int = 10000
+    ) -> torch.Tensor:
+        half = dim // 2
+        if half == 0:
+            return torch.zeros((t.shape[0], dim), device=t.device, dtype=torch.float32)
+
+        max_period_tensor = torch.tensor(
+            max_period, device=t.device, dtype=torch.float32
+        )
+        freqs = torch.exp(
+            -torch.log(max_period_tensor)
+            * torch.arange(half, dtype=torch.float32, device=t.device)
+            / half
+        )
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat(
+                [embedding, torch.zeros_like(embedding[:, :1])], dim=-1
+            )
+        return embedding
+
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        out = self.mlp(t_freq)
+        return out
+
+
+class SpatialTrackMLP(nn.Module):
+    def __init__(self, config: FlowMatchingPredictorConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.intermediate_size = config.intermediate_size
+        self.gate_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.up_proj = nn.Linear(
+            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        )
+        self.down_proj = nn.Linear(
+            self.intermediate_size, self.hidden_size, bias=config.mlp_bias
+        )
+        self.act_fn = ACT2FN["silu"]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class SpatialTrackLayer(nn.Module):
+    """
+    Simplified transformer layer with AdaLN conditioning using PyTorch-native MultiheadAttention
+    """
+
+    def __init__(self, config: FlowMatchingPredictorConfig):
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+
+        # PyTorch-native MultiheadAttention (batch_first=True for (B, N, H) format)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=config.hidden_size,
+            num_heads=config.num_attention_heads,
+            dropout=config.attention_dropout,
+            bias=config.attention_bias,
+            batch_first=True,  # Uses (B, N, H) format
+        )
+
+        # Match the denoising predictor MLP behavior (gated + configurable activation).
+        self.mlp = SpatialTrackMLP(config)
+
+        # Normalization layers
+        self.input_layernorm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
+
+        # AdaLN modulation (core innovation preserved)
+        self.adaln_linear = nn.Linear(
+            config.hidden_size, 6 * config.hidden_size, bias=True
+        )
+        self.adaln_modulation = nn.Sequential(
+            nn.SiLU(),
+            self.adaln_linear,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,  # (B, N, H)
+        adaln_conditioning: torch.Tensor,  # (B, H) - made required
+        output_attentions: bool = False,
+        **kwargs,  # Ignore attention_mask, position_ids, etc.
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+
+        # Store residual for first connection
+        residual = hidden_states
+
+        # AdaLN modulation for attention block
+        adaln_out = self.adaln_modulation(adaln_conditioning)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            adaln_out.chunk(6, dim=-1)
+        )
+        # Broadcasting: (B,H) -> (B,1,H) -> (B,N,H) works automatically
+
+        # Pre-attention normalization + AdaLN
+        normed = self.input_layernorm(hidden_states)
+        normed = normed * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+
+        # PyTorch MultiheadAttention - NO MASKING
+        attn_output, attn_weights = self.self_attn(
+            query=normed, key=normed, value=normed, need_weights=output_attentions
+        )
+
+        # Output gating + residual connection
+        attn_output = gate_msa.unsqueeze(1) * attn_output
+        hidden_states = residual + attn_output
+
+        # Store residual for second connection
+        residual = hidden_states
+
+        # Post-attention normalization + AdaLN
+        normed = self.post_attention_layernorm(hidden_states)
+        normed = normed * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+
+        # MLP
+        mlp_output = self.mlp(normed)
+        mlp_output = gate_mlp.unsqueeze(1) * mlp_output
+        hidden_states = residual + mlp_output
+
+        if output_attentions:
+            return hidden_states, attn_weights
+        else:
+            return hidden_states, None
+
+
 class FlowMatchingPredictor(nn.Module):
     """
-    Spatial Transformer-based Flow Matching Predictor (ARFM-style).
+    Flow Matching Predictor - Simplified DenoisingJointTrackPredictor
 
-    Input:
-    - history_features: (B, 22, per_joint_dim)
-        - Conditional context from MotionHistoryEncoder
-        - Provides temporal and spatial history for all joints including root
+    Designed for:
+    - T=1 (single frame prediction)
+    - External preprocessing (positions, shifts, etc. provided externally)
+    - No attention masking (all tracks assumed valid)
+    - PyTorch-native transformer components
+    - Preserves AdaLN conditioning mechanism for rectified flow
 
-    - noisy_target: (B, 64)
-        - 1D root height
-        - Joint features (next 63D):
-            - 21 non-root joints, each with 3D RIC positions
-        - Represents the current noisy state x_t in flow matching
-
-    - noise_level: (B,)
-        - Scalar flow time t in [0,1] used to compute sinusoidal embedding
-
-    - temporal_progress: (B,)
-        - Optional normalized frame progress in sequence (not used yet)
-
-    Output:
-    - pred_frame: (B, 72)
-        - Concatenated predictions for a single frame:
-            - Root token output (first 9D):
-                1D height
-                + 2D velocity (direct prediction)
-                + 6D rotation (direct prediction)
-            - Joint tokens output (next 63D):
-                21 joints x 3D RIC positions
-        - Matches the target frame representation used for flow matching / denoising
+    Predicts velocity field for rectified flow-based motion prediction
     """
 
     def __init__(
         self,
-        per_joint_dim: int = 32,  # history embedding dimension from MotionHistoryEncoder
-        model_dim: int = 64,  # spatial transformer hidden dim
-        num_layers: int = 2,  # number of spatial transformer layers
-        joint_count: int = 22,  # total joints including root
-        time_embed_dim: int = 64,  # sinusoidal time embedding
-        dropout: float = 0.1,  # dropout rate
-        normalizer: Optional[FeatureNormalizer] = None,  # For normalizing raw features
+        feature_size: int,  # Size of track features per track (from encoder/detector)
+        config: FlowMatchingPredictorConfig,  # Model configuration
+        out_channels: Optional[int] = None,
+        use_relative_shift: bool = True,
+        **kwargs,
     ):
         super().__init__()
-        self.model_dim = model_dim
-        self.num_layers = num_layers
-        self.joint_count = joint_count
-        self.time_embed_dim = time_embed_dim
+        self.out_channels = (
+            out_channels or config.track_dimensionality
+        )  # Usually 2 (x,y)
+        self.use_relative_shift = use_relative_shift
 
-        # Store normalizer for raw feature normalization
-        self.normalizer = normalizer
+        # Input projection: concatenate all features -> hidden_size
+        input_dim = (
+            config.track_dimensionality  # noised_tracks (x,y coordinates to denoise)
+            + feature_size  # track_features (from video encoder, etc.)
+            + (
+                config.track_dimensionality if use_relative_shift else 0
+            )  # relative_shifts (if used, provided externally)
+        )
+        self.input_projection = nn.Linear(input_dim, config.hidden_size)
 
-        # --- Hierarchical Kinematic Encoder ---
-        self.kinematic_encoder = KinematicChainEncoder(model_dim)
+        self.global_cond_projection = nn.Linear(
+            config.global_cond_dim, config.hidden_size
+        )
 
-        # --- Sinusoidal time embedding ---
-        self.time_mlp = nn.Sequential(
-            nn.Linear(time_embed_dim, model_dim),
+        # Time embedding for denoising timestep
+        self.time_embedder = SinusoidalEmbedder(config.hidden_size)
+
+        # Kinematic chain embedding
+        self.kinematic_encoder = KinematicChainEncoder(config.hidden_size)
+        self.register_buffer("joint_ids", torch.arange(22, dtype=torch.long))  # (22,)
+        self.kinematic_token_norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
+
+        # Stage-2 structural fusion: layer-wise scalar gates, initialized to no-op.
+        self.structural_layer_gates = nn.Parameter(
+            torch.zeros(config.num_hidden_layers, dtype=torch.float32)
+        )
+
+        # Transformer layers with AdaLN
+        self.layers = nn.ModuleList(
+            [SpatialTrackLayer(config) for _ in range(config.num_hidden_layers)]
+        )
+
+        # Output prediction head
+        self.output_norm = nn.LayerNorm(config.hidden_size, eps=1e-6)
+        self.output_adaln_linear = nn.Linear(
+            config.hidden_size, 2 * config.hidden_size, bias=True
+        )
+        self.output_adaln = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(model_dim, model_dim),
+            self.output_adaln_linear,
         )
+        self.output_projection = nn.Linear(config.hidden_size, self.out_channels)
 
-        # --- Project history ---
-        self.input_proj_history = nn.Sequential(
-            nn.LayerNorm(per_joint_dim),
-            nn.Linear(per_joint_dim, model_dim),
-            nn.LayerNorm(model_dim),
-        )
+        self._initialize_weights()
 
-        # --- Project noisy target ---
-        self.input_proj_noisy_root = nn.Sequential(
-            nn.Linear(1, model_dim),
-            nn.LayerNorm(model_dim),  # normalize in model space
-        )
+    def _initialize_weights(self):
+        # Initialize transformer layers:
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
 
-        self.input_proj_noisy_joint = nn.Sequential(
-            nn.Linear(3, model_dim),
-            nn.LayerNorm(model_dim),
-        )
+        self.apply(_basic_init)
 
-        # --- Project previous frame ---
-        self.input_proj_prev_root = nn.Sequential(
-            nn.Linear(9, model_dim),
-            nn.LayerNorm(model_dim),
-        )
+        # Initialize timestep embedding MLP.
+        nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
 
-        self.input_proj_prev_joint = nn.Sequential(
-            nn.Linear(12, model_dim),
-            nn.LayerNorm(model_dim),
-        )
+        # Zero-out adaln modulation layers in DiT blocks:
+        for layer in self.layers:
+            if isinstance(layer, SpatialTrackLayer):
+                nn.init.constant_(layer.adaln_linear.weight, 0)
+                if layer.adaln_linear.bias is not None:
+                    nn.init.constant_(layer.adaln_linear.bias, 0)
 
-        # --- Fusion (stronger than single linear) ---
-        self.fusion = nn.Sequential(
-            nn.LayerNorm(3 * model_dim),  # normalize concatenated features
-            nn.Linear(3 * model_dim, 2 * model_dim),
-            nn.GELU(),
-            nn.Linear(2 * model_dim, model_dim),
-        )
-
-        # --- Learnable bias for when prev_frame_features is None ---
-        self.null_prev_bias = nn.Parameter(torch.zeros(joint_count, model_dim))
-
-        # --- Spatial Transformer ---
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=model_dim,
-            nhead=4,
-            dim_feedforward=model_dim * 4,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=True,
-        )
-        self.spatial_transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers, enable_nested_tensor=False
-        )
-
-        # --- Separate output heads ---
-        self.root_shared = nn.Sequential(
-            nn.LayerNorm(model_dim),
-            nn.Linear(model_dim, 2 * model_dim),
-            nn.GELU(),
-        )
-        self.root_height = nn.Linear(2 * model_dim, 1)
-        self.root_velocity = nn.Linear(2 * model_dim, 2)
-        self.root_rotation = nn.Sequential(
-            nn.Linear(2 * model_dim, 2 * model_dim),
-            nn.GELU(),
-            nn.Linear(2 * model_dim, 6),
-        )
-
-        self.joint_head = nn.Sequential(
-            nn.LayerNorm(model_dim),
-            nn.Linear(model_dim, model_dim * 2),
-            nn.GELU(),
-            nn.Linear(model_dim * 2, 3),  # 3D RIC positions
-        )
-
-    def _sinusoidal_time_embedding(self, t: torch.Tensor, max_positions=10000):
-        """Sinusoidal embedding for flow time t in [0,1]."""
-        half_dim = self.time_embed_dim // 2
-        freqs = torch.exp(
-            -torch.log(torch.tensor(max_positions))
-            / (half_dim - 1)
-            * torch.arange(half_dim, device=t.device)
-        )
-        args = t.unsqueeze(-1) * freqs.unsqueeze(0)
-        emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-        if self.time_embed_dim % 2 != 0:
-            emb = F.pad(emb, (0, 1))
-        return emb  # (B, time_embed_dim)
+        # Zero-out output layers:
+        nn.init.constant_(self.output_adaln_linear.weight, 0)
+        nn.init.constant_(self.output_adaln_linear.bias, 0)
+        nn.init.constant_(self.output_projection.weight, 0)
+        nn.init.constant_(self.output_projection.bias, 0)
 
     def forward(
         self,
-        history_features: torch.Tensor,  # (B, 22, per_joint_dim)
-        noise_level: torch.Tensor,  # (B,)
-        noisy_target: Optional[torch.Tensor] = None,  # (B, 72) - in normalized space
-        prev_frame_features: Optional[
+        noised_tracks: torch.Tensor,  # (B, N, D) - noised trajectory coordinates to denoise
+        timesteps: torch.Tensor,  # (B,) or (B, 1) - denoising timesteps in [0,1]
+        text_embedding: torch.Tensor,  # (B, F) - Text embedding for global conditioning
+        track_features: torch.Tensor,  # (B, N, F) - per-track features from encoder/detector
+        relative_shifts: Optional[
             torch.Tensor
-        ] = None,  # (B, 261) - prev frame features
-        temporal_progress: Optional[torch.Tensor] = None,
-    ):
+        ] = None,  # (B, N, D) - precomputed relative shifts (optional)
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        **kwargs,  # Ignore attention_mask, position_ids, etc.
+    ) -> tuple[
+        torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]
+    ]:
         """
-        Forward pass for FlowMatchingPredictor.
+        Forward pass of the Flow Matching Predictor
 
         Args:
-            history_features: (B, 22, per_joint_dim) - Context from MotionHistoryEncoder
-            noise_level: (B,) - Flow time t in [0,1]
-            noisy_target: (B, 64) - Current noisy state x_t (already in normalized space)
-            prev_frame_features: (B, 261) - Features from previous frame (root 9D + joints 252D)
-            temporal_progress: (B,) - Optional normalized frame progress
+            track_features: (B, N, F) - Features per track (e.g., from video encoder)
+            noised_tracks: (B, N, D) - Noised trajectory coordinates to predict flow for
+            timesteps: (B,) or (B, 1) - Denoising timesteps t in [0,1]
+            relative_shifts: (B, N, D) - Precomputed relative position shifts (optional, default None)
+            text_embedding: (B, F) - Text embedding for global conditioning
+            output_attentions: Whether to return attention weights (not implemented in this simplified version)
+            output_hidden_states: Whether to return hidden states (not implemented in this simplified version)
 
         Returns:
-            pred_frame: (B, 72) - Predicted velocity field (in normalized space)
+            flow_prediction: (B, N, D) - Predicted velocity field for denoising
         """
-        B, J, _ = history_features.shape
-        device = history_features.device
 
-        # --- Project history ---
-        cond_proj = self.input_proj_history(history_features)  # (B,22,model_dim)
+        # 1. Feature concatenation along feature dimension
+        features_to_concat = [noised_tracks, track_features]
+        if self.use_relative_shift:
+            if relative_shifts is None:
+                relative_shifts = torch.zeros_like(noised_tracks)
+            features_to_concat.append(relative_shifts)
 
-        # --- Handle noisy target ---
-        if noisy_target is None:
-            noisy_target = torch.randn(B, 64, device=device)
+        concatenated_features = torch.cat(
+            features_to_concat, dim=-1
+        )  # (B, N, F+E+[2]+D)
 
-        noisy_root_in = noisy_target[:, :1]  # (B,1)
-        noisy_joints_in = noisy_target[:, 1:].reshape(B, J - 1, 3)  # (B,21,3)
+        # 2. Input projection to transformer dimension
+        hidden_states = self.input_projection(concatenated_features)  # (B, N, H)
 
-        noisy_root_proj = self.input_proj_noisy_root(noisy_root_in).unsqueeze(1)
-        noisy_joint_proj = self.input_proj_noisy_joint(noisy_joints_in)
+        # Build static per-joint kinematic tokens once and reuse across layers.
+        B, N, H = hidden_states.shape
+        kin_tokens = self.kinematic_encoder(self.joint_ids)  # (22, H)
+        if kin_tokens.shape[0] != N:
+            raise ValueError(
+                f"Joint count mismatch: predictor got N={N}, "
+                f"but kinematic table has {kin_tokens.shape[0]} joints."
+            )
+        kin_tokens = self.kinematic_token_norm(kin_tokens)
+        kin_tokens = kin_tokens.to(
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+        kin_tokens = kin_tokens.unsqueeze(0).expand(B, N, H)  # (B, N, H)
 
-        noisy_proj = torch.cat(
-            [noisy_root_proj, noisy_joint_proj], dim=1
-        )  # (B,22,model_dim)
+        # 3. Time conditioning
+        # Handle both (B,) and (B, 1) timestep formats
+        time_cond = self.time_embedder(
+            timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps
+        )  # (B, H)
 
-        # --- Handle prev_frame_features ---
-        if prev_frame_features is None:
-            # Use learned bias when not provided (backwards compatible)
-            prev_proj = self.null_prev_bias.unsqueeze(0).expand(
-                B, -1, -1
-            )  # (B, 22, model_dim)
-        else:
-            # Split into root and joints
-            prev_root = prev_frame_features[:, :9]  # (B, 9)
-            prev_joints = prev_frame_features[:, 9:].reshape(
-                B, J - 1, -1
-            )  # (B, 21, 12)
+        global_cond_proj = self.global_cond_projection(text_embedding)  # (B, H)
 
-            # Project separately and concatenate
-            prev_root_proj = self.input_proj_prev_root(prev_root).unsqueeze(
-                1
-            )  # (B, 1, model_dim)
-            prev_joints_proj = self.input_proj_prev_joint(
-                prev_joints
-            )  # (B, 21, model_dim)
+        # Combine required global conditioning with time embedding.
+        adaln_conditioning = time_cond + global_cond_proj  # (B, H)
 
-            prev_proj = torch.cat(
-                [prev_root_proj, prev_joints_proj], dim=1
-            )  # (B, 22, model_dim)
+        # 4. Transformer processing (NO ATTENTION MASKING)
+        all_hidden_states: list[torch.Tensor] = []
+        all_self_attns: list[torch.Tensor] = []
 
-        # --- Combine condition + noisy + prev_frame_features ---
-        x = torch.cat([cond_proj, noisy_proj, prev_proj], dim=-1)  # (B,22,3*model_dim)
-        x = self.fusion(x)  # (B,22,model_dim)
+        for layer_idx, layer in enumerate(self.layers):
+            # Bounded signed gate allows add/subtract structural prior per layer.
+            layer_gate = torch.tanh(self.structural_layer_gates[layer_idx]).to(
+                dtype=hidden_states.dtype
+            )
+            hidden_states = hidden_states + layer_gate * kin_tokens
 
-        # --- Add time embedding ---
-        t_emb = self._sinusoidal_time_embedding(noise_level)
-        t_bias = self.time_mlp(t_emb).unsqueeze(1)
-        x = x + t_bias
-        x = x * (1 + t_bias)
+            layer_outputs = layer(
+                hidden_states,
+                adaln_conditioning=adaln_conditioning,
+                output_attentions=output_attentions,
+                # attention_mask, position_ids, etc. all ignored as per requirements
+            )
 
-        # --- Add kinematic bias ---
-        joint_ids = torch.arange(J, device=device)
-        kinematic_bias = self.kinematic_encoder(joint_ids)
-        x = x + kinematic_bias.unsqueeze(0)
+            hidden_states = layer_outputs[0]
 
-        # --- Spatial Transformer ---
-        x = self.spatial_transformer(x)  # (B,22,model_dim)
+            if output_hidden_states:
+                all_hidden_states.append(hidden_states)
 
-        # --- Split root and joint tokens for separate heads ---
-        global_context = x.mean(dim=1, keepdim=True)
-        root_token = x[:, 0:1, :] + global_context
-        joint_tokens = x[:, 1:, :]
+            if output_attentions:
+                all_self_attns.append(layer_outputs[1])
 
-        root_shared = self.root_shared(root_token)
-        root_height = self.root_height(root_shared)  # (B,1,1)
-        root_vel = self.root_velocity(root_shared)  # (B,1,2)
-        root_rot = self.root_rotation(root_shared)  # (B,1,6)
-        root_out = torch.cat([root_height, root_vel, root_rot], dim=-1)  # (B,1,9)
+        # 5. Output prediction
+        normed_states = self.output_norm(hidden_states)  # (B, N, H)
+        shift, scale = self.output_adaln(adaln_conditioning).chunk(2, dim=-1)
+        normed_states = normed_states * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        joint_out = self.joint_head(joint_tokens)  # (B,21,3)
+        flow_prediction = self.output_projection(normed_states)  # (B, N, D)
 
-        # --- Flatten and concatenate to final 72D ---
-        pred_frame = torch.cat([root_out.squeeze(1), joint_out.reshape(B, -1)], dim=-1)
-        return pred_frame
+        return (
+            flow_prediction,
+            all_hidden_states if output_hidden_states else None,
+            all_self_attns if output_attentions else None,
+        )
 
 
 class HumanMotionGenerator:
@@ -473,11 +579,13 @@ class HumanMotionGenerator:
         self,
         encoder: MotionHistoryEncoder,
         predictor: FlowMatchingPredictor,
+        config: Config,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.predictor = predictor
         self.normalizer = encoder.normalizer
+        self.config = config
 
     def eval(self) -> "HumanMotionGenerator":
         """Set models to evaluation mode."""
@@ -510,16 +618,16 @@ class HumanMotionGenerator:
         num_frames: int = 200,
         num_steps: int = 10,
         horizon: int | None = None,
-        input_features: Optional[torch.Tensor] = None,
+        input_positions: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
         guidance_scale: float = 1.0,
         dataset_type: str = "t2m",
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate n consecutive animation frames autoregressively.
 
-        Uses flow_output_to_271d for incremental 72D → 271D conversion and
-        RootPositionTracker for absolute root position tracking. This ensures
+        Uses absolute global joint positions as the autoregressive state and
+        generated_positions_to_271d for incremental feature extraction. This ensures
         O(n) complexity and Markov-safe autoregressive generation.
 
         Args:
@@ -527,12 +635,14 @@ class HumanMotionGenerator:
             num_frames: Number of frames to generate
             num_steps: Number of flow matching ODE steps
             horizon: Number of recent frames to use for context encoding
-            input_features: Optional initial motion history (B, N, 271) or (B, 271)
+            input_positions: Optional initial global positions (B, N, 22, 3) or (B, 22, 3)
             total_duration: Optional duration tensor (not used)
             dataset_type: Dataset type for feature extraction
 
         Returns:
-            position_history: (B, N+num_frames, 22, 3) - Global joint positions including initial history
+            position_history: (B, N+num_frames, 22, 3) - Absolute global joint positions including initial history
+            feature_history: (B, N+num_frames, 271) - 271D features derived from position history
+            prev_relative_shifts: (B, N+num_frames, 22, 3) - Relative shifts from previous frames
         """
         self.eval()
         with torch.no_grad():
@@ -559,35 +669,62 @@ class HumanMotionGenerator:
             # ========================================
             # History Initialization
             # ========================================
-            # Use RootPositionTracker for absolute root position tracking
-            # and feature_history for context encoding
+            # Keep absolute global positions as the primary AR state.
+            # Feature history is derived incrementally from position history.
 
-            if input_features is None:
-                root_pos = torch.zeros((B, 3), device=device)  # (B, 3) - absolute XYZ
-                root_tracker = RootPositionTracker(root_pos)
-                # Initialize with a zero frame for cold start
-                feature_history = torch.zeros((B, 1, 271), device=device)  # (B, 1, 271)
+            if input_positions is None:
+                # Cold start from a zero pose frame.
+                position_history = torch.zeros(
+                    (B, 1, self.encoder.joint_count, self.predictor.out_channels),
+                    device=device,
+                )
+                feature_history = sequence_joints_to_features(
+                    position_history, dataset_type=dataset_type
+                )  # (B, 1, 271)
             else:
-                # Seeded: use input_features
-                if input_features.ndim == 2:
-                    # Single frame (B, 271)
-                    feature_history = input_features.unsqueeze(1).clone()  # (B, 1, 271)
+                input_positions = input_positions.to(device=device)
+                if input_positions.ndim == 3:
+                    # Single frame (B, N, 3)
+                    seed_positions = input_positions.unsqueeze(
+                        1
+                    ).clone()  # (B, 1, N, 3)
+                elif input_positions.ndim == 4:
+                    # Sequence (B, T, N, 3)
+                    seed_positions = input_positions.clone()  # (B, T, N, 3)
                 else:
-                    # Sequence (B, N, 271)
-                    feature_history = input_features.clone()  # (B, N, 271)
-                # Initialize RootPositionTracker from feature history
-                root_tracker = RootPositionTracker.from_history(feature_history)
+                    raise ValueError(
+                        "input_positions must be shape (B, N, 3) or (B, T, N, 3)"
+                    )
+
+                position_history = seed_positions
+                # Seeded: convert global positions to 271D feature history
+                feature_history = sequence_joints_to_features(
+                    seed_positions, dataset_type=dataset_type
+                )  # (B, T, 271)
+
+            prev_relative_shifts = torch.zeros(
+                (B, 1, self.encoder.joint_count, self.predictor.out_channels),
+                device=device,
+            )
+
+            if position_history.shape[1] > 1:
+                prev_relative_shifts = torch.cat(
+                    [
+                        prev_relative_shifts,
+                        position_history[:, 1:] - position_history[:, :-1],
+                    ],
+                    dim=1,
+                )
 
             for frame_idx in range(num_frames):
                 # ========================================
-                # Step A: Extract last frame from feature history
+                # Step A: Extract last frame from position history
                 # ========================================
-                last_frame = feature_history[:, -1]  # (B, 271) - RAW
-                prev_root_pos = root_tracker.get()  # (B, 3)
+                current_positions = position_history[:, -1]  # (B, 22, 3)
 
                 # ========================================
                 # Step B: Encode context from last horizon frames
-                # normalize=True (default) - models normalize RAW features internally
+                # Feature history is used only for context encoding.
                 # ========================================
                 # Slice to last horizon frames
                 if horizon is not None:
@@ -608,78 +745,63 @@ class HumanMotionGenerator:
 
                 # ========================================
                 # Step C: Flow matching ODE loop
-                # x_t starts as random noise (already in normalized space conceptually)
+                # x_t starts as random noise in track space (B, 22, 3)
                 # ========================================
-                x_t = torch.randn((B, 64), device=device)
-                x_vel = torch.zeros((B, 2), device=device)
-                x_rot = torch.zeros((B, 6), device=device)
+                x_t = torch.randn(
+                    (B, self.encoder.joint_count, self.predictor.out_channels),
+                    device=device,
+                )
                 dt = 1.0 / num_steps
 
-                # # N-Step Prediction
+                # N-step flow matching in tokenized track space.
                 for step in range(num_steps):
                     t = torch.full((B,), step * dt, device=device)
+                    relative_shifts = x_t
 
-                    # Extract prev_frame_features from last_frame (271D -> 261D)
-                    prev_features = extract_prev_frame_features(last_frame)  # (B, 261)
-
-                    # Only conditional prediction (no CFG)
-                    pred = self.predictor(
-                        history_features=context_cond,
-                        noise_level=t,
-                        noisy_target=x_t,
-                        prev_frame_features=prev_features,
+                    # Predict velocity using new forward signature
+                    flow_output = self.predictor.forward(
+                        track_features=context_cond,
+                        noised_tracks=x_t,
+                        timesteps=t,
+                        relative_shifts=relative_shifts,
+                        text_embedding=text_emb,
+                        output_attentions=False,
+                        output_hidden_states=False,
                     )
 
-                    x_vel = x_vel + pred[..., 1:3] * dt
-                    x_rot = x_rot + pred[..., 3:9] * dt
-
-                    v_t = torch.cat([pred[..., 0:1], pred[..., 9:]], dim=-1)
-                    x_t = x_t + v_t * dt
-
-                # # Single-Step Prediction
-                # prev_features = extract_prev_frame_features(last_frame)  # (B, 261)
-                # t = torch.full((B,), 0, device=device)
-                # x_t = self.predictor(
-                #     history_features=context_cond,
-                #     noise_level=t,
-                #     noisy_target=x_t,
-                #     prev_frame_features=prev_features,
-                # )  # (B, 72)
-
-                flow_output = torch.cat(
-                    [x_t[..., 0:1], x_vel, x_rot, x_t[..., 1:]], dim=-1
-                )
-
-                if self.normalizer:
-                    flow_output = self.normalizer.denormalize_flow_output(flow_output)
+                    # Unpack tuple: (flow_prediction, hidden_states, attentions)
+                    pred = flow_output[0]
+                    x_t = x_t + pred * dt
 
                 # ========================================
-                # Step E: Convert 72D → 271D (incremental)
+                # Step E: Apply displacement and convert positions → 271D (incremental)
                 # ========================================
-                new_frame, new_root_pos = flow_output_to_271d(
-                    flow_output=flow_output,
-                    prev_frame=last_frame,
-                    prev_root_pos=prev_root_pos,
+                relative_shift = x_t  # (B, 22, 3)
+                new_positions = current_positions + relative_shift  # (B, 22, 3)
+                new_frame, _ = generated_positions_to_271d(
+                    new_positions=new_positions,
+                    prev_positions=current_positions,
                     dataset_type=dataset_type,
+                    use_fk_for_ric=False,
                 )  # (B, 271), (B, 3)
 
                 # ========================================
                 # Step F: Update tracker and history
                 # ========================================
-                root_tracker.update(new_frame)
+                position_history = torch.cat(
+                    [position_history, new_positions.unsqueeze(1)], dim=1
+                )  # (B, T+1, 22, 3)
                 feature_history = torch.cat(
                     [feature_history, new_frame.unsqueeze(1)], dim=1
                 )  # (B, N+1, 271)
+                prev_relative_shifts = torch.cat(
+                    [prev_relative_shifts, relative_shift.unsqueeze(1)], dim=1
+                )  # (B, T, 22, 3)
 
                 if (frame_idx + 1) % 50 == 0:
                     print(f"Generated {frame_idx + 1}/{num_frames} frames")
 
-            # Convert full feature_history to positions for return
-            position_history = features_to_positions(
-                feature_history, dataset_type=dataset_type
-            )  # (B, N+num_frames, 22, 3)
-
-            return position_history
+            return position_history, feature_history, prev_relative_shifts
 
     @classmethod
     def load_from_checkpoint(
@@ -721,14 +843,15 @@ class HumanMotionGenerator:
             normalizer=normalizer,
         ).to(device)
 
-        # Initialize Flow Matching Predictor
+        # Initialize Flow Matching Predictor with new config-based interface
+        predictor_config = config.predictor_config
+        feature_size = config.get_predictor_feature_size()
+
         predictor = FlowMatchingPredictor(
-            per_joint_dim=config.predictor_per_joint_dim,
-            model_dim=config.predictor_model_dim,
-            num_layers=config.predictor_num_layers,
-            joint_count=config.encoder_num_joints,
-            time_embed_dim=config.predictor_time_embed_dim,
-            dropout=config.predictor_dropout,
+            feature_size=feature_size,
+            config=predictor_config,
+            out_channels=None,
+            use_relative_shift=True,
             normalizer=normalizer,
         ).to(device)
 
@@ -747,4 +870,4 @@ class HumanMotionGenerator:
         encoder.eval()
         predictor.eval()
 
-        return cls(encoder, predictor)
+        return cls(encoder, predictor, config)
