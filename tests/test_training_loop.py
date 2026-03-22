@@ -12,6 +12,7 @@ Assumes normalizer will be provided during actual training.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import sys
 import os
@@ -26,7 +27,7 @@ from utils.train_utils import (
     extract_clean_target,
     EMAModel,
 )
-from utils.motion_utils import FeatureNormalizer
+from utils.motion_utils import FeatureNormalizer, extract_prev_frame_features
 
 
 # =============================================================================
@@ -229,7 +230,8 @@ def test_predictor_forward(predictor, config):
     # Create mock inputs
     history_features = torch.randn(B, config.num_joints, config.encoder_per_joint_dim)
     noise_level = torch.rand(B)
-    noisy_target = torch.randn(B, 72)  # 72D flow output
+    # 64D noisy target: 1D root height + 21*3D joint RIC = 1 + 63 = 64D
+    noisy_target = torch.randn(B, 64)
 
     # Forward pass
     with torch.no_grad():
@@ -310,21 +312,54 @@ def test_training_iteration(encoder, predictor, config):
 
     print(f"Clean targets shape: {clean_targets.shape}")
 
-    # Flow matching
-    t = torch.rand(B)
-    noise = torch.randn_like(clean_targets)
-    x_t = t.view(B, 1) * clean_targets + (1 - t.view(B, 1)) * noise
+    # New flow matching format: 64D noisy target (1D height + 63D joints)
+    x1_h = clean_targets[..., 0:1]
+    x1_vel = clean_targets[..., 1:3]
+    x1_rot = clean_targets[..., 3:9]
+    x1_joints = clean_targets[..., 9:]
 
-    # Predict (no prev_frame_features needed for basic test)
+    # Noise only on height and joints (velocity and rotation are zero)
+    x0_h = torch.randn_like(x1_h)
+    x0_joints = torch.randn_like(x1_joints)
+
+    t = torch.rand(B)
+    t_ = t.view(B, 1)
+
+    # Create 64D noisy target
+    xt_h = t_ * x1_h + (1 - t_) * x0_h
+    xt_joints = t_ * x1_joints + (1 - t_) * x0_joints
+    noisy_target = torch.cat([xt_h, xt_joints], dim=-1)  # (B, 64)
+
+    # Get prev_frame_features
+    prev_frame = hist[:, -1]  # (B, 271)
+    prev_features = extract_prev_frame_features(prev_frame)  # (B, 261)
+
+    # Predict
     pred = predictor(
         history_features=contexts,
         noise_level=t,
-        noisy_target=x_t,
+        noisy_target=noisy_target,
+        prev_frame_features=prev_features,
     )
 
-    # Compute loss
-    target_v = clean_targets - noise
-    loss = torch.nn.functional.mse_loss(pred, target_v)
+    # Compute loss using new format with separate components
+    pred_v_h = pred[..., 0:1]
+    pred_vel = pred[..., 1:3]
+    pred_rot = pred[..., 3:9]
+    pred_v_joints = pred[..., 9:]
+    pred_v_pos = torch.cat([pred_v_h, pred_v_joints], dim=-1)
+
+    target_v_h = x1_h - x0_h
+    target_v_joints = x1_joints - x0_joints
+    target_v_pos = torch.cat([target_v_h, target_v_joints], dim=-1)
+
+    L_flow = F.smooth_l1_loss(pred_v_pos, target_v_pos)
+    cos_sim = F.cosine_similarity(pred_rot, x1_rot, dim=-1)
+    L_dir = (1 - cos_sim).mean()
+    L_vel = F.mse_loss(pred_vel, x1_vel)
+    L_rot = F.smooth_l1_loss(pred_rot, x1_rot)
+
+    loss = 1.0 * L_flow + 0.5 * L_dir + 1.0 * L_vel + 1.0 * L_rot
 
     print(f"Loss: {loss.item():.6f}")
 

@@ -23,14 +23,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 
 # Import pipeline components
 from config import Config
 from models import MotionHistoryEncoder, FlowMatchingPredictor
 from utils.dataset import create_dataloader
-from utils.train_utils import train
-from utils.motion_utils import FeatureNormalizer
+from utils.train_utils import train, extract_clean_target
+from utils.motion_utils import FeatureNormalizer, extract_prev_frame_features
 
 
 def get_minimal_config():
@@ -218,14 +219,19 @@ def test_forward_pass(config, motion_encoder, flow_predictor, dataloader):
     flow_predictor.eval()
     noise_level = torch.rand(B, device=device)  # Random noise levels
 
-    # Create noisy target (72D)
-    noisy_target = torch.randn(B, 72, device=device)
+    # Create noisy target (64D): 1D root height + 21*3D joint RIC = 1 + 63 = 64D
+    noisy_target = torch.randn(B, 64, device=device)
+
+    # Create prev_frame_features (261D from 271D frame)
+    prev_frame = motion_norm[:, -1]  # (271,)
+    prev_features = extract_prev_frame_features(prev_frame)  # (1, 261)
 
     with torch.no_grad():
         pred_frame = flow_predictor(
             history_features=history_features,
             noise_level=noise_level,
             noisy_target=noisy_target,
+            prev_frame_features=prev_features,
         )
 
     print(f"Predicted frame shape: {pred_frame.shape}")
@@ -283,31 +289,60 @@ def test_training_step(config, motion_encoder, flow_predictor, dataloader, norma
     hist = motion_norm[:, :horizon, :]  # (B, horizon, 271)
     target = motion_norm[:, horizon, :]  # (B, 271) - next frame
 
-    # Extract 72D target (root + joints)
-    root_height_vel = target[:, :3]  # (B, 3)
-    root_rot = target[:, 69:75]  # (B, 6)
-    root_features = torch.cat([root_height_vel, root_rot], dim=-1)  # (B, 9)
-    joint_features = target[:, 6:69]  # (B, 63) - 21 joints
-    target_72d = torch.cat([root_features, joint_features], dim=-1)  # (B, 72)
+    # Extract clean target (72D)
+    clean_targets = extract_clean_target(target)  # (B, 72)
 
-    # Create noisy target for flow matching
-    noise = torch.randn_like(target_72d)
-    t = torch.rand(B, device=device)  # Noise level in [0, 1]
-    noisy_target = t.unsqueeze(-1) * target_72d + (1 - t).unsqueeze(-1) * noise
+    # New flow matching format: 64D noisy target (1D height + 63D joints)
+    x1_h = clean_targets[..., 0:1]
+    x1_vel = clean_targets[..., 1:3]
+    x1_rot = clean_targets[..., 3:9]
+    x1_joints = clean_targets[..., 9:]
+
+    # Noise only on height and joints (velocity and rotation are zero)
+    x0_h = torch.randn_like(x1_h)
+    x0_joints = torch.randn_like(x1_joints)
+
+    t = torch.rand(B, device=device)
+    t_ = t.view(B, 1)
+
+    # Create 64D noisy target
+    xt_h = t_ * x1_h + (1 - t_) * x0_h
+    xt_joints = t_ * x1_joints + (1 - t_) * x0_joints
+    noisy_target = torch.cat([xt_h, xt_joints], dim=-1)  # (B, 64)
 
     # Forward pass through encoder
     history_features = motion_encoder(hist, text_emb)
 
+    # Get prev_frame_features
+    prev_frame = hist[:, -1]  # (B, 271)
+    prev_features = extract_prev_frame_features(prev_frame)  # (B, 261)
+
     # Forward pass through predictor
-    pred_velocity = flow_predictor(
+    pred = flow_predictor(
         history_features=history_features,
         noise_level=t,
         noisy_target=noisy_target,
+        prev_frame_features=prev_features,
     )
 
-    # Compute loss (simple L2 loss on velocity)
-    target_velocity = target_72d - noisy_target  # Ground truth velocity
-    loss = nn.functional.mse_loss(pred_velocity, target_velocity)
+    # Compute loss using new format with separate components
+    pred_v_h = pred[..., 0:1]
+    pred_vel = pred[..., 1:3]
+    pred_rot = pred[..., 3:9]
+    pred_v_joints = pred[..., 9:]
+    pred_v_pos = torch.cat([pred_v_h, pred_v_joints], dim=-1)
+
+    target_v_h = x1_h - x0_h
+    target_v_joints = x1_joints - x0_joints
+    target_v_pos = torch.cat([target_v_h, target_v_joints], dim=-1)
+
+    L_flow = F.smooth_l1_loss(pred_v_pos, target_v_pos)
+    cos_sim = F.cosine_similarity(pred_rot, x1_rot, dim=-1)
+    L_dir = (1 - cos_sim).mean()
+    L_vel = F.mse_loss(pred_vel, x1_vel)
+    L_rot = F.smooth_l1_loss(pred_rot, x1_rot)
+
+    loss = 1.0 * L_flow + 0.5 * L_dir + 1.0 * L_vel + 1.0 * L_rot
 
     # Backward pass
     optimizer.zero_grad()

@@ -286,6 +286,11 @@ def test_checkpoint_loading():
     # Create a generator and save checkpoint
     generator = create_generator()
 
+    # Create a config that matches the generator's configuration
+    test_config = Config()
+    test_config.encoder_num_layers = 2  # Match create_generator()
+    test_config.predictor_num_layers = 2  # Match create_generator()
+
     # Create a temporary checkpoint
     with tempfile.TemporaryDirectory() as tmpdir:
         checkpoint_path = os.path.join(tmpdir, "test_checkpoint.pt")
@@ -294,15 +299,15 @@ def test_checkpoint_loading():
         checkpoint = {
             "encoder": generator.encoder.state_dict(),
             "predictor": generator.predictor.state_dict(),
-            "config": Config(),
+            "config": test_config,
         }
         torch.save(checkpoint, checkpoint_path)
         print(f"Saved checkpoint to {checkpoint_path}")
 
-        # Load checkpoint
+        # Load checkpoint with matching config
         loaded_generator = HumanMotionGenerator.load_from_checkpoint(
             checkpoint_path=checkpoint_path,
-            config=Config(),
+            config=test_config,
             device="cpu",
             normalizer=create_mock_normalizer(),
         )

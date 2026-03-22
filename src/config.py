@@ -57,7 +57,7 @@ class Config:
     encoder_text_proj_dim: int = 128  # Text projection dimension
     encoder_hidden_dim: int = 256  # GRU hidden size
     encoder_per_joint_dim: int = 64  # Output per-joint context dimension
-    encoder_num_layers: int = 3  # GRU layers
+    encoder_num_layers: int = 4  # GRU layers
     encoder_num_joints: int = 22  # Number of joints
     encoder_text_scale: float = 1.0  # Text conditioning scale
     encoder_dropout: float = 0.1  # Dropout between GRU layers
@@ -90,9 +90,11 @@ class Config:
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 5, "epochs": 400},
-            {"horizon": 10, "epochs": 800},
-            {"horizon": 20, "epochs": 1200},
+            {"horizon": 1, "epochs": 500},
+            {"horizon": 2, "epochs": 900},
+            {"horizon": 5, "epochs": 1200},
+            {"horizon": 10, "epochs": 1400},
+            {"horizon": 20, "epochs": 1600},
             {"horizon": 40, "epochs": 2000},
         ]
     )

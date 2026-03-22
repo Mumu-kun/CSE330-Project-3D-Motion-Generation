@@ -471,16 +471,26 @@ def log_batch_metrics(
 ) -> None:
     """
     Log batch-level metrics to W&B.
+
+    Args:
+        loss_components: Dictionary of loss component names to loss tensors.
+                        Any keys are supported - all will be logged as train/loss_{key}.
     """
     if wandb_logger is None:
         return
 
-    wandb_logger.log(
+    # Dynamically log all loss components - works with any loss computation scheme
+    log_dict = {}
+    for key, value in loss_components.items():
+        # Handle both tensors and scalars
+        if hasattr(value, "item"):
+            log_dict[f"train/loss_{key}"] = value.item()
+        else:
+            log_dict[f"train/loss_{key}"] = value
+
+    # Add other metrics
+    log_dict.update(
         {
-            "train/loss_root_y": loss_components["root_y"].item(),
-            "train/loss_root_vel": loss_components["root_vel"].item(),
-            "train/loss_root_rot": loss_components["root_rot"].item(),
-            "train/loss_joints": loss_components["joints"].item(),
             "train/loss": loss.item(),
             "train/lr": lr,
             "train/epoch": epoch,
@@ -492,9 +502,10 @@ def log_batch_metrics(
             "train/current_horizon": current_horizon,
             "train/effective_horizon": effective_horizon,
             "train/num_pred_frames": num_pred_frames,
-        },
-        step=global_step,
+        }
     )
+
+    wandb_logger.log(log_dict, step=global_step)
 
 
 def log_epoch_metrics(
@@ -690,25 +701,54 @@ def validate(
                 # Optionally handle mismatch via projection
                 pass
 
-            context = encoder(hist, text_for_encoder)  # (B, 22, D)
-
-            clean_target = extract_clean_target(target_frame)  # (B, 72)
+            contexts = encoder(hist, text_for_encoder)  # (B, 22, D)
             prev_frame = hist[:, -1]
             prev_features = extract_prev_frame_features(prev_frame)
 
+            # Flow matching target
+            target_frame = target_frames[:, 0]  # (B, 271)
+            clean_targets = extract_clean_target(target_frame)  # (B, 72)
+
+            x1_h = clean_targets[..., 0:1]
+            x1_vel = clean_targets[..., 1:3]
+            x1_rot = clean_targets[..., 3:9]
+            x1_joints = clean_targets[..., 9:]
+
+            x0_h = torch.randn_like(x1_h)
+            x0_joints = torch.randn_like(x1_joints)
+
             t = torch.rand(B, device=device)
-            noise = torch.randn_like(clean_target)
-            x_t = t.view(B, 1) * clean_target + (1 - t.view(B, 1)) * noise
+            t_ = t.view(B, 1)
+
+            xt_h = t_ * x1_h + (1 - t_) * x0_h
+            xt_joints = t_ * x1_joints + (1 - t_) * x0_joints
+            xt = torch.cat([xt_h, xt_joints], dim=-1)
 
             pred = predictor(
-                history_features=context,
+                history_features=contexts,
                 noise_level=t,
-                noisy_target=x_t,
+                noisy_target=xt,
                 prev_frame_features=prev_features,
             )
 
-            target_v = clean_target - noise
-            loss = F.mse_loss(pred, target_v)
+            pred_v_h = pred[..., 0:1]
+            pred_vel = pred[..., 1:3]
+            pred_rot = pred[..., 3:9]
+            pred_v_joints = pred[..., 9:]
+            pred_v_pos = torch.cat([pred_v_h, pred_v_joints], dim=-1)
+
+            target_v_h = x1_h - x0_h
+            target_v_joints = x1_joints - x0_joints
+            target_v_pos = torch.cat([target_v_h, target_v_joints], dim=-1)
+
+            L_flow = F.smooth_l1_loss(pred_v_pos, target_v_pos)
+            cos_sim = F.cosine_similarity(pred_rot, x1_rot, dim=-1)
+            L_dir = (1 - cos_sim).mean()
+
+            L_vel = F.mse_loss(pred_vel, x1_vel)
+            L_rot = F.smooth_l1_loss(pred_rot, x1_rot)
+
+            loss = 1.0 * L_flow + 0.5 * L_dir + 1.0 * L_vel + 1.0 * L_rot
 
             total_loss += loss.item() * B
             total_samples += B
@@ -843,32 +883,53 @@ def train(
                     # Encode history
                     contexts = encoder(hist, text_for_encoder)  # (B, 22, D)
 
-                    # Flow matching target
-                    target_frame = target_frames[:, 0]  # (B, 271)
-                    clean_targets = extract_clean_target(target_frame)  # (B, 72)
                     prev_frame = hist[:, -1]
                     prev_features = extract_prev_frame_features(prev_frame)
 
+                    # Flow matching target
+                    target_frame = target_frames[:, 0]  # (B, 271)
+                    clean_targets = extract_clean_target(target_frame)  # (B, 72)
+
+                    x1_h = clean_targets[..., 0:1]
+                    x1_vel = clean_targets[..., 1:3]
+                    x1_rot = clean_targets[..., 3:9]
+                    x1_joints = clean_targets[..., 9:]
+
+                    x0_h = torch.randn_like(x1_h)
+                    x0_joints = torch.randn_like(x1_joints)
+
                     t = torch.rand(B, device=device)
-                    noise = torch.randn_like(clean_targets)
-                    x_t = t.view(B, 1) * clean_targets + (1 - t.view(B, 1)) * noise
+                    t_ = t.view(B, 1)
+
+                    xt_h = t_ * x1_h + (1 - t_) * x0_h
+                    xt_joints = t_ * x1_joints + (1 - t_) * x0_joints
+                    xt = torch.cat([xt_h, xt_joints], dim=-1)
 
                     pred = predictor(
                         history_features=contexts,
                         noise_level=t,
-                        noisy_target=x_t,
+                        noisy_target=xt,
                         prev_frame_features=prev_features,
                     )
 
-                    target_v = clean_targets - noise
+                    pred_v_h = pred[..., 0:1]
+                    pred_vel = pred[..., 1:3]
+                    pred_rot = pred[..., 3:9]
+                    pred_v_joints = pred[..., 9:]
+                    pred_v_pos = torch.cat([pred_v_h, pred_v_joints], dim=-1)
 
-                    loss_tf = F.mse_loss(pred, target_v)
-                    loss_root_y = F.mse_loss(pred[:, 0], target_v[:, 0])
-                    loss_root_vel = F.mse_loss(pred[:, 1:3], target_v[:, 1:3])
-                    loss_root_rot = F.mse_loss(pred[:, 3:9], target_v[:, 3:9])
-                    loss_joints = F.mse_loss(pred[:, 9:], target_v[:, 9:])
+                    target_v_h = x1_h - x0_h
+                    target_v_joints = x1_joints - x0_joints
+                    target_v_pos = torch.cat([target_v_h, target_v_joints], dim=-1)
 
-                    loss = loss_tf
+                    L_flow = F.mse_loss(pred_v_pos, target_v_pos)
+                    cos_sim = F.cosine_similarity(pred_rot, x1_rot, dim=-1)
+                    L_dir = (1 - cos_sim).mean()
+
+                    L_vel = F.smooth_l1_loss(pred_vel, x1_vel)
+                    L_rot = F.smooth_l1_loss(pred_rot, x1_rot)
+
+                    loss = 1.0 * L_flow + 0.5 * L_dir + 1.0 * L_vel + 1.0 * L_rot
 
                 scaler.scale(loss).backward()
 
@@ -906,10 +967,10 @@ def train(
                     effective_horizon=effective_horizon,
                     num_pred_frames=1,
                     loss_components={
-                        "root_y": loss_root_y,
-                        "root_vel": loss_root_vel,
-                        "root_rot": loss_root_rot,
-                        "joints": loss_joints,
+                        "L_flow": L_flow.item(),
+                        "L_dir": L_dir.item(),
+                        "L_vel": L_vel.item(),
+                        "L_rot": L_rot.item(),
                     },
                     global_step=training_state["global_step"],
                 )
