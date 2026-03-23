@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from config import Config
 from models import MotionHistoryEncoder, FlowMatchingPredictor, HumanMotionGenerator
 from utils.train_utils import (
-    extract_clean_target,
+    Trainer,
     EMAModel,
 )
 from utils.motion_utils import FeatureNormalizer, extract_prev_frame_features
@@ -83,7 +83,7 @@ def test_extract_clean_target():
     frame = torch.randn(B, 271)
 
     # Extract target
-    target = extract_clean_target(frame)
+    target = Trainer.extract_clean_target(frame)
 
     # Check shape
     assert target.shape == (B, 72), f"Expected shape (B, 72), got {target.shape}"
@@ -308,7 +308,7 @@ def test_training_iteration(encoder, predictor, config):
     target = target_frames[:, -1, :]  # (B, 271)
 
     # Extract clean target (72D)
-    clean_targets = extract_clean_target(target)  # (B, 72)
+    clean_targets = Trainer.extract_clean_target(target)  # (B, 72)
 
     print(f"Clean targets shape: {clean_targets.shape}")
 

@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Tuple, Union, cast
 from config import Config, FlowMatchingPredictorConfig
 from transformers.activations import ACT2FN
 
@@ -67,6 +67,10 @@ class KinematicChainEncoder(nn.Module):
 
         self.register_buffer("joint_to_chain", torch.tensor(joint_to_chain))
         self.register_buffer("joint_to_depth", torch.tensor(joint_to_depth))
+
+        # Type annotations for Pylance (converts Module buffers to indexed tensors)
+        self.joint_to_chain: torch.Tensor
+        self.joint_to_depth: torch.Tensor
 
         self.chain_emb = nn.Embedding(5, model_dim // 2)
         self.depth_emb = nn.Embedding(8, model_dim // 2)
@@ -184,7 +188,7 @@ class MotionHistoryEncoder(nn.Module):
         history_features, _ = self._gru_block(motion_seq, text_emb, h=None)
         return history_features
 
-    def step(
+    def gru_step(
         self,
         x_t: torch.Tensor,  # (B, motion_dim)  single frame features
         text_emb: torch.Tensor,  # (B, text_dim)
@@ -212,7 +216,7 @@ class SinusoidalEmbedder(nn.Module):
     def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
         super().__init__()
         self.frequency_embedding_size = frequency_embedding_size
-        self.mlp = nn.Sequential(
+        self.mlp: nn.Sequential = nn.Sequential(
             nn.Linear(frequency_embedding_size, hidden_size, bias=True),
             nn.SiLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
@@ -441,9 +445,8 @@ class FlowMatchingPredictor(nn.Module):
         self.apply(_basic_init)
 
         # Initialize timestep embedding MLP.
-        nn.init.normal_(self.time_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.time_embedder.mlp[2].weight, std=0.02)
-
+        nn.init.normal_(cast(nn.Linear, self.time_embedder.mlp[0]).weight, std=0.02)
+        nn.init.normal_(cast(nn.Linear, self.time_embedder.mlp[2]).weight, std=0.02)
         # Zero-out adaln modulation layers in DiT blocks:
         for layer in self.layers:
             if isinstance(layer, SpatialTrackLayer):
@@ -631,7 +634,7 @@ class HumanMotionGenerator:
         O(n) complexity and Markov-safe autoregressive generation.
 
         Args:
-            text: Text prompt(s) - str, List[str], or pre-encoded tensor (B, l_seq, 512)
+            text: Text prompt(s) - str, List[str], or pre-encoded tensor (B, 1, 512)
             num_frames: Number of frames to generate
             num_steps: Number of flow matching ODE steps
             horizon: Number of recent frames to use for context encoding
@@ -663,8 +666,13 @@ class HumanMotionGenerator:
                 B = text.shape[0]
             else:
                 # Already a tensor
+                if text.ndim != 3 or text.shape[1] != 1:
+                    raise ValueError(
+                        f"Pre-encoded text must have shape (B, 1, 512); got {tuple(text.shape)}"
+                    )
                 B = text.shape[0]
             device = next(self.parameters()).device
+            text = text.to(device=device)
 
             # ========================================
             # History Initialization
@@ -735,8 +743,8 @@ class HumanMotionGenerator:
                 else:
                     encoder_input = feature_history
 
-                # Prepare text embedding: (B, 1, 512) -> (B, 512)
-                text_emb = text.squeeze(1) if text.dim() == 3 else text
+                # Strict text shape policy: (B, 1, 512) at entry, (B, 512) for encoder/predictor.
+                text_emb = text[:, 0, :]
 
                 context_cond = self.encoder(
                     encoder_input,
@@ -783,6 +791,7 @@ class HumanMotionGenerator:
                     prev_positions=current_positions,
                     dataset_type=dataset_type,
                     use_fk_for_ric=False,
+                    normalizer=self.normalizer,
                 )  # (B, 271), (B, 3)
 
                 # ========================================

@@ -10,6 +10,8 @@ venv/
 *.code-workspace
 .idea/
 .kilocode
+.github
+.agents
 
 # Jupyter
 .ipynb_checkpoints/
@@ -34,3 +36,4 @@ momask-codes/
 *_cache/
 sample_data/humanml3d-subset
 sample_data/archive.zip
+tests/dataset/humanml3d-subset-mini

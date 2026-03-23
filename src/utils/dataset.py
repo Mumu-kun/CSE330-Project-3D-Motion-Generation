@@ -167,7 +167,7 @@ class Text2MotionDataset(Dataset):
             ):
                 batch_caps = missing_captions[i : i + batch_size]
                 with torch.no_grad():
-                    # (B, 77, 512) - CLIP sequence embeddings
+                    # (B, 1, 512) - pooled CLIP embeddings
                     embeddings = clip_encoder(batch_caps).cpu()
 
                 for cap, emb in zip(batch_caps, embeddings):
@@ -279,7 +279,34 @@ class Text2MotionDataset(Dataset):
         else:
             text_embedding = text_embedding.float()
 
-        # text_embedding shape: (77, 512) - CLIP sequence embeddings
+        # Normalize to strict shape: (1, 512)
+        if text_embedding.ndim == 1:
+            if text_embedding.shape[0] != CLIP_EMBED_DIM:
+                raise ValueError(
+                    f"Invalid 1D text embedding shape {tuple(text_embedding.shape)} for caption '{caption}'. "
+                    f"Expected ({CLIP_EMBED_DIM},)."
+                )
+            text_embedding = text_embedding.unsqueeze(0)
+        elif text_embedding.ndim == 2:
+            if text_embedding.shape == (1, CLIP_EMBED_DIM):
+                pass
+            elif text_embedding.shape == (CLIP_MAX_SEQ_LEN, CLIP_EMBED_DIM):
+                raise ValueError(
+                    "Detected legacy CLIP sequence embedding shape (77, 512) in text cache. "
+                    "Regenerate text_embeddings_cache.pt using pooled CLIP outputs (1, 512)."
+                )
+            else:
+                raise ValueError(
+                    f"Invalid 2D text embedding shape {tuple(text_embedding.shape)} for caption '{caption}'. "
+                    f"Expected (1, {CLIP_EMBED_DIM})."
+                )
+        else:
+            raise ValueError(
+                f"Invalid text embedding rank {text_embedding.ndim} for caption '{caption}'. "
+                "Expected rank 2 with shape (1, 512)."
+            )
+
+        # text_embedding shape: (1, 512) - pooled CLIP embedding
         # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
         return caption, motion, joints, original_length, text_embedding
 
@@ -323,7 +350,7 @@ def text2motion_collate_fn(
       - motion: (max_T, 271) torch.Tensor - full 271D features
       - joints: (max_T, J, 3) torch.Tensor
       - length: int
-      - text_embedding: (77, 512) torch.Tensor - CLIP sequence embeddings
+            - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
     """
     # Lists of items
     captions = [b[0] for b in batch]
@@ -345,6 +372,13 @@ def text2motion_collate_fn(
     motions_list = [to_tensor(x) for x in motions_list]
     joints_list = [to_tensor(x) for x in joints_list]
     text_embs_list = [to_tensor(x) for x in text_embs_list]
+
+    for idx, text_emb in enumerate(text_embs_list):
+        if text_emb.ndim != 2 or text_emb.shape[0] != 1 or text_emb.shape[1] != CLIP_EMBED_DIM:
+            raise ValueError(
+                f"Invalid text embedding at batch index {idx}: shape {tuple(text_emb.shape)}. "
+                f"Expected (1, {CLIP_EMBED_DIM})."
+            )
 
     # Stack tensors directly
     motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)

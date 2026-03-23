@@ -888,6 +888,7 @@ def generated_positions_to_271d(
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
     use_fk_for_ric: bool = False,
+    normalizer: Optional["FeatureNormalizer"] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute a single 271D feature frame from newly generated global joint positions.
@@ -913,9 +914,10 @@ def generated_positions_to_271d(
         dataset_type: Dataset key (default "t2m").
         feet_thre: Foot contact threshold.
         use_fk_for_ric: If True, compute RIC from FK-consistent positions.
+        normalizer: Optional FeatureNormalizer applied to the output frame.
 
     Returns:
-        new_frame: (B, 271) extracted feature frame.
+        new_frame: (B, 271) extracted feature frame (normalized if normalizer is provided).
         new_root_pos: (B, 3) absolute current root position.
     """
     if new_positions.ndim != 3 or new_positions.shape[-2:] != (22, 3):
@@ -1002,9 +1004,11 @@ def generated_positions_to_271d(
         dim=-1,
     )
 
-    return new_frame.to(device=device, dtype=dtype), new_root_pos.to(
-        device=device, dtype=dtype
-    )
+    new_frame = new_frame.to(device=device, dtype=dtype)
+    if normalizer is not None:
+        new_frame = normalizer.normalize(new_frame)
+
+    return new_frame, new_root_pos.to(device=device, dtype=dtype)
 
 
 class RootPositionTracker:

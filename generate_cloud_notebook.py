@@ -48,6 +48,7 @@ def generate_cloud_notebook():
     build_dir = script_dir / "build"
     source_notebook = source_dir / "pipeline.ipynb"
     output_notebook = build_dir / "notebook.ipynb"
+    header_notebook = build_dir / "header.ipynb"
 
     # Files to include in cloud notebook
     support_files = {
@@ -160,7 +161,15 @@ def generate_cloud_notebook():
         "source": setup_source,
     }
 
-    nb["cells"] = [setup_markdown, setup_code] + nb["cells"]
+    prev_cells = nb.get("cells", [])
+
+    nb["cells"] = [setup_markdown, setup_code]
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    with open(header_notebook, "w", encoding="utf-8") as f:
+        json.dump(nb, f, indent=1)
+
+    nb["cells"] = [setup_markdown, setup_code] + prev_cells
 
     # 6. Save the bundled notebook
     build_dir.mkdir(parents=True, exist_ok=True)

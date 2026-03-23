@@ -1,12 +1,12 @@
 """
-Test FlowMatchingPredictor with new API: required global_cond and 3D relative_shifts.
+Test FlowMatchingPredictor with new API: required text_embedding and 3D relative_shifts.
 
 This test verifies:
 1. Predictor initialization with use_relative_shift enabled
 2. Forward pass with explicit relative_shifts (3D root-relative offsets)
 3. Forward pass with None relative_shifts (auto-zero padding)
 4. Output shape and numerical stability
-5. Global conditioning requirement enforced
+5. Text conditioning requirement enforced
 """
 
 import torch
@@ -88,7 +88,7 @@ def test_forward_with_explicit_shifts(predictor, config, pred_config):
     N = 22  # Joint count
     F = config.encoder_per_joint_dim  # 64
     D = pred_config.track_dimensionality  # 3
-    H = pred_config.hidden_size  # 256
+    C = pred_config.global_cond_dim  # 512
 
     device = config.device
 
@@ -96,7 +96,7 @@ def test_forward_with_explicit_shifts(predictor, config, pred_config):
     track_features = torch.randn(B, N, F, device=device)  # (2, 22, 64)
     noised_tracks = torch.randn(B, N, D, device=device)  # (2, 22, 3)
     timesteps = torch.rand(B, device=device)  # (2,) in [0, 1)
-    global_cond = torch.randn(B, H, device=device)  # (2, 256)
+    text_embedding = torch.randn(B, C, device=device)  # (2, 512)
 
     # Compute relative shifts as root-relative offsets
     relative_shifts = noised_tracks - noised_tracks[:, :1, :]  # (2, 22, 3)
@@ -105,7 +105,7 @@ def test_forward_with_explicit_shifts(predictor, config, pred_config):
     print(f"  track_features:  {track_features.shape}")
     print(f"  noised_tracks:   {noised_tracks.shape}")
     print(f"  timesteps:       {timesteps.shape}")
-    print(f"  global_cond:     {global_cond.shape}")
+    print(f"  text_embedding:  {text_embedding.shape}")
     print(f"  relative_shifts: {relative_shifts.shape}")
 
     # Forward pass
@@ -114,7 +114,7 @@ def test_forward_with_explicit_shifts(predictor, config, pred_config):
             track_features=track_features,
             noised_tracks=noised_tracks,
             timesteps=timesteps,
-            global_cond=global_cond,
+            text_embedding=text_embedding,
             relative_shifts=relative_shifts,
         )
 
@@ -138,7 +138,7 @@ def test_forward_with_explicit_shifts(predictor, config, pred_config):
     # Check output range (should be relatively bounded)
     max_val = flow_pred.abs().max().item()
     print(
-        f"[OK] Output value range: [{output.min():.4f}, {output.max():.4f}] (max abs: {max_val:.4f})"
+        f"[OK] Output value range: [{flow_pred.min():.4f}, {flow_pred.max():.4f}] (max abs: {max_val:.4f})"
     )
 
     print("[PASS] Forward pass with explicit shifts successful\n")
@@ -160,7 +160,7 @@ def test_forward_with_none_shifts(predictor, config, pred_config):
     N = 22  # Joint count
     F = config.encoder_per_joint_dim  # 64
     D = pred_config.track_dimensionality  # 3
-    H = pred_config.hidden_size  # 256
+    C = pred_config.global_cond_dim  # 512
 
     device = config.device
 
@@ -168,13 +168,13 @@ def test_forward_with_none_shifts(predictor, config, pred_config):
     track_features = torch.randn(B, N, F, device=device)  # (2, 22, 64)
     noised_tracks = torch.randn(B, N, D, device=device)  # (2, 22, 3)
     timesteps = torch.rand(B, device=device)  # (2,)
-    global_cond = torch.randn(B, H, device=device)  # (2, 256)
+    text_embedding = torch.randn(B, C, device=device)  # (2, 512)
 
     print(f"Input shapes (no explicit shifts provided):")
     print(f"  track_features:  {track_features.shape}")
     print(f"  noised_tracks:   {noised_tracks.shape}")
     print(f"  timesteps:       {timesteps.shape}")
-    print(f"  global_cond:     {global_cond.shape}")
+    print(f"  text_embedding:  {text_embedding.shape}")
     print(f"  relative_shifts: None (should auto-zero)")
 
     # Forward pass with None relative_shifts
@@ -183,7 +183,7 @@ def test_forward_with_none_shifts(predictor, config, pred_config):
             track_features=track_features,
             noised_tracks=noised_tracks,
             timesteps=timesteps,
-            global_cond=global_cond,
+            text_embedding=text_embedding,
             relative_shifts=None,  # Should auto-zero
         )
 
@@ -211,7 +211,7 @@ def test_forward_with_none_shifts(predictor, config, pred_config):
             track_features=track_features,
             noised_tracks=noised_tracks,
             timesteps=timesteps,
-            global_cond=global_cond,
+            text_embedding=text_embedding,
             relative_shifts=explicit_zeros,
         )
 
@@ -229,8 +229,8 @@ def test_forward_with_none_shifts(predictor, config, pred_config):
 # =============================================================================
 
 
-def test_global_cond_required(predictor, config, pred_config):
-    """Test that global_cond parameter is required."""
+def test_text_embedding_required(predictor, config, pred_config):
+    """Test that text_embedding parameter is required."""
     print("=" * 70)
     print("Test 4: Global Conditioning is Required")
     print("=" * 70)
@@ -239,8 +239,6 @@ def test_global_cond_required(predictor, config, pred_config):
     N = 22
     F = config.encoder_per_joint_dim
     D = pred_config.track_dimensionality
-    H = pred_config.hidden_size
-
     device = config.device
 
     # Create mock inputs
@@ -248,7 +246,7 @@ def test_global_cond_required(predictor, config, pred_config):
     noised_tracks = torch.randn(B, N, D, device=device)
     timesteps = torch.rand(B, device=device)
 
-    print(f"Attempting forward pass WITHOUT global_cond (should fail)...")
+    print(f"Attempting forward pass WITHOUT text_embedding (should fail)...")
 
     try:
         with torch.no_grad():
@@ -256,15 +254,15 @@ def test_global_cond_required(predictor, config, pred_config):
                 track_features=track_features,
                 noised_tracks=noised_tracks,
                 timesteps=timesteps,
-                # global_cond intentionally omitted
+                # text_embedding intentionally omitted
             )
         print(
-            "[FAIL] Forward pass succeeded without global_cond! This should not happen!"
+            "[FAIL] Forward pass succeeded without text_embedding! This should not happen!"
         )
         return False
     except TypeError as e:
         print(f"[OK] Expected TypeError caught: {str(e)[:80]}...")
-        print(f"[OK] global_cond is correctly required")
+        print(f"[OK] text_embedding is correctly required")
 
     print("[PASS] Global conditioning requirement enforced\n")
     return True
@@ -284,7 +282,7 @@ def test_batch_size_variation(predictor, config, pred_config):
     N = 22
     F = config.encoder_per_joint_dim
     D = pred_config.track_dimensionality
-    H = pred_config.hidden_size
+    C = pred_config.global_cond_dim
     device = config.device
 
     batch_sizes = [1, 2, 4, 8]
@@ -293,14 +291,14 @@ def test_batch_size_variation(predictor, config, pred_config):
         track_features = torch.randn(B, N, F, device=device)
         noised_tracks = torch.randn(B, N, D, device=device)
         timesteps = torch.rand(B, device=device)
-        global_cond = torch.randn(B, H, device=device)
+        text_embedding = torch.randn(B, C, device=device)
 
         with torch.no_grad():
             output = predictor(
                 track_features=track_features,
                 noised_tracks=noised_tracks,
                 timesteps=timesteps,
-                global_cond=global_cond,
+                text_embedding=text_embedding,
             )
 
         # Unpack tuple: (flow_prediction, hidden_states, attentions)
@@ -333,8 +331,8 @@ def main():
         # Test 3: Forward with None shifts (auto-zero)
         test_forward_with_none_shifts(predictor, config, pred_config)
 
-        # Test 4: Global conditioning requirement
-        test_global_cond_required(predictor, config, pred_config)
+        # Test 4: Text conditioning requirement
+        test_text_embedding_required(predictor, config, pred_config)
 
         # Test 5: Batch size variation
         test_batch_size_variation(predictor, config, pred_config)

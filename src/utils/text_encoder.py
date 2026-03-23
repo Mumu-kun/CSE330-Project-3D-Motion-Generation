@@ -46,7 +46,7 @@ class CLIPEncoder(torch.nn.Module):
             text: A single string or a list of strings.
 
         Returns:
-            embeddings: (B, 1, 512) tensor containing the pooled embeddings.
+            embeddings: (B, 1, 512) tensor containing pooled CLIP embeddings.
         """
         if isinstance(text, str):
             text = [text]
@@ -61,7 +61,7 @@ class CLIPEncoder(torch.nn.Module):
 
         # Use the pooler_output for a global representation of the sentence
         # Shape: (Batch_Size, 512)
-        embeddings = outputs.pooler_output
+        embeddings = outputs.pooler_output.unsqueeze(1)
 
         return embeddings
 
