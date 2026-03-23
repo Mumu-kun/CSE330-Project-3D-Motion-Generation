@@ -19,6 +19,7 @@ Redesigned training mechanism:
 import copy
 import os
 import time
+from contextlib import contextmanager
 from typing import Optional, Tuple, Dict, Any, Union, TypeVar, Generic
 
 import torch
@@ -89,6 +90,56 @@ class EMAModel(Generic[T]):
         return self
 
 
+class TimingStats:
+    """Aggregates timing statistics across training steps."""
+
+    def __init__(self):
+        self.timings: Dict[str, list[float]] = {}
+        self.step_count = 0
+
+    def record(self, key: str, elapsed_ms: float) -> None:
+        """Record a timing measurement in milliseconds."""
+        if key not in self.timings:
+            self.timings[key] = []
+        self.timings[key].append(elapsed_ms)
+
+    def get_averages(self) -> Dict[str, float]:
+        """Get average timing for each key in milliseconds."""
+        return {
+            key: sum(times) / len(times) for key, times in self.timings.items() if times
+        }
+
+    def reset(self) -> None:
+        """Reset all timings."""
+        self.timings.clear()
+        self.step_count = 0
+
+    def __str__(self) -> str:
+        """Pretty print timing summary."""
+        averages = self.get_averages()
+        lines = ["=== Timing Summary ==="]
+        for key in sorted(averages.keys()):
+            lines.append(f"  {key}: {averages[key]:.2f}ms")
+        total = sum(averages.values())
+        lines.append(f"  Total: {total:.2f}ms")
+        return "\n".join(lines)
+
+
+@contextmanager
+def timer(stats: Optional[TimingStats], key: str):
+    """Context manager for timing operations with optional recording."""
+    if stats is None:
+        yield
+        return
+
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        stats.record(key, elapsed_ms)
+
+
 class Trainer:
     """Class-based trainer that holds global training dependencies and config."""
 
@@ -115,6 +166,9 @@ class Trainer:
         self.resume_from = resume_from
         self.normalizer = normalizer
         self.val_dataloader = val_dataloader
+        self.timing_stats: Optional[TimingStats] = (
+            TimingStats() if config.enable_profiling else None
+        )
 
     @staticmethod
     def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
@@ -493,7 +547,8 @@ class Trainer:
         target_joints = joints[:, 1:]
         target_relative_shifts = relative_shifts[:, 1:]
 
-        context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
+        with timer(self.timing_stats, "forward/gru_init"):
+            context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
         if context is None:
             raise RuntimeError("Encoder context was not initialized from history.")
 
@@ -514,15 +569,16 @@ class Trainer:
             xt = t_ * x1 + (1 - t_) * x0
             relative_shifts_step = prev_relative_shifts[:, step_idx]
 
-            pred, _, _ = pred_model.forward(
-                track_features=context,
-                noised_tracks=xt,
-                timesteps=t,
-                relative_shifts=relative_shifts_step,
-                text_embedding=text_for_encoder,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
+            with timer(self.timing_stats, "forward/predictor_flow"):
+                pred, _, _ = pred_model.forward(
+                    track_features=context,
+                    noised_tracks=xt,
+                    timesteps=t,
+                    relative_shifts=relative_shifts_step,
+                    text_embedding=text_for_encoder,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                )
             flow_losses.append(F.mse_loss(pred, x1 - x0))
 
             rollout_mask = self.get_rollout_mask(
@@ -535,46 +591,56 @@ class Trainer:
                 x_t_roll = torch.randn_like(x1)
                 pred_roll_endpoint: Optional[torch.Tensor] = None
                 try:
-                    with torch.no_grad():
-                        for ode_step in range(ode_steps):
-                            tau = torch.full((B,), float(ode_step) * dt, device=device)
-                            pred_roll = pred_model.forward(
-                                track_features=context,
-                                noised_tracks=x_t_roll,
-                                timesteps=tau,
-                                relative_shifts=x_t_roll,
-                                text_embedding=text_for_encoder,
+                    with timer(self.timing_stats, "forward/rollout_ode"):
+                        with torch.no_grad():
+                            for ode_step in range(ode_steps):
+                                with timer(
+                                    self.timing_stats, "forward/rollout_ode_step"
+                                ):
+                                    tau = torch.full(
+                                        (B,), float(ode_step) * dt, device=device
+                                    )
+                                    pred_roll = pred_model.forward(
+                                        track_features=context,
+                                        noised_tracks=x_t_roll,
+                                        timesteps=tau,
+                                        relative_shifts=x_t_roll,
+                                        text_embedding=text_for_encoder,
+                                        output_attentions=False,
+                                        output_hidden_states=False,
+                                    )[0]
+                                    x_t_roll = x_t_roll + pred_roll * dt
+
+                    if self.config.use_consistency_loss:
+                        with timer(self.timing_stats, "forward/consistency_pred"):
+                            rolled_count = int(rollout_mask.sum().item())
+                            tau_endpoint = torch.full(
+                                (rolled_count,),
+                                float(ode_steps - 1) * dt,
+                                device=device,
+                            )
+                            pred_roll_endpoint = pred_model.forward(
+                                track_features=context[rollout_mask],
+                                noised_tracks=x_t_roll[rollout_mask],
+                                timesteps=tau_endpoint,
+                                relative_shifts=x_t_roll[rollout_mask],
+                                text_embedding=text_for_encoder[rollout_mask],
                                 output_attentions=False,
                                 output_hidden_states=False,
                             )[0]
-                            x_t_roll = x_t_roll + pred_roll * dt
-
-                    if self.config.use_consistency_loss:
-                        rolled_count = int(rollout_mask.sum().item())
-                        tau_endpoint = torch.full(
-                            (rolled_count,), float(ode_steps - 1) * dt, device=device
-                        )
-                        pred_roll_endpoint = pred_model.forward(
-                            track_features=context[rollout_mask],
-                            noised_tracks=x_t_roll[rollout_mask],
-                            timesteps=tau_endpoint,
-                            relative_shifts=x_t_roll[rollout_mask],
-                            text_embedding=text_for_encoder[rollout_mask],
-                            output_attentions=False,
-                            output_hidden_states=False,
-                        )[0]
                 finally:
                     if predictor_was_training:
                         pred_model.train()
 
-                pred_positions_roll = current_positions + x_t_roll
-                rollout_frame, _ = generated_positions_to_271d(
-                    new_positions=pred_positions_roll,
-                    prev_positions=current_positions,
-                    dataset_type="t2m",
-                    use_fk_for_ric=False,
-                    normalizer=self.normalizer,
-                )
+                with timer(self.timing_stats, "forward/pos_transform"):
+                    pred_positions_roll = current_positions + x_t_roll
+                    rollout_frame, _ = generated_positions_to_271d(
+                        new_positions=pred_positions_roll,
+                        prev_positions=current_positions,
+                        dataset_type="t2m",
+                        use_fk_for_ric=False,
+                        normalizer=self.normalizer,
+                    )
                 next_input[rollout_mask] = rollout_frame[rollout_mask]
 
                 if self.config.use_consistency_loss and pred_roll_endpoint is not None:
@@ -594,9 +660,10 @@ class Trainer:
             else:
                 current_positions = target_joints[:, step_idx].detach()
 
-            context, h_state = enc.gru_step(
-                next_input.detach(), text_for_encoder, h_state
-            )
+            with timer(self.timing_stats, "forward/gru_step"):
+                context, h_state = enc.gru_step(
+                    next_input.detach(), text_for_encoder, h_state
+                )
 
         flow_loss = torch.stack(flow_losses).mean()
         consistency_loss = (
@@ -917,60 +984,66 @@ class Trainer:
                     self.dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch"
                 )
                 batch_start_time = time.time()
+                timing_log_interval = max(1, int(self.config.timing_log_interval))
 
                 for batch in pbar:
-                    motion, joints, text, lengths, B, T = self.unpack_batch(
-                        batch=batch,
-                        device=device,
-                    )
-
-                    motion, joints, relative_shifts, effective_horizon = (
-                        self.sample_next_frame_window(
-                            motion=motion,
-                            joints=joints,
-                            curr_horizon=curriculum_state["current_horizon"],
+                    with timer(self.timing_stats, "data_load"):
+                        motion, joints, text, lengths, B, T = self.unpack_batch(
+                            batch=batch,
+                            device=device,
                         )
-                    )
+
+                        motion, joints, relative_shifts, effective_horizon = (
+                            self.sample_next_frame_window(
+                                motion=motion,
+                                joints=joints,
+                                curr_horizon=curriculum_state["current_horizon"],
+                            )
+                        )
 
                     text_input = self.apply_cfg_dropout(text, device, B)
-                    text_for_encoder = self.prepare_text_for_encoder(
-                        text_input, device, B
-                    )
+                    with timer(self.timing_stats, "text_prep"):
+                        text_for_encoder = self.prepare_text_for_encoder(
+                            text_input, device, B
+                        )
 
                     optimizer.zero_grad(set_to_none=True)
 
-                    with torch.amp.autocast(device_str, dtype=amp_dtype, enabled=use_amp):  # type: ignore
-                        (
-                            loss,
-                            flow_loss,
-                            consistency_loss,
-                            pred_horizon,
-                            rollout_prob,
-                        ) = self.incremental_flow_loss(
-                            motion=motion,
-                            joints=joints,
-                            relative_shifts=relative_shifts,
-                            text_for_encoder=text_for_encoder,
-                            epoch=epoch,
-                            total_epochs=num_epochs,
-                            device=device,
-                            stochastic_rollout=True,
+                    with timer(self.timing_stats, "forward"):
+                        with torch.amp.autocast(device_str, dtype=amp_dtype, enabled=use_amp):  # type: ignore
+                            (
+                                loss,
+                                flow_loss,
+                                consistency_loss,
+                                pred_horizon,
+                                rollout_prob,
+                            ) = self.incremental_flow_loss(
+                                motion=motion,
+                                joints=joints,
+                                relative_shifts=relative_shifts,
+                                text_for_encoder=text_for_encoder,
+                                epoch=epoch,
+                                total_epochs=num_epochs,
+                                device=device,
+                                stochastic_rollout=True,
+                            )
+
+                    with timer(self.timing_stats, "backward"):
+                        scaler.scale(loss).backward()
+
+                        scaler.unscale_(optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            list(self.encoder.parameters())
+                            + list(self.predictor.parameters()),
+                            max_grad_norm,
                         )
 
-                    scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
 
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        list(self.encoder.parameters())
-                        + list(self.predictor.parameters()),
-                        max_grad_norm,
-                    )
-
-                    scaler.step(optimizer)
-                    scaler.update()
-
-                    encoder_ema.update(self.encoder)
-                    predictor_ema.update(self.predictor)
+                    with timer(self.timing_stats, "ema_update"):
+                        encoder_ema.update(self.encoder)
+                        predictor_ema.update(self.predictor)
 
                     batch_time = time.time() - batch_start_time
                     batch_start_time = time.time()
@@ -1005,6 +1078,24 @@ class Trainer:
                         global_step=training_state["global_step"],
                     )
 
+                    if (
+                        self.timing_stats is not None
+                        and (training_state["global_step"] + 1) % timing_log_interval
+                        == 0
+                    ):
+                        timing_dict = self.timing_stats.get_averages()
+                        if wandb_logger is not None:
+                            wandb_logger.log(
+                                {
+                                    f"time/{key}_ms": val
+                                    for key, val in timing_dict.items()
+                                },
+                                step=training_state["global_step"],
+                            )
+                        tqdm.write(
+                            f"[Step {training_state['global_step']}] {str(self.timing_stats)}"
+                        )
+
                     if training_state["global_step"] % 100 == 0:
                         tqdm.write(
                             f"[Epoch {epoch}] [Step {training_state['global_step']}] "
@@ -1030,15 +1121,16 @@ class Trainer:
                         val_encoder = self.encoder
                         val_predictor = self.predictor
 
-                    val_metrics = self.validate(
-                        encoder=val_encoder,
-                        predictor=val_predictor,
-                        horizon=curriculum_state["current_horizon"],
-                        num_batches=val_batches,
-                        device=device,
-                        epoch=epoch,
-                        total_epochs=num_epochs,
-                    )
+                    with timer(self.timing_stats, "validation"):
+                        val_metrics = self.validate(
+                            encoder=val_encoder,
+                            predictor=val_predictor,
+                            horizon=curriculum_state["current_horizon"],
+                            num_batches=val_batches,
+                            device=device,
+                            epoch=epoch,
+                            total_epochs=num_epochs,
+                        )
 
                     val_loss = val_metrics["val_loss"]
                     tqdm.write(f"Validation loss: {val_loss:.6f}")
@@ -1061,19 +1153,33 @@ class Trainer:
                     global_step=training_state["global_step"],
                 )
 
-                training_state = self.handle_checkpointing(
-                    save_dir=checkpoint_dir,
-                    encoder_ema=encoder_ema,
-                    predictor_ema=predictor_ema,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=training_state["global_step"],
-                    avg_epoch_loss=avg_epoch_loss,
-                    curriculum_state=curriculum_state,
-                    training_state=training_state,
-                    val_metrics=val_metrics,
-                )
+                with timer(self.timing_stats, "checkpoint"):
+                    training_state = self.handle_checkpointing(
+                        save_dir=checkpoint_dir,
+                        encoder_ema=encoder_ema,
+                        predictor_ema=predictor_ema,
+                        optimizer=optimizer,
+                        scaler=scaler,
+                        epoch=epoch,
+                        global_step=training_state["global_step"],
+                        avg_epoch_loss=avg_epoch_loss,
+                        curriculum_state=curriculum_state,
+                        training_state=training_state,
+                        val_metrics=val_metrics,
+                    )
+
+                if self.timing_stats is not None:
+                    tqdm.write(str(self.timing_stats))
+                    if wandb_logger is not None:
+                        epoch_timing = self.timing_stats.get_averages()
+                        wandb_logger.log(
+                            {
+                                f"epoch_time/{key}_ms": val
+                                for key, val in epoch_timing.items()
+                            },
+                            step=training_state["global_step"],
+                        )
+                    self.timing_stats.reset()
 
         except KeyboardInterrupt:
             tqdm.write("Training interrupted. Saving emergency checkpoint...")

@@ -130,16 +130,18 @@ Denormalize output for reconstruction (via flow_output_to_271d)
 The training loop supports periodic validation to monitor generalization and detect overfitting.
 
 **Configuration** (in [`Config`](src/config.py)):
-| Setting                     | Type  | Default | Description                                                  |
-| --------------------------- | ----- | ------- | ------------------------------------------------------------ |
-| `val_interval`              | int   | 5       | Run validation every N epochs                                |
-| `val_batches`               | int   | 20      | Number of validation batches per run (-1 for full set)       |
-| `val_use_ema`               | bool  | True    | Use EMA models for validation (more stable)                  |
-| `save_best_val`             | bool  | True    | Save separate checkpoint for best validation loss            |
-| `rollout_prob_start`        | float | 0.0     | Rollout probability at epoch 0 for AR routing                |
-| `rollout_prob_end`          | float | 0.5     | Rollout probability at final epoch for AR routing            |
-| `rollout_integration_steps` | int   | 10      | Number of ODE integration steps in rollout branch            |
-| `use_consistency_loss`      | bool  | False   | Enables endpoint consistency recompute after no-grad rollout |
+| Setting                     | Type  | Default | Description                                                   |
+| --------------------------- | ----- | ------- | ------------------------------------------------------------- |
+| `val_interval`              | int   | 5       | Run validation every N epochs                                 |
+| `val_batches`               | int   | 20      | Number of validation batches per run (-1 for full set)        |
+| `val_use_ema`               | bool  | True    | Use EMA models for validation (more stable)                   |
+| `save_best_val`             | bool  | True    | Save separate checkpoint for best validation loss             |
+| `enable_profiling`          | bool  | False   | Enable timing instrumentation for train loop and forward pass |
+| `timing_log_interval`       | int   | 100     | Log averaged timing metrics every N training steps            |
+| `rollout_prob_start`        | float | 0.0     | Rollout probability at epoch 0 for AR routing                 |
+| `rollout_prob_end`          | float | 0.5     | Rollout probability at final epoch for AR routing             |
+| `rollout_integration_steps` | int   | 10      | Number of ODE integration steps in rollout branch             |
+| `use_consistency_loss`      | bool  | False   | Enables endpoint consistency recompute after no-grad rollout  |
 
 Rollout probability is linearly interpolated from `rollout_prob_start` to `rollout_prob_end` and is applied in both training and validation loss unroll.
 When `use_consistency_loss` is enabled, rollout integration stays in no-grad and consistency gradients come from a single endpoint recompute on rolled samples.
@@ -168,6 +170,11 @@ encoder_ema, predictor_ema = Trainer.train(
 - `epoch/val_loss` logged to W&B
 - Checkpoints: `best.pt` (best training loss), `best_val.pt` (best validation loss)
 - Checkpoints include validation state: `best_val_loss`, `best_val_epoch`
+
+When profiling is enabled, `Trainer` also records and logs averaged timing metrics:
+- Per-step interval logs: `time/{op}_ms` (e.g., `time/forward_ms`, `time/forward/predictor_flow_ms`, `time/backward_ms`)
+- End-of-epoch logs: `epoch_time/{op}_ms`
+- Forward breakdown keys: `forward/gru_init`, `forward/predictor_flow`, `forward/rollout_ode`, `forward/rollout_ode_step`, `forward/consistency_pred`, `forward/pos_transform`, `forward/gru_step`
 
 ### Train Classmethod
 

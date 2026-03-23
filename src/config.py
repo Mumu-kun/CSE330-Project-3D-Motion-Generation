@@ -152,6 +152,10 @@ class Config:
     val_use_ema: bool = True  # Use EMA models for validation
     save_best_val: bool = True  # Save separate checkpoint for best validation loss
 
+    # Profiling settings
+    enable_profiling: bool = False  # Enable timing instrumentation
+    timing_log_interval: int = 100  # Log timings every N batches
+
     unit_length = 5
 
     def __post_init__(self):
