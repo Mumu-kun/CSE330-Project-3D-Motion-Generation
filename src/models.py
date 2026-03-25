@@ -24,6 +24,7 @@ from config import Config, FlowMatchingPredictorConfig
 from transformers.activations import ACT2FN
 
 from utils.motion_utils import (
+    get_fk_offsets,
     sequence_joints_to_features,
     generated_positions_to_271d,
     FeatureNormalizer,
@@ -629,6 +630,7 @@ class HumanMotionGenerator:
         total_duration: Optional[torch.Tensor] = None,
         guidance_scale: float = 1.0,
         dataset_type: str = "t2m",
+        use_fk=True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate n consecutive animation frames autoregressively.
@@ -645,7 +647,7 @@ class HumanMotionGenerator:
             input_positions: Optional initial global positions (B, N, 22, 3) or (B, 22, 3)
             total_duration: Optional duration tensor (not used)
             dataset_type: Dataset type for feature extraction
-
+            use_fk: Whether to use FK positions for relative shift computation
         Returns:
             position_history: (B, N+num_frames, 22, 3) - Absolute global joint positions including initial history
             feature_history: (B, N+num_frames, 271) - 271D features derived from position history
@@ -713,6 +715,10 @@ class HumanMotionGenerator:
                 feature_history = sequence_joints_to_features(
                     seed_positions, dataset_type=dataset_type
                 )  # (B, T, 271)
+
+            fk_offsets = (
+                get_fk_offsets(position_history) if use_fk else None
+            )  # (B, 22, 3)
 
             feature_history = (
                 self.normalizer.normalize(feature_history)
@@ -800,13 +806,16 @@ class HumanMotionGenerator:
                 # ========================================
                 relative_shift = x_t  # (B, 22, 3)
                 new_positions = current_positions + relative_shift  # (B, 22, 3)
-                new_frame, _ = generated_positions_to_271d(
+                new_frame, _, fk_positions = generated_positions_to_271d(
                     new_positions=new_positions,
                     prev_positions=current_positions,
                     dataset_type=dataset_type,
-                    use_fk_for_ric=False,
                     normalizer=self.normalizer,
-                )  # (B, 271), (B, 3)
+                    fk_offsets=fk_offsets,
+                )  # (B, 271), (B, 3), (B, 22, 3)
+
+                if fk_positions is not None:
+                    new_positions = fk_positions  # Override with FK-corrected positions if available
 
                 # ========================================
                 # Step F: Update tracker and history

@@ -41,6 +41,7 @@ from utils.motion_utils import (
     flow_output_to_271d,  # kept in case you use it elsewhere
     generated_positions_to_271d,
     extract_prev_frame_features,
+    get_fk_offsets,
 )
 
 # Type variable for generic EMA model typing
@@ -539,6 +540,8 @@ class Trainer:
                 f"motion length {motion.shape[1]} != joints length {j_len}."
             )
 
+        fk_offsets = get_fk_offsets(joints)  # (B, 22, 3)
+
         pred_steps = j_len - 1
         hist = motion[:, :-1]
         hist_joints = joints[:, :-1]
@@ -639,11 +642,11 @@ class Trainer:
 
                 with timer(self.timing_stats, "forward/pos_transform"):
                     pred_positions_roll = current_positions_roll + x_t_roll
-                    rollout_frame, _ = generated_positions_to_271d(
+                    rollout_frame, _, fk_positions_roll = generated_positions_to_271d(
                         new_positions=pred_positions_roll,
                         prev_positions=current_positions_roll,
                         dataset_type="t2m",
-                        use_fk_for_ric=False,
+                        fk_offsets=fk_offsets[rollout_mask],
                         normalizer=self.normalizer,
                     )
                 next_input[rollout_mask] = rollout_frame
@@ -652,9 +655,20 @@ class Trainer:
                     pred_positions_endpoint = (
                         current_positions_roll + pred_roll_endpoint
                     )
+                    _, _, fk_positions_endpoint = generated_positions_to_271d(
+                        new_positions=pred_positions_endpoint,
+                        prev_positions=current_positions_roll,
+                        dataset_type="t2m",
+                        fk_offsets=fk_offsets[rollout_mask],
+                        normalizer=self.normalizer,
+                    )
                     consistency_losses.append(
                         F.mse_loss(
-                            pred_positions_endpoint,
+                            (
+                                fk_positions_endpoint
+                                if fk_positions_endpoint is not None
+                                else pred_positions_endpoint
+                            ),
                             target_joints[:, step_idx][rollout_mask],
                         )
                     )

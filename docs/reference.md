@@ -185,6 +185,11 @@ IK/rotation extraction optimization:
 - `qmul` uses elementwise quaternion algebra (no intermediate batched outer-product tensor), and `quaternion_to_cont6d` computes first two rotation columns directly.
 - Reproduce hotspot profiling with `scripts/profile_generated_positions_to_271d.py`.
 
+FK branch sequence evaluation:
+- Use `scripts/evaluate_generated_positions_to_271d_fk.py` to evaluate `generated_positions_to_271d` across full sample sequences.
+- Reports teacher-forced and autoregressive metrics with/without `fk_offsets`, including full 271D frame error, 6D rotation error, FK position error, and round-trip position error.
+- Writes per-frame CSV (default: `output/generated_positions_fk_eval_000070.csv`).
+
 ### Train Classmethod
 
 | Parameter            | Type                | Description                                   |

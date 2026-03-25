@@ -73,6 +73,19 @@ T2M_KINEMATIC_CHAIN = [
 ]
 
 
+# Precompute once at module level
+
+__PARENT_INDICES, __CHILD_INDICES = zip(
+    *[
+        (parent, child)
+        for chain in T2M_KINEMATIC_CHAIN
+        for parent, child in zip(chain[:-1], chain[1:])
+    ]
+)
+_PARENT_INDICES = torch.tensor(__PARENT_INDICES, dtype=torch.long)
+_CHILD_INDICES = torch.tensor(__CHILD_INDICES, dtype=torch.long)
+
+
 # ============================================================================
 # Dataset Configuration
 # ============================================================================
@@ -116,6 +129,32 @@ FEATURE_SLICES = {
 # ============================================================================
 # Internal Helper Functions
 # ============================================================================
+
+
+def get_fk_offsets(positions: torch.Tensor) -> torch.Tensor:
+    """
+    Compute per-bone FK offsets scaled to match average bone lengths in input data.
+    Args:
+        positions: Joint positions (B, T, 22, 3)
+    Returns:
+        scaled_offsets: Scaled FK offsets (B, 22, 3)
+    """
+    B, _, J, _ = positions.shape
+
+    parent_idx = _PARENT_INDICES.to(positions.device)
+    child_idx = _CHILD_INDICES.to(positions.device)
+
+    edge_lengths = torch.norm(
+        positions[..., child_idx, :] - positions[..., parent_idx, :], dim=-1
+    ).mean(
+        dim=1
+    )  # (B, E)
+
+    mean_lengths = torch.zeros(B, J, dtype=positions.dtype, device=positions.device)
+    mean_lengths[:, child_idx] = edge_lengths
+
+    unit_offsets = T2M_RAW_OFFSETS.to(positions.device)
+    return (unit_offsets * mean_lengths.unsqueeze(-1)).detach()  # (B, 22, 3)
 
 
 def _normalize_vector(v: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
@@ -277,8 +316,14 @@ def _forward_kinematics(
     positions = torch.zeros(B, 22, 3, device=device, dtype=dtype)
     positions[:, 0] = root_pos_flat
 
-    # Expand offsets
-    offsets_expanded = offsets.unsqueeze(0).expand(B, -1, -1)
+    if offsets.ndim == 2:
+        offsets_expanded = offsets.unsqueeze(0).expand(B, -1, -1)  # (B, 22, 3)
+    elif offsets.ndim == 3:
+        offsets_expanded = offsets
+    else:
+        raise ValueError(
+            f"Offsets must have shape (22, 3) or (B, 22, 3), got {offsets.shape}"
+        )
 
     # FK for each chain
     for chain in kinematic_chain:
@@ -907,9 +952,10 @@ def generated_positions_to_271d(
     ] = None,  # (B, 22, 3) previous global positions
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
-    use_fk_for_ric: bool = False,
+    fk_offsets: Optional[torch.Tensor] = None,
     normalizer: Optional["FeatureNormalizer"] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    **kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """
     Compute a single 271D feature frame from newly generated global joint positions.
 
@@ -933,12 +979,14 @@ def generated_positions_to_271d(
         prev_positions: (B, 22, 3) previous absolute global positions.
         dataset_type: Dataset key (default "t2m").
         feet_thre: Foot contact threshold.
-        use_fk_for_ric: If True, compute RIC from FK-consistent positions.
+        fk_offsets: Optional (B, 22, 3) tensor of FK offsets for RIC computation.
         normalizer: Optional FeatureNormalizer applied to the output frame.
+        use_fk_for_ric: If True, compute RIC from FK-consistent positions.
 
     Returns:
         new_frame: (B, 271) extracted feature frame (normalized if normalizer is provided).
         new_root_pos: (B, 3) absolute current root position.
+        fk_positions: (B, 22, 3) FK-consistent positions (if fk_offsets provided), else None.
     """
     if new_positions.ndim != 3 or new_positions.shape[-2:] != (22, 3):
         raise ValueError(
@@ -969,8 +1017,24 @@ def generated_positions_to_271d(
     else:
         prev_positions_resolved = None
 
-    # 1) Root features: absolute Y and velocity-form X/Z.
+    # 2) IK and 6D rotations.
+    quaternions = _compute_ik(
+        new_positions, raw_offsets, kinematic_chain, face_joint_indx
+    )
+    rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
+    root_quat = quaternions[:, 0]  # (B,4)
+    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 22, -1)
+
     new_root_pos = new_positions[:, 0]  # (B, 3)
+    # 3) RIC positions from either FK-consistent or direct global positions.
+    fk_positions = None
+    if fk_offsets is not None:
+        fk_positions = _forward_kinematics(
+            rotations_6d, new_root_pos, fk_offsets, kinematic_chain
+        )
+        new_positions = fk_positions
+
+    # 1) Root features: absolute Y and velocity-form X/Z.
     root_height_y = new_root_pos[:, 1:2]
     if prev_positions_resolved is None:
         root_vel_x = torch.zeros((B, 1), device=device, dtype=dtype)
@@ -980,23 +1044,7 @@ def generated_positions_to_271d(
         root_vel_z = new_root_pos[:, 2:3] - prev_positions_resolved[:, 0, 2:3]
     root_features = torch.cat([root_height_y, root_vel_x, root_vel_z], dim=-1)  # (B,3)
 
-    # 2) IK and 6D rotations.
-    quaternions = _compute_ik(
-        new_positions, raw_offsets, kinematic_chain, face_joint_indx
-    )
-    rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
-    root_quat = quaternions[:, 0]  # (B,4)
-    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 22, -1)
-
-    # 3) RIC positions from either FK-consistent or direct global positions.
-    if use_fk_for_ric:
-        fk_positions = _forward_kinematics(
-            rotations_6d, new_root_pos, raw_offsets, kinematic_chain
-        )
-        ric_source = fk_positions
-    else:
-        ric_source = new_positions
-
+    ric_source = new_positions
     ric = ric_source - ric_source[:, 0:1]
     ric = qrot(root_quat_expanded, ric)  # (B,22,3)
 
@@ -1031,7 +1079,7 @@ def generated_positions_to_271d(
     if normalizer is not None:
         new_frame = normalizer.normalize(new_frame)
 
-    return new_frame, new_root_pos
+    return new_frame, new_root_pos, fk_positions
 
 
 class RootPositionTracker:
