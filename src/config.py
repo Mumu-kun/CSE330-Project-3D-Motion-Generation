@@ -77,9 +77,9 @@ class Config:
     encoder_motion_dim: int = 271  # Input motion feature dimension
     encoder_text_dim: int = 512  # CLIP embedding size
     encoder_text_proj_dim: int = 128  # Text projection dimension
-    encoder_hidden_dim: int = 256  # GRU hidden size
-    encoder_per_joint_dim: int = 64  # Output per-joint context dimension
-    encoder_num_layers: int = 4  # GRU layers
+    encoder_hidden_dim: int = 512  # GRU hidden size
+    encoder_per_joint_dim: int = 512  # Output per-joint context dimension
+    encoder_num_layers: int = 2  # GRU layers
     encoder_num_joints: int = 22  # Number of joints
     encoder_text_scale: float = 1.0  # Text conditioning scale
     encoder_dropout: float = 0.1  # Dropout between GRU layers
@@ -108,7 +108,7 @@ class Config:
     # Training settings
     batch_size: int = 192
     learning_rate: float = 1e-4
-    num_epochs: int = 200
+    num_epochs: int = 400
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
@@ -116,14 +116,15 @@ class Config:
     # CFG (Classifier-Free Guidance) settings
     cfg_dropout: float = 0.1  # Dropout probability for CFG
 
+    use_fk: bool = True  # Whether to compute FK loss during training
     # Rollout scheduling settings
     rollout_prob_start: float = 0.0  # Rollout probability at first epoch
-    rollout_prob_end: float = 0.3  # Rollout probability at final epoch
+    rollout_prob_end: float = 0.5  # Rollout probability at final epoch
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )
     use_consistency_loss: bool = (
-        False  # Enable endpoint consistency loss after no-grad rollout
+        True  # Enable endpoint consistency loss after no-grad rollout
     )
 
     # Horizon settings
@@ -135,8 +136,8 @@ class Config:
         default_factory=lambda: [
             {"horizon": 5, "epochs": 50},
             {"horizon": 10, "epochs": 100},
-            {"horizon": 20, "epochs": 150},
-            {"horizon": 40, "epochs": 200},
+            {"horizon": 20, "epochs": 200},
+            {"horizon": 40, "epochs": 400},
         ]
     )
 

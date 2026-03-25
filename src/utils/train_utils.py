@@ -577,7 +577,7 @@ class Trainer:
                     track_features=context,
                     noised_tracks=xt,
                     timesteps=t,
-                    relative_shifts=relative_shifts_step,
+                    prev_relative_shifts=relative_shifts_step,
                     text_embedding=text_for_encoder,
                     output_attentions=False,
                     output_hidden_states=False,
@@ -587,7 +587,7 @@ class Trainer:
             rollout_mask = self.get_rollout_mask(
                 B, rollout_prob, device, stochastic_rollout
             )
-            next_input = target_motion[:, step_idx].clone()
+            next_motion = target_motion[:, step_idx].clone()
             if rollout_mask.any():
                 rolled_count = int(rollout_mask.sum().item())
                 predictor_was_training = pred_model.training
@@ -613,7 +613,7 @@ class Trainer:
                                         track_features=context_roll,
                                         noised_tracks=x_t_roll,
                                         timesteps=tau,
-                                        relative_shifts=x_t_roll,
+                                        prev_relative_shifts=x_t_roll,
                                         text_embedding=text_roll,
                                         output_attentions=False,
                                         output_hidden_states=False,
@@ -631,7 +631,7 @@ class Trainer:
                                 track_features=context_roll,
                                 noised_tracks=x_t_roll,
                                 timesteps=tau_endpoint,
-                                relative_shifts=x_t_roll,
+                                prev_relative_shifts=x_t_roll,
                                 text_embedding=text_roll,
                                 output_attentions=False,
                                 output_hidden_states=False,
@@ -649,7 +649,7 @@ class Trainer:
                         fk_offsets=fk_offsets[rollout_mask],
                         normalizer=self.normalizer,
                     )
-                next_input[rollout_mask] = rollout_frame
+                next_motion[rollout_mask] = rollout_frame
 
                 if self.config.use_consistency_loss and pred_roll_endpoint is not None:
                     pred_positions_endpoint = (
@@ -681,7 +681,7 @@ class Trainer:
 
             with timer(self.timing_stats, "forward/gru_step"):
                 context, h_state = enc.gru_step(
-                    next_input.detach(), text_for_encoder, h_state
+                    next_motion.detach(), text_for_encoder, h_state
                 )
 
         flow_loss = torch.stack(flow_losses).mean()

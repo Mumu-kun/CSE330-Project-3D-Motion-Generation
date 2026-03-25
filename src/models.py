@@ -128,11 +128,11 @@ class MotionHistoryEncoder(nn.Module):
         )
 
         # Shared MLP: global GRU hidden (B, H) → all joints (B, 22 * D_joint)
-        self.global_to_joints = nn.Sequential(
-            nn.Linear(model_dim, model_dim),
-            nn.ReLU(),
-            nn.Linear(model_dim, joint_count * per_joint_out_dim),
-        )
+        # self.global_to_joints = nn.Sequential(
+        #     nn.Linear(model_dim, model_dim),
+        #     nn.ReLU(),
+        #     nn.Linear(model_dim, joint_count * per_joint_out_dim),
+        # )
 
     def init_hidden(self, text_emb: torch.Tensor) -> torch.Tensor:
         """
@@ -172,10 +172,13 @@ class MotionHistoryEncoder(nn.Module):
         h_t = h_seq[:, -1, :]  # last timestep in this block, (B, H)
 
         # Shared MLP to per-joint tokens
-        joint_tokens = self.global_to_joints(h_t)  # (B, 22 * D_joint)
-        history_features = joint_tokens.view(
-            B, self.joint_count, self.per_joint_out_dim
-        )  # (B, 22, D_joint)
+        # joint_tokens = self.global_to_joints(h_t)  # (B, 22 * D_joint)
+        # history_features = joint_tokens.view(
+        #     B, self.joint_count, self.per_joint_out_dim
+        # )  # (B, 22, D_joint)
+        history_features = h_t.unsqueeze(1).expand(
+            B, self.joint_count, self.model_dim
+        )  # (B, 22, H)
 
         return history_features, h_next
 
@@ -471,7 +474,7 @@ class FlowMatchingPredictor(nn.Module):
         timesteps: torch.Tensor,  # (B,) or (B, 1) - denoising timesteps in [0,1]
         text_embedding: torch.Tensor,  # (B, F) - Text embedding for global conditioning
         track_features: torch.Tensor,  # (B, N, F) - per-track features from encoder/detector
-        relative_shifts: Optional[
+        prev_relative_shifts: Optional[
             torch.Tensor
         ] = None,  # (B, N, D) - precomputed relative shifts (optional)
         output_attentions: Optional[bool] = None,
@@ -499,9 +502,9 @@ class FlowMatchingPredictor(nn.Module):
         # 1. Feature concatenation along feature dimension
         features_to_concat = [noised_tracks, track_features]
         if self.use_relative_shift:
-            if relative_shifts is None:
-                relative_shifts = torch.zeros_like(noised_tracks)
-            features_to_concat.append(relative_shifts)
+            if prev_relative_shifts is None:
+                prev_relative_shifts = torch.zeros_like(noised_tracks)
+            features_to_concat.append(prev_relative_shifts)
 
         concatenated_features = torch.cat(
             features_to_concat, dim=-1
@@ -791,7 +794,7 @@ class HumanMotionGenerator:
                         track_features=context_cond,
                         noised_tracks=x_t,
                         timesteps=t,
-                        relative_shifts=relative_shifts,
+                        prev_relative_shifts=relative_shifts,
                         text_embedding=text_emb,
                         output_attentions=False,
                         output_hidden_states=False,
