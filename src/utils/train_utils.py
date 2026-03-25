@@ -586,9 +586,13 @@ class Trainer:
             )
             next_input = target_motion[:, step_idx].clone()
             if rollout_mask.any():
+                rolled_count = int(rollout_mask.sum().item())
                 predictor_was_training = pred_model.training
                 pred_model.eval()
-                x_t_roll = torch.randn_like(x1)
+                context_roll = context[rollout_mask]
+                text_roll = text_for_encoder[rollout_mask]
+                current_positions_roll = current_positions[rollout_mask]
+                x_t_roll = torch.randn_like(x1[rollout_mask])
                 pred_roll_endpoint: Optional[torch.Tensor] = None
                 try:
                     with timer(self.timing_stats, "forward/rollout_ode"):
@@ -598,14 +602,16 @@ class Trainer:
                                     self.timing_stats, "forward/rollout_ode_step"
                                 ):
                                     tau = torch.full(
-                                        (B,), float(ode_step) * dt, device=device
+                                        (rolled_count,),
+                                        float(ode_step) * dt,
+                                        device=device,
                                     )
                                     pred_roll = pred_model.forward(
-                                        track_features=context,
+                                        track_features=context_roll,
                                         noised_tracks=x_t_roll,
                                         timesteps=tau,
                                         relative_shifts=x_t_roll,
-                                        text_embedding=text_for_encoder,
+                                        text_embedding=text_roll,
                                         output_attentions=False,
                                         output_hidden_states=False,
                                     )[0]
@@ -613,18 +619,17 @@ class Trainer:
 
                     if self.config.use_consistency_loss:
                         with timer(self.timing_stats, "forward/consistency_pred"):
-                            rolled_count = int(rollout_mask.sum().item())
                             tau_endpoint = torch.full(
                                 (rolled_count,),
                                 float(ode_steps - 1) * dt,
                                 device=device,
                             )
                             pred_roll_endpoint = pred_model.forward(
-                                track_features=context[rollout_mask],
-                                noised_tracks=x_t_roll[rollout_mask],
+                                track_features=context_roll,
+                                noised_tracks=x_t_roll,
                                 timesteps=tau_endpoint,
-                                relative_shifts=x_t_roll[rollout_mask],
-                                text_embedding=text_for_encoder[rollout_mask],
+                                relative_shifts=x_t_roll,
+                                text_embedding=text_roll,
                                 output_attentions=False,
                                 output_hidden_states=False,
                             )[0]
@@ -633,19 +638,19 @@ class Trainer:
                         pred_model.train()
 
                 with timer(self.timing_stats, "forward/pos_transform"):
-                    pred_positions_roll = current_positions + x_t_roll
+                    pred_positions_roll = current_positions_roll + x_t_roll
                     rollout_frame, _ = generated_positions_to_271d(
                         new_positions=pred_positions_roll,
-                        prev_positions=current_positions,
+                        prev_positions=current_positions_roll,
                         dataset_type="t2m",
                         use_fk_for_ric=False,
                         normalizer=self.normalizer,
                     )
-                next_input[rollout_mask] = rollout_frame[rollout_mask]
+                next_input[rollout_mask] = rollout_frame
 
                 if self.config.use_consistency_loss and pred_roll_endpoint is not None:
                     pred_positions_endpoint = (
-                        current_positions[rollout_mask] + pred_roll_endpoint
+                        current_positions_roll + pred_roll_endpoint
                     )
                     consistency_losses.append(
                         F.mse_loss(
@@ -655,7 +660,7 @@ class Trainer:
                     )
 
                 next_positions = target_joints[:, step_idx].clone()
-                next_positions[rollout_mask] = pred_positions_roll[rollout_mask]
+                next_positions[rollout_mask] = pred_positions_roll
                 current_positions = next_positions.detach()
             else:
                 current_positions = target_joints[:, step_idx].detach()
@@ -1153,20 +1158,28 @@ class Trainer:
                     global_step=training_state["global_step"],
                 )
 
-                with timer(self.timing_stats, "checkpoint"):
-                    training_state = self.handle_checkpointing(
-                        save_dir=checkpoint_dir,
-                        encoder_ema=encoder_ema,
-                        predictor_ema=predictor_ema,
-                        optimizer=optimizer,
-                        scaler=scaler,
-                        epoch=epoch,
-                        global_step=training_state["global_step"],
-                        avg_epoch_loss=avg_epoch_loss,
-                        curriculum_state=curriculum_state,
-                        training_state=training_state,
-                        val_metrics=val_metrics,
-                    )
+                if (
+                    self.config.checkpoint_interval > 0
+                    and (epoch + 1) % self.config.checkpoint_interval == 0
+                ) or (
+                    val_metrics
+                    and val_metrics.get("val_loss", float("inf"))
+                    < training_state["best_val_loss"]
+                ):
+                    with timer(self.timing_stats, "checkpoint"):
+                        training_state = self.handle_checkpointing(
+                            save_dir=checkpoint_dir,
+                            encoder_ema=encoder_ema,
+                            predictor_ema=predictor_ema,
+                            optimizer=optimizer,
+                            scaler=scaler,
+                            epoch=epoch,
+                            global_step=training_state["global_step"],
+                            avg_epoch_loss=avg_epoch_loss,
+                            curriculum_state=curriculum_state,
+                            training_state=training_state,
+                            val_metrics=val_metrics,
+                        )
 
                 if self.timing_stats is not None:
                     tqdm.write(str(self.timing_stats))

@@ -193,6 +193,7 @@ class MotionHistoryEncoder(nn.Module):
         x_t: torch.Tensor,  # (B, motion_dim)  single frame features
         text_emb: torch.Tensor,  # (B, text_dim)
         h: Optional[torch.Tensor],  # (L, B, H) or None
+        use_normalization: bool = False,  # Whether to apply normalization to x_t
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         One-step update for AR inference.
@@ -200,6 +201,9 @@ class MotionHistoryEncoder(nn.Module):
           history_features: (B, 22, per_joint_dim)  summary up to this frame
           h_next: (L, B, H)  next hidden state to carry forward
         """
+        if use_normalization and self.normalizer is not None:
+            x_t = self.normalizer.normalize(x_t)
+
         motion_in = x_t.unsqueeze(1)  # (B, 1, motion_dim)
         history_features, h_next = self._gru_block(motion_in, text_emb, h)
         return history_features, h_next
@@ -710,6 +714,12 @@ class HumanMotionGenerator:
                     seed_positions, dataset_type=dataset_type
                 )  # (B, T, 271)
 
+            feature_history = (
+                self.normalizer.normalize(feature_history)
+                if self.normalizer is not None
+                else feature_history
+            )
+
             prev_relative_shifts = torch.zeros(
                 (B, 1, self.encoder.joint_count, self.predictor.out_channels),
                 device=device,
@@ -764,7 +774,11 @@ class HumanMotionGenerator:
                 # N-step flow matching in tokenized track space.
                 for step in range(num_steps):
                     t = torch.full((B,), step * dt, device=device)
-                    relative_shifts = x_t
+                    relative_shifts = (
+                        prev_relative_shifts[:, -1]
+                        if prev_relative_shifts.shape[1] > 0
+                        else None
+                    )
 
                     # Predict velocity using new forward signature
                     flow_output = self.predictor.forward(

@@ -53,6 +53,8 @@ class Config:
     output_path: Path = Path("./output")
     checkpoint_dir: Path = Path("./checkpoints")
 
+    checkpoint_interval: int = 50  # Save checkpoint every N epochs
+
     # Motion format settings (271D custom format from motion_utils.py)
     motion_dim: int = 271  # Custom 271D feature dimension
     num_joints: int = 22  # Number of joints in skeleton
@@ -91,7 +93,7 @@ class Config:
         default_factory=lambda: FlowMatchingPredictorConfig(
             hidden_size=64,
             intermediate_size=4 * 64,
-            num_hidden_layers=2,
+            num_hidden_layers=3,
             num_attention_heads=8,
             hidden_act="silu",
             rms_norm_eps=1e-6,

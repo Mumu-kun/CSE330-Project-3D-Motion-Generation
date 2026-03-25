@@ -18,9 +18,9 @@ _FLOAT_EPS = np.finfo(np.float64).eps
 def qinv(q):
     """Invert quaternion(s) q."""
     assert q.shape[-1] == 4, "q must be a tensor of shape (*, 4)"
-    mask = torch.ones_like(q)
-    mask[..., 1:] = -mask[..., 1:]
-    return q * mask
+    q_conj = q.clone()
+    q_conj[..., 1:] = -q_conj[..., 1:]
+    return q_conj
 
 
 def qmul(q, r):
@@ -32,16 +32,15 @@ def qmul(q, r):
     assert q.shape[-1] == 4
     assert r.shape[-1] == 4
 
-    original_shape = q.shape
+    qw, qx, qy, qz = torch.unbind(q, dim=-1)
+    rw, rx, ry, rz = torch.unbind(r, dim=-1)
 
-    # Compute outer product
-    terms = torch.bmm(r.view(-1, 4, 1), q.view(-1, 1, 4))
+    w = rw * qw - rx * qx - ry * qy - rz * qz
+    x = rw * qx + rx * qw - ry * qz + rz * qy
+    y = rw * qy + rx * qz + ry * qw - rz * qx
+    z = rw * qz - rx * qy + ry * qx + rz * qw
 
-    w = terms[:, 0, 0] - terms[:, 1, 1] - terms[:, 2, 2] - terms[:, 3, 3]
-    x = terms[:, 0, 1] + terms[:, 1, 0] - terms[:, 2, 3] + terms[:, 3, 2]
-    y = terms[:, 0, 2] + terms[:, 1, 3] + terms[:, 2, 0] - terms[:, 3, 1]
-    z = terms[:, 0, 3] - terms[:, 1, 2] + terms[:, 2, 1] + terms[:, 3, 0]
-    return torch.stack((w, x, y, z), dim=1).view(original_shape)
+    return torch.stack((w, x, y, z), dim=-1)
 
 
 def qrot(q, v):
@@ -96,9 +95,18 @@ def quaternion_to_matrix(quaternions):
 
 def quaternion_to_cont6d(quaternions):
     """Convert quaternions to 6D rotation representation."""
-    rotation_mat = quaternion_to_matrix(quaternions)
-    cont_6d = torch.cat([rotation_mat[..., 0], rotation_mat[..., 1]], dim=-1)
-    return cont_6d
+    r, i, j, k = torch.unbind(quaternions, -1)
+    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+
+    c0_x = 1 - two_s * (j * j + k * k)
+    c0_y = two_s * (i * j + k * r)
+    c0_z = two_s * (i * k - j * r)
+
+    c1_x = two_s * (i * j - k * r)
+    c1_y = 1 - two_s * (i * i + k * k)
+    c1_z = two_s * (j * k + i * r)
+
+    return torch.stack((c0_x, c0_y, c0_z, c1_x, c1_y, c1_z), dim=-1)
 
 
 def cont6d_to_matrix(cont6d):

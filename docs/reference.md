@@ -176,6 +176,15 @@ When profiling is enabled, `Trainer` also records and logs averaged timing metri
 - End-of-epoch logs: `epoch_time/{op}_ms`
 - Forward breakdown keys: `forward/gru_init`, `forward/predictor_flow`, `forward/rollout_ode`, `forward/rollout_ode_step`, `forward/consistency_pred`, `forward/pos_transform`, `forward/gru_step`
 
+Rollout transform optimization:
+- `incremental_flow_loss` now runs rollout ODE and `generated_positions_to_271d` only on rollout-masked samples instead of the full batch.
+- This reduces `forward/pos_transform` and rollout overhead when rollout probability is below `1.0` without changing AR update semantics.
+
+IK/rotation extraction optimization:
+- `_compute_ik` and `_qbetween` use a shared vector-normalization helper and reduced redundant normalization in known-unit-vector paths.
+- `qmul` uses elementwise quaternion algebra (no intermediate batched outer-product tensor), and `quaternion_to_cont6d` computes first two rotation columns directly.
+- Reproduce hotspot profiling with `scripts/profile_generated_positions_to_271d.py`.
+
 ### Train Classmethod
 
 | Parameter            | Type                | Description                                   |
@@ -383,6 +392,7 @@ The predictor is trained and used to model the flow field that transports noisy 
 - Incrementally compute next 271D feature frame from flow output
 - Computes ALL 22 joint rotations via IK from new_positions (not just root)
 - Uses `_compute_ik()` to derive quaternions, then `quaternion_to_cont6d()` for 6D rotations
+- `generated_positions_to_271d` shares the same IK + rotation conversion path for per-frame autoregressive updates.
 - Fully Markov and AR-safe; no cumulative sum or full sequence reconstruction
 
 ---

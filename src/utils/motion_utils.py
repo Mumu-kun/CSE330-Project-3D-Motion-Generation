@@ -118,6 +118,12 @@ FEATURE_SLICES = {
 # ============================================================================
 
 
+def _normalize_vector(v: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+    """Normalize vectors along the last dimension with numerical guard."""
+    inv_norm = torch.rsqrt((v * v).sum(dim=-1, keepdim=True).clamp(min=eps))
+    return v * inv_norm
+
+
 def _compute_ik(
     positions: torch.Tensor,
     raw_offsets: torch.Tensor,
@@ -150,21 +156,20 @@ def _compute_ik(
     across1 = positions_flat[:, r_hip] - positions_flat[:, l_hip]  # (B, 3)
     across2 = positions_flat[:, sdr_r] - positions_flat[:, sdr_l]  # (B, 3)
     across = across1 + across2
-    across = across / (torch.norm(across, dim=-1, keepdim=True) + 1e-10)
+    across = _normalize_vector(across)
 
-    # Forward direction (cross with Y-up)
-    forward = torch.cross(
-        torch.tensor([[0, 1, 0]], device=device, dtype=dtype).expand(B, -1),
-        across,
-        dim=-1,
-    )
-    forward = forward / (torch.norm(forward, dim=-1, keepdim=True) + 1e-10)
+    # Forward direction from Y-up cross product: cross([0,1,0], [x,y,z]) -> [z,0,-x]
+    forward = positions_flat.new_zeros(B, 3)
+    forward[:, 0] = across[:, 2]
+    forward[:, 2] = -across[:, 0]
+    forward = _normalize_vector(forward)
 
     # Target forward direction (Z-axis)
-    target = torch.tensor([[0, 0, 1]], device=device, dtype=dtype).expand(B, -1)
+    target = positions_flat.new_zeros(B, 3)
+    target[:, 2] = 1.0
 
     # Root rotation (from forward to target)
-    root_quat = _qbetween(forward, target)
+    root_quat = _qbetween(forward, target, assume_v0_normalized=True)
 
     # Initialize quaternions
     quaternions = torch.zeros(B, 22, 4, device=device, dtype=dtype)
@@ -172,6 +177,10 @@ def _compute_ik(
 
     # IK for each chain
     offsets = raw_offsets.unsqueeze(0).expand(B, -1, -1)  # (B, 22, 3)
+    offsets_norm = _normalize_vector(offsets)
+
+    # Conjugation sign for fast inverse of unit quaternions.
+    qinv_sign = root_quat.new_tensor([1.0, -1.0, -1.0, -1.0]).view(1, 4)
 
     for chain in kinematic_chain:
         R = root_quat
@@ -180,17 +189,22 @@ def _compute_ik(
             child_idx = chain[i + 1]
 
             # Get bone direction in T-pose
-            u = offsets[:, child_idx]  # (B, 3)
+            u = offsets_norm[:, child_idx]  # (B, 3)
 
             # Get bone direction in current pose
             v = positions_flat[:, child_idx] - positions_flat[:, parent_idx]
-            v = v / (torch.norm(v, dim=-1, keepdim=True) + 1e-10)
+            v = _normalize_vector(v)
 
             # Rotation from u to v
-            rot_u_v = _qbetween(u, v)
+            rot_u_v = _qbetween(
+                u,
+                v,
+                assume_v0_normalized=True,
+                assume_v1_normalized=True,
+            )
 
             # Local rotation
-            R_loc = qmul(qinv(R), rot_u_v)
+            R_loc = qmul(R * qinv_sign, rot_u_v)
 
             quaternions[:, child_idx] = R_loc
             R = qmul(R, R_loc)
@@ -198,7 +212,12 @@ def _compute_ik(
     return quaternions.reshape(batch_shape + (22, 4))
 
 
-def _qbetween(v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
+def _qbetween(
+    v0: torch.Tensor,
+    v1: torch.Tensor,
+    assume_v0_normalized: bool = False,
+    assume_v1_normalized: bool = False,
+) -> torch.Tensor:
     """
     Compute quaternion that rotates v0 to v1.
 
@@ -209,9 +228,10 @@ def _qbetween(v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
     Returns:
         Quaternions (..., 4)
     """
-    # Normalize
-    v0 = v0 / (torch.norm(v0, dim=-1, keepdim=True) + 1e-10)
-    v1 = v1 / (torch.norm(v1, dim=-1, keepdim=True) + 1e-10)
+    if not assume_v0_normalized:
+        v0 = _normalize_vector(v0)
+    if not assume_v1_normalized:
+        v1 = _normalize_vector(v1)
 
     # Compute rotation
     dot = (v0 * v1).sum(dim=-1, keepdim=True)
@@ -221,7 +241,7 @@ def _qbetween(v0: torch.Tensor, v1: torch.Tensor) -> torch.Tensor:
     w = 1.0 + dot
 
     q = torch.cat([w, cross], dim=-1)
-    q = q / (torch.norm(q, dim=-1, keepdim=True) + 1e-10)
+    q = _normalize_vector(q)
 
     return q
 
@@ -942,12 +962,15 @@ def generated_positions_to_271d(
             raise ValueError(
                 f"Expected prev_positions shape {(B, 22, 3)}, got {prev_positions.shape}"
             )
-        prev_positions_resolved = prev_positions.to(device=device, dtype=dtype)
+        if prev_positions.device != device or prev_positions.dtype != dtype:
+            prev_positions_resolved = prev_positions.to(device=device, dtype=dtype)
+        else:
+            prev_positions_resolved = prev_positions
     else:
         prev_positions_resolved = None
 
     # 1) Root features: absolute Y and velocity-form X/Z.
-    new_root_pos = new_positions[:, 0].clone()  # (B, 3)
+    new_root_pos = new_positions[:, 0]  # (B, 3)
     root_height_y = new_root_pos[:, 1:2]
     if prev_positions_resolved is None:
         root_vel_x = torch.zeros((B, 1), device=device, dtype=dtype)
@@ -963,6 +986,7 @@ def generated_positions_to_271d(
     )
     rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
     root_quat = quaternions[:, 0]  # (B,4)
+    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 22, -1)
 
     # 3) RIC positions from either FK-consistent or direct global positions.
     if use_fk_for_ric:
@@ -974,7 +998,7 @@ def generated_positions_to_271d(
         ric_source = new_positions
 
     ric = ric_source - ric_source[:, 0:1]
-    ric = qrot(root_quat.unsqueeze(1).expand(-1, 22, -1), ric)  # (B,22,3)
+    ric = qrot(root_quat_expanded, ric)  # (B,22,3)
 
     # 4) Local velocities and foot contacts.
     if prev_positions_resolved is None:
@@ -983,7 +1007,7 @@ def generated_positions_to_271d(
         feet_r = torch.zeros((B, 2), device=device, dtype=dtype)
     else:
         pos_delta = new_positions - prev_positions_resolved
-        local_vel = qrot(root_quat.unsqueeze(1).expand(-1, 22, -1), pos_delta)
+        local_vel = qrot(root_quat_expanded, pos_delta)
 
         vel_l = new_positions[:, fid_l] - prev_positions_resolved[:, fid_l]
         vel_r = new_positions[:, fid_r] - prev_positions_resolved[:, fid_r]
@@ -1004,11 +1028,10 @@ def generated_positions_to_271d(
         dim=-1,
     )
 
-    new_frame = new_frame.to(device=device, dtype=dtype)
     if normalizer is not None:
         new_frame = normalizer.normalize(new_frame)
 
-    return new_frame, new_root_pos.to(device=device, dtype=dtype)
+    return new_frame, new_root_pos
 
 
 class RootPositionTracker:
