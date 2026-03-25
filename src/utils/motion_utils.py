@@ -325,17 +325,19 @@ def _forward_kinematics(
             f"Offsets must have shape (22, 3) or (B, 22, 3), got {offsets.shape}"
         )
 
+    rot_matrices = cont6d_to_matrix(rotations_flat)  # (B, 22, 3, 3)
+
     # FK for each chain
     for chain in kinematic_chain:
         # Start with root rotation matrix
-        matR = cont6d_to_matrix(rotations_flat[:, 0])  # (B, 3, 3)
+        matR = rot_matrices[:, 0]  # (B, 3, 3)
 
         for i in range(1, len(chain)):
             child_idx = chain[i]
             parent_idx = chain[i - 1]
 
             # Accumulate rotation
-            child_rot = cont6d_to_matrix(rotations_flat[:, child_idx])
+            child_rot = rot_matrices[:, child_idx]
             matR = torch.bmm(matR, child_rot)
 
             # Compute position
