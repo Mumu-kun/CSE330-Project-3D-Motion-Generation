@@ -126,6 +126,7 @@ class Config:
     use_consistency_loss: bool = (
         True  # Enable endpoint consistency loss after no-grad rollout
     )
+    consistency_loss_weight: float = 1.0  # Weight for consistency loss in total loss
 
     # Horizon settings
     horizon: int = 20  # Maximum/target horizon for training

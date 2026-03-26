@@ -170,6 +170,10 @@ class Trainer:
         self.timing_stats: Optional[TimingStats] = (
             TimingStats() if config.enable_profiling else None
         )
+        self.consistency_distribution = torch.distributions.Beta(
+            torch.tensor(50.0, device=self.config.device),
+            torch.tensor(5.0, device=self.config.device),
+        )
 
     @staticmethod
     def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
@@ -540,15 +544,17 @@ class Trainer:
                 f"motion length {motion.shape[1]} != joints length {j_len}."
             )
 
-        fk_offsets = get_fk_offsets(joints)  # (B, 22, 3)
+        fk_offsets = (
+            get_fk_offsets(joints) if self.config.use_fk else None
+        )  # (B, 22, 3)
 
         pred_steps = j_len - 1
-        hist = motion[:, :-1]
-        hist_joints = joints[:, :-1]
-        prev_relative_shifts = relative_shifts[:, :-1]
-        target_motion = motion[:, 1:]
-        target_joints = joints[:, 1:]
-        target_relative_shifts = relative_shifts[:, 1:]
+        hist = motion[:, :-1].clone()
+        hist_joints = joints[:, :-1].clone()
+        prev_relative_shifts = relative_shifts[:, :-1].clone()
+        target_motion = motion[:, 1:].clone()
+        target_joints = joints[:, 1:].clone()
+        target_relative_shifts = relative_shifts[:, 1:].clone()
 
         with timer(self.timing_stats, "forward/gru_init"):
             context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
@@ -562,39 +568,29 @@ class Trainer:
         )
         ode_steps = max(1, int(self.config.rollout_integration_steps))
         dt = 1.0 / float(ode_steps)
-        current_positions = hist_joints[:, 0].detach().clone()
 
-        for step_idx in range(pred_steps):
-            x1 = target_relative_shifts[:, step_idx]
-            x0 = torch.randn_like(x1)
-            t = torch.rand(B, device=device)
-            t_ = t.view(B, 1, 1)
-            xt = t_ * x1 + (1 - t_) * x0
-            relative_shifts_step = prev_relative_shifts[:, step_idx]
+        contexts = [context]
 
-            with timer(self.timing_stats, "forward/predictor_flow"):
-                pred, _, _ = pred_model.forward(
-                    track_features=context,
-                    noised_tracks=xt,
-                    timesteps=t,
-                    prev_relative_shifts=relative_shifts_step,
-                    text_embedding=text_for_encoder,
-                    output_attentions=False,
-                    output_hidden_states=False,
-                )
-            flow_losses.append(F.mse_loss(pred, x1 - x0))
-
+        for step_idx in range(pred_steps - 1):
+            current_positions = hist_joints[:, step_idx]
             rollout_mask = self.get_rollout_mask(
                 B, rollout_prob, device, stochastic_rollout
             )
+
             next_motion = target_motion[:, step_idx].clone()
+            next_joints = target_joints[:, step_idx].clone()
+
             if rollout_mask.any():
-                rolled_count = int(rollout_mask.sum().item())
                 predictor_was_training = pred_model.training
                 pred_model.eval()
+                rolled_count = int(rollout_mask.sum().item())
+
                 context_roll = context[rollout_mask]
                 text_roll = text_for_encoder[rollout_mask]
                 current_positions_roll = current_positions[rollout_mask]
+                prev_relative_shifts_roll = prev_relative_shifts[rollout_mask, step_idx]
+
+                x1 = target_relative_shifts[:, step_idx]
                 x_t_roll = torch.randn_like(x1[rollout_mask])
                 pred_roll_endpoint: Optional[torch.Tensor] = None
                 try:
@@ -613,29 +609,12 @@ class Trainer:
                                         track_features=context_roll,
                                         noised_tracks=x_t_roll,
                                         timesteps=tau,
-                                        prev_relative_shifts=x_t_roll,
+                                        prev_relative_shifts=prev_relative_shifts_roll,
                                         text_embedding=text_roll,
                                         output_attentions=False,
                                         output_hidden_states=False,
                                     )[0]
                                     x_t_roll = x_t_roll + pred_roll * dt
-
-                    if self.config.use_consistency_loss:
-                        with timer(self.timing_stats, "forward/consistency_pred"):
-                            tau_endpoint = torch.full(
-                                (rolled_count,),
-                                float(ode_steps - 1) * dt,
-                                device=device,
-                            )
-                            pred_roll_endpoint = pred_model.forward(
-                                track_features=context_roll,
-                                noised_tracks=x_t_roll,
-                                timesteps=tau_endpoint,
-                                prev_relative_shifts=x_t_roll,
-                                text_embedding=text_roll,
-                                output_attentions=False,
-                                output_hidden_states=False,
-                            )[0]
                 finally:
                     if predictor_was_training:
                         pred_model.train()
@@ -646,51 +625,93 @@ class Trainer:
                         new_positions=pred_positions_roll,
                         prev_positions=current_positions_roll,
                         dataset_type="t2m",
-                        fk_offsets=fk_offsets[rollout_mask],
+                        fk_offsets=(
+                            fk_offsets[rollout_mask] if fk_offsets is not None else None
+                        ),
                         normalizer=self.normalizer,
                     )
                 next_motion[rollout_mask] = rollout_frame
+                next_joints[rollout_mask] = (
+                    fk_positions_roll
+                    if fk_positions_roll is not None
+                    else pred_positions_roll
+                )
 
-                if self.config.use_consistency_loss and pred_roll_endpoint is not None:
-                    pred_positions_endpoint = (
-                        current_positions_roll + pred_roll_endpoint
-                    )
-                    _, _, fk_positions_endpoint = generated_positions_to_271d(
-                        new_positions=pred_positions_endpoint,
-                        prev_positions=current_positions_roll,
-                        dataset_type="t2m",
-                        fk_offsets=fk_offsets[rollout_mask],
-                        normalizer=self.normalizer,
-                    )
-                    consistency_losses.append(
-                        F.mse_loss(
-                            (
-                                fk_positions_endpoint
-                                if fk_positions_endpoint is not None
-                                else pred_positions_endpoint
-                            ),
-                            target_joints[:, step_idx][rollout_mask],
-                        )
-                    )
-
-                next_positions = target_joints[:, step_idx].clone()
-                next_positions[rollout_mask] = pred_positions_roll
-                current_positions = next_positions.detach()
-            else:
-                current_positions = target_joints[:, step_idx].detach()
+                hist[:, step_idx + 1] = next_motion.detach()
+                hist_joints[:, step_idx + 1] = next_joints.detach()
+                prev_relative_shifts[:, step_idx + 1] = (
+                    next_joints - current_positions
+                ).detach()
 
             with timer(self.timing_stats, "forward/gru_step"):
                 context, h_state = enc.gru_step(
-                    next_motion.detach(), text_for_encoder, h_state
+                    hist[:, step_idx + 1], text_for_encoder, h_state
                 )
+            contexts.append(context)
 
-        flow_loss = torch.stack(flow_losses).mean()
-        consistency_loss = (
-            torch.stack(consistency_losses).mean()
-            if consistency_losses
-            else flow_loss.new_zeros(())
+        contexts_stacked = torch.stack(contexts, dim=1)
+        contexts_reshaped = contexts_stacked.flatten(0, 1)
+        prev_relative_shifts_reshaped = prev_relative_shifts.flatten(0, 1)
+        text_batched = (
+            text_for_encoder.unsqueeze(1)
+            .expand(-1, pred_steps, -1)
+            .reshape(B * pred_steps, -1)
         )
-        total_loss = flow_loss + (0.2 * consistency_loss)
+
+        x1 = target_relative_shifts.flatten(0, 1)
+        x0 = torch.randn_like(x1)
+
+        with timer(self.timing_stats, "forward/predictor"):
+            t = torch.rand((x1.shape[0],), device=device)
+            _t = t[:, None, None]
+            xt = _t * x1 + (1 - _t) * x0
+            pred, _, _ = pred_model.forward(
+                track_features=contexts_reshaped,
+                noised_tracks=xt,
+                timesteps=t,
+                prev_relative_shifts=prev_relative_shifts_reshaped,
+                text_embedding=text_batched,
+            )
+            flow_loss = F.mse_loss(pred, x1 - x0)
+
+        consistency_loss = torch.tensor(0.0, device=device)
+        if self.config.use_consistency_loss:
+            hist_joints_reshaped = hist_joints.flatten(0, 1)
+            with timer(self.timing_stats, "forward/consistency_loss"):
+                t = self.consistency_distribution.sample((x1.shape[0],))
+                _t = t[:, None, None]
+                xt = _t * x1 + (1 - _t) * x0
+                pred_t, _, _ = pred_model.forward(
+                    track_features=contexts_reshaped,
+                    noised_tracks=xt,
+                    timesteps=t,
+                    prev_relative_shifts=prev_relative_shifts_reshaped,
+                    text_embedding=text_batched,
+                )
+                dt = 1 - _t
+                pred_x1 = xt + pred_t * dt
+            with timer(self.timing_stats, "forward/pos_transform"):
+                pred_positions = hist_joints_reshaped + pred_x1
+                pred_frames, _, fk_positions = generated_positions_to_271d(
+                    new_positions=pred_positions,
+                    prev_positions=hist_joints_reshaped,
+                    dataset_type="t2m",
+                    fk_offsets=(
+                        torch.repeat_interleave(fk_offsets, pred_steps, dim=0)
+                        if fk_offsets is not None
+                        else None
+                    ),  # (B*pred_steps, 22, 3)
+                    normalizer=self.normalizer,
+                )
+                pred_shift = (
+                    fk_positions - hist_joints_reshaped
+                    if fk_positions is not None
+                    else pred_x1
+                )
+                consistency_loss = F.mse_loss(pred_shift, x1)
+
+        total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
+
         return total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob
 
     def apply_cfg_dropout(
@@ -894,6 +915,10 @@ class Trainer:
         total_consistency_loss = 0.0
         total_samples = 0
 
+        pred_horizon = 1
+
+        self.val_dataloader.dataset.set_horizon(1 + horizon + pred_horizon)  # type: ignore
+
         with torch.no_grad():
             for i, batch in enumerate(self.val_dataloader):
                 if num_batches > 0 and i >= num_batches:
@@ -918,7 +943,7 @@ class Trainer:
                         epoch=epoch,
                         total_epochs=total_epochs,
                         device=device_value,
-                        stochastic_rollout=False,
+                        stochastic_rollout=True,
                         encoder=enc,
                         predictor=pred,
                     )
@@ -1140,28 +1165,32 @@ class Trainer:
                         val_encoder = self.encoder
                         val_predictor = self.predictor
 
-                    with timer(self.timing_stats, "validation"):
-                        val_metrics = self.validate(
-                            encoder=val_encoder,
-                            predictor=val_predictor,
-                            horizon=curriculum_state["current_horizon"],
-                            num_batches=val_batches,
-                            device=device,
-                            epoch=epoch,
-                            total_epochs=num_epochs,
-                        )
+                    try:
+                        with timer(self.timing_stats, "validation"):
+                            val_metrics = self.validate(
+                                encoder=val_encoder,
+                                predictor=val_predictor,
+                                horizon=curriculum_state["current_horizon"],
+                                num_batches=val_batches,
+                                device=device,
+                                epoch=epoch,
+                                total_epochs=num_epochs,
+                            )
 
-                    val_loss = val_metrics["val_loss"]
-                    tqdm.write(f"Validation loss: {val_loss:.6f}")
+                        val_loss = val_metrics["val_loss"]
+                        tqdm.write(f"Validation loss: {val_loss:.6f}")
 
-                    if wandb_logger is not None:
-                        wandb_logger.log(
-                            {
-                                "val/loss": val_loss,
-                                "val/epoch": epoch,
-                            },
-                            step=training_state["global_step"],
-                        )
+                        if wandb_logger is not None:
+                            wandb_logger.log(
+                                {
+                                    "val/loss": val_loss,
+                                    "val/epoch": epoch,
+                                },
+                                step=training_state["global_step"],
+                            )
+                    except Exception as e:
+                        tqdm.write(f"Validation error: {str(e)}")
+                        val_metrics = {}
 
                 self.log_epoch_metrics(
                     wandb_logger=wandb_logger,

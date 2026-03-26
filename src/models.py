@@ -477,8 +477,8 @@ class FlowMatchingPredictor(nn.Module):
         prev_relative_shifts: Optional[
             torch.Tensor
         ] = None,  # (B, N, D) - precomputed relative shifts (optional)
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
         **kwargs,  # Ignore attention_mask, position_ids, etc.
     ) -> tuple[
         torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]
@@ -819,6 +819,9 @@ class HumanMotionGenerator:
 
                 if fk_positions is not None:
                     new_positions = fk_positions  # Override with FK-corrected positions if available
+                    relative_shift = (
+                        new_positions - current_positions
+                    )  # Recompute relative shift after FK correction
 
                 # ========================================
                 # Step F: Update tracker and history
