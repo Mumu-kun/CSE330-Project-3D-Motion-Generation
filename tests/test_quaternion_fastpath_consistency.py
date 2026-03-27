@@ -44,3 +44,27 @@ def test_qmul_identity_and_qinv_consistency() -> None:
     assert torch.allclose(left, q, atol=1e-6, rtol=1e-5)
     assert torch.allclose(right, q, atol=1e-6, rtol=1e-5)
     assert torch.allclose(recon, identity, atol=1e-5, rtol=1e-4)
+
+
+def test_quaternion_conversions_stay_finite_for_degenerate_inputs() -> None:
+    """Zero and near-zero quaternions should fall back to identity rotation."""
+    q = torch.tensor(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [1e-12, -1e-12, 2e-12, -2e-12],
+        ],
+        dtype=torch.float32,
+    )
+
+    cont6d = quaternion_to_cont6d(q)
+    rot_mat = quaternion_to_matrix(q)
+    expected_cont6d = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]],
+        dtype=torch.float32,
+    ).expand_as(cont6d)
+    expected_mat = torch.eye(3, dtype=torch.float32).unsqueeze(0).expand_as(rot_mat)
+
+    assert torch.isfinite(cont6d).all()
+    assert torch.isfinite(rot_mat).all()
+    assert torch.allclose(cont6d, expected_cont6d, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rot_mat, expected_mat, atol=1e-6, rtol=1e-6)

@@ -42,6 +42,7 @@ from utils.motion_utils import (
     generated_positions_to_271d,
     extract_prev_frame_features,
     get_fk_offsets,
+    get_dataset_config,
 )
 
 # Type variable for generic EMA model typing
@@ -174,6 +175,12 @@ class Trainer:
             torch.tensor(50.0, device=self.config.device),
             torch.tensor(5.0, device=self.config.device),
         )
+        self.last_guard_stats: Dict[str, float] = {
+            "degenerate_rollout_count": 0.0,
+            "degenerate_rollout_ratio": 0.0,
+            "degenerate_consistency_count": 0.0,
+            "degenerate_consistency_ratio": 0.0,
+        }
 
     @staticmethod
     def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
@@ -514,6 +521,94 @@ class Trainer:
         threshold = max(1, int(round(p * batch_size)))
         return torch.arange(batch_size, device=device) < threshold
 
+    @staticmethod
+    def ensure_finite_tensor(
+        tensor: Optional[torch.Tensor], name: str, context: str
+    ) -> None:
+        """Raise a focused error when a training tensor contains NaN/Inf values."""
+        if tensor is None or torch.isfinite(tensor).all():
+            return
+        raise RuntimeError(
+            f"Non-finite tensor detected for {name} during {context}; "
+            f"tensor shape was {tuple(tensor.shape)}"
+        )
+
+    @staticmethod
+    def get_nonfinite_loss_names(loss_terms: Dict[str, torch.Tensor]) -> list[str]:
+        """Return the names of any scalar loss terms that are NaN/Inf."""
+        return [
+            name
+            for name, value in loss_terms.items()
+            if not torch.isfinite(value).all()
+        ]
+
+    def detect_degenerate_pose_mask(
+        self,
+        new_positions: torch.Tensor,
+        prev_positions: torch.Tensor,
+        fk_offsets: Optional[torch.Tensor] = None,
+        reference_shifts: Optional[torch.Tensor] = None,
+        dataset_type: str = "t2m",
+    ) -> torch.Tensor:
+        """Flag poses that are too degenerate to safely send through IK/FK."""
+        batch_size = new_positions.shape[0]
+        device = new_positions.device
+        if (
+            not self.config.use_degenerate_pose_guard
+            or batch_size == 0
+            or new_positions.shape != prev_positions.shape
+        ):
+            return torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        cfg = get_dataset_config(dataset_type)
+        parent_indices = []
+        child_indices = []
+        for chain in cfg["kinematic_chain"]:
+            for parent_idx, child_idx in zip(chain[:-1], chain[1:]):
+                parent_indices.append(parent_idx)
+                child_indices.append(child_idx)
+
+        parent_idx_t = torch.tensor(parent_indices, device=device, dtype=torch.long)
+        child_idx_t = torch.tensor(child_indices, device=device, dtype=torch.long)
+
+        bad_mask = ~torch.isfinite(new_positions).reshape(batch_size, -1).all(dim=-1)
+
+        actual_bone_lengths = torch.norm(
+            new_positions[:, child_idx_t] - new_positions[:, parent_idx_t],
+            dim=-1,
+        )
+        if fk_offsets is not None:
+            expected_bone_lengths = torch.norm(fk_offsets[:, child_idx_t], dim=-1)
+        else:
+            expected_bone_lengths = torch.norm(
+                prev_positions[:, child_idx_t] - prev_positions[:, parent_idx_t],
+                dim=-1,
+            )
+        expected_bone_lengths = expected_bone_lengths.clamp(min=1e-6)
+        bone_ratio_threshold = (
+            self.config.degenerate_bone_ratio_threshold * expected_bone_lengths
+        )
+        bad_mask |= (actual_bone_lengths < bone_ratio_threshold).any(dim=-1)
+
+        l_hip, r_hip, sdr_r, sdr_l = cfg["face_joint_indx"]
+        across = (new_positions[:, r_hip] - new_positions[:, l_hip]) + (
+            new_positions[:, sdr_r] - new_positions[:, sdr_l]
+        )
+        across_norm = torch.norm(across, dim=-1)
+        bad_mask |= across_norm < self.config.degenerate_across_norm_threshold
+
+        predicted_step = torch.norm(new_positions - prev_positions, dim=-1).amax(dim=-1)
+        if reference_shifts is not None:
+            reference_step = torch.norm(reference_shifts, dim=-1).amax(dim=-1)
+        else:
+            reference_step = predicted_step.new_zeros(predicted_step.shape)
+        reference_step = reference_step.clamp(min=1e-6)
+        bad_mask |= predicted_step > (
+            self.config.degenerate_step_multiplier * reference_step
+        )
+
+        return bad_mask
+
     def incremental_flow_loss(
         self,
         motion: torch.Tensor,
@@ -561,13 +656,15 @@ class Trainer:
         if context is None:
             raise RuntimeError("Encoder context was not initialized from history.")
 
-        flow_losses: list[torch.Tensor] = []
-        consistency_losses: list[torch.Tensor] = []
         rollout_prob = self.get_rollout_probability(
             epoch=epoch, total_epochs=total_epochs
         )
         ode_steps = max(1, int(self.config.rollout_integration_steps))
         dt = 1.0 / float(ode_steps)
+        rollout_guard_bad = 0
+        rollout_guard_total = 0
+        consistency_guard_bad = 0
+        consistency_guard_total = 0
 
         contexts = [context]
 
@@ -592,7 +689,6 @@ class Trainer:
 
                 x1 = target_relative_shifts[:, step_idx]
                 x_t_roll = torch.randn_like(x1[rollout_mask])
-                pred_roll_endpoint: Optional[torch.Tensor] = None
                 try:
                     with timer(self.timing_stats, "forward/rollout_ode"):
                         with torch.no_grad():
@@ -621,26 +717,76 @@ class Trainer:
 
                 with timer(self.timing_stats, "forward/pos_transform"):
                     pred_positions_roll = current_positions_roll + x_t_roll
-                    rollout_frame, _, fk_positions_roll = generated_positions_to_271d(
+                    rollout_fk_offsets = (
+                        fk_offsets[rollout_mask] if fk_offsets is not None else None
+                    )
+                    degenerate_rollout_mask = self.detect_degenerate_pose_mask(
                         new_positions=pred_positions_roll,
                         prev_positions=current_positions_roll,
-                        dataset_type="t2m",
-                        fk_offsets=(
-                            fk_offsets[rollout_mask] if fk_offsets is not None else None
-                        ),
-                        normalizer=self.normalizer,
+                        fk_offsets=rollout_fk_offsets,
+                        reference_shifts=prev_relative_shifts_roll,
                     )
-                next_motion[rollout_mask] = rollout_frame
-                next_joints[rollout_mask] = (
-                    fk_positions_roll
-                    if fk_positions_roll is not None
-                    else pred_positions_roll
-                )
+                    rollout_guard_bad += int(degenerate_rollout_mask.sum().item())
+                    rollout_guard_total += rolled_count
+
+                    rolled_motion = next_motion[rollout_mask].clone()
+                    rolled_joints = next_joints[rollout_mask].clone()
+                    valid_rollout_mask = ~degenerate_rollout_mask
+                    if valid_rollout_mask.any():
+                        rollout_frame, _, fk_positions_roll = (
+                            generated_positions_to_271d(
+                                new_positions=pred_positions_roll[valid_rollout_mask],
+                                prev_positions=current_positions_roll[
+                                    valid_rollout_mask
+                                ],
+                                dataset_type="t2m",
+                                fk_offsets=(
+                                    rollout_fk_offsets[valid_rollout_mask]
+                                    if rollout_fk_offsets is not None
+                                    else None
+                                ),
+                                normalizer=self.normalizer,
+                            )
+                        )
+                        self.ensure_finite_tensor(
+                            rollout_frame,
+                            "rollout_frame",
+                            f"rollout position transform at step {step_idx}",
+                        )
+                        self.ensure_finite_tensor(
+                            fk_positions_roll,
+                            "rollout_fk_positions",
+                            f"rollout position transform at step {step_idx}",
+                        )
+                        canonical_next_joints = (
+                            fk_positions_roll
+                            if fk_positions_roll is not None
+                            else pred_positions_roll[valid_rollout_mask]
+                        )
+                        rolled_motion[valid_rollout_mask] = rollout_frame
+                        rolled_joints[valid_rollout_mask] = canonical_next_joints
+
+                    next_motion[rollout_mask] = rolled_motion
+                    next_joints[rollout_mask] = rolled_joints
+
+                    self.ensure_finite_tensor(
+                        next_motion[rollout_mask],
+                        "rollout_next_motion",
+                        f"rollout guarded update at step {step_idx}",
+                    )
+                    self.ensure_finite_tensor(
+                        next_joints[rollout_mask],
+                        "rollout_next_joints",
+                        f"rollout guarded update at step {step_idx}",
+                    )
 
                 hist[:, step_idx + 1] = next_motion.detach()
                 hist_joints[:, step_idx + 1] = next_joints.detach()
                 prev_relative_shifts[:, step_idx + 1] = (
                     next_joints - current_positions
+                ).detach()
+                target_relative_shifts[:, step_idx + 1] = (
+                    target_joints[:, step_idx + 1] - next_joints
                 ).detach()
 
             with timer(self.timing_stats, "forward/gru_step"):
@@ -692,25 +838,71 @@ class Trainer:
                 pred_x1 = xt + pred_t * dt
             with timer(self.timing_stats, "forward/pos_transform"):
                 pred_positions = hist_joints_reshaped + pred_x1
-                pred_frames, _, fk_positions = generated_positions_to_271d(
+                repeated_fk_offsets = (
+                    torch.repeat_interleave(fk_offsets, pred_steps, dim=0)
+                    if fk_offsets is not None
+                    else None
+                )
+                degenerate_consistency_mask = self.detect_degenerate_pose_mask(
                     new_positions=pred_positions,
                     prev_positions=hist_joints_reshaped,
-                    dataset_type="t2m",
-                    fk_offsets=(
-                        torch.repeat_interleave(fk_offsets, pred_steps, dim=0)
-                        if fk_offsets is not None
-                        else None
-                    ),  # (B*pred_steps, 22, 3)
-                    normalizer=self.normalizer,
+                    fk_offsets=repeated_fk_offsets,
+                    reference_shifts=prev_relative_shifts_reshaped,
                 )
-                pred_shift = (
-                    fk_positions - hist_joints_reshaped
-                    if fk_positions is not None
-                    else pred_x1
+                consistency_guard_bad = int(degenerate_consistency_mask.sum().item())
+                consistency_guard_total = int(degenerate_consistency_mask.numel())
+                valid_consistency_mask = ~degenerate_consistency_mask
+                min_valid = max(
+                    1, int(self.config.degenerate_min_valid_samples_for_consistency)
                 )
-                consistency_loss = F.mse_loss(pred_shift, x1)
+                valid_count = int(valid_consistency_mask.sum().item())
+                if valid_count >= min_valid:
+                    pred_frames, _, fk_positions = generated_positions_to_271d(
+                        new_positions=pred_positions[valid_consistency_mask],
+                        prev_positions=hist_joints_reshaped[valid_consistency_mask],
+                        dataset_type="t2m",
+                        fk_offsets=(
+                            repeated_fk_offsets[valid_consistency_mask]
+                            if repeated_fk_offsets is not None
+                            else None
+                        ),
+                        normalizer=self.normalizer,
+                    )
+                    self.ensure_finite_tensor(
+                        pred_frames,
+                        "consistency_frame",
+                        "consistency position transform",
+                    )
+                    self.ensure_finite_tensor(
+                        fk_positions,
+                        "consistency_fk_positions",
+                        "consistency position transform",
+                    )
+                    pred_positions = (
+                        fk_positions
+                        if fk_positions is not None
+                        else pred_positions[valid_consistency_mask]
+                    )
+                    target_positions = target_joints.flatten(0, 1)[
+                        valid_consistency_mask
+                    ]
+                    consistency_loss = F.mse_loss(pred_positions, target_positions)
 
         total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
+        self.last_guard_stats = {
+            "degenerate_rollout_count": float(rollout_guard_bad),
+            "degenerate_rollout_ratio": (
+                float(rollout_guard_bad) / float(rollout_guard_total)
+                if rollout_guard_total > 0
+                else 0.0
+            ),
+            "degenerate_consistency_count": float(consistency_guard_bad),
+            "degenerate_consistency_ratio": (
+                float(consistency_guard_bad) / float(consistency_guard_total)
+                if consistency_guard_total > 0
+                else 0.0
+            ),
+        }
 
         return total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob
 
@@ -1072,6 +1264,29 @@ class Trainer:
                                 stochastic_rollout=True,
                             )
 
+                    nonfinite_losses = self.get_nonfinite_loss_names(
+                        {
+                            "loss": loss,
+                            "flow_loss": flow_loss,
+                            "consistency_loss": consistency_loss,
+                        }
+                    )
+                    if nonfinite_losses:
+                        tqdm.write(
+                            f"[Epoch {epoch}] [Step {training_state['global_step']}] "
+                            "Skipping batch with non-finite losses: "
+                            + ", ".join(nonfinite_losses)
+                        )
+                        if wandb_logger is not None:
+                            wandb_logger.log(
+                                {"train/skipped_nonfinite_batch": 1},
+                                step=training_state["global_step"],
+                            )
+                        pbar.set_postfix({"skip": ",".join(nonfinite_losses)})
+                        optimizer.zero_grad(set_to_none=True)
+                        training_state["global_step"] += 1
+                        continue
+
                     with timer(self.timing_stats, "backward"):
                         scaler.scale(loss).backward()
 
@@ -1098,6 +1313,8 @@ class Trainer:
                             "L_flow": f"{flow_loss.item():.4f}",
                             "L_cons": f"{consistency_loss.item():.4f}",
                             "p_roll": f"{rollout_prob:.2f}",
+                            "deg_roll": f"{self.last_guard_stats['degenerate_rollout_ratio']:.2f}",
+                            "deg_cons": f"{self.last_guard_stats['degenerate_consistency_ratio']:.2f}",
                             "lr": f"{lr:.2e}",
                         }
                     )
@@ -1118,6 +1335,7 @@ class Trainer:
                             "L_flow": flow_loss.item(),
                             "L_consistency": consistency_loss.item(),
                             "rollout_prob": rollout_prob,
+                            **self.last_guard_stats,
                         },
                         global_step=training_state["global_step"],
                     )

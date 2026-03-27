@@ -163,6 +163,28 @@ def _normalize_vector(v: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
     return v * inv_norm
 
 
+def _identity_quaternion_like(q: torch.Tensor) -> torch.Tensor:
+    """Create an identity quaternion tensor matching q's shape/device/dtype."""
+    identity = torch.zeros_like(q)
+    identity[..., 0] = 1.0
+    return identity
+
+
+def _ensure_finite_tensor(
+    tensor: torch.Tensor,
+    stage: str,
+    source_shape: torch.Size,
+) -> None:
+    """Raise a clear error when intermediate generated features become non-finite."""
+    if torch.isfinite(tensor).all():
+        return
+    raise RuntimeError(
+        "generated_positions_to_271d produced non-finite values "
+        f"at stage '{stage}' for input batch shape {tuple(source_shape)} "
+        f"and tensor shape {tuple(tensor.shape)}"
+    )
+
+
 def _compute_ik(
     positions: torch.Tensor,
     raw_offsets: torch.Tensor,
@@ -280,9 +302,10 @@ def _qbetween(
     w = 1.0 + dot
 
     q = torch.cat([w, cross], dim=-1)
-    q = _normalize_vector(q)
-
-    return q
+    q_norm = torch.norm(q, dim=-1, keepdim=True)
+    identity = _identity_quaternion_like(q)
+    normalized_q = q / q_norm.clamp(min=1e-10)
+    return torch.where(q_norm >= 1e-10, normalized_q, identity)
 
 
 def _forward_kinematics(
@@ -1019,22 +1042,43 @@ def generated_positions_to_271d(
     else:
         prev_positions_resolved = None
 
-    # 2) IK and 6D rotations.
-    quaternions = _compute_ik(
-        new_positions, raw_offsets, kinematic_chain, face_joint_indx
-    )
-    rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
-    root_quat = quaternions[:, 0]  # (B,4)
-    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 22, -1)
+    candidate_positions = new_positions
+    _ensure_finite_tensor(candidate_positions, "candidate_positions", new_positions.shape)
+    candidate_root_pos = candidate_positions[:, 0]  # (B, 3)
 
-    new_root_pos = new_positions[:, 0]  # (B, 3)
-    # 3) RIC positions from either FK-consistent or direct global positions.
+    candidate_quaternions = _compute_ik(
+        candidate_positions, raw_offsets, kinematic_chain, face_joint_indx
+    )
+    _ensure_finite_tensor(
+        candidate_quaternions, "candidate_quaternions", new_positions.shape
+    )
+    candidate_rotations_6d = quaternion_to_cont6d(candidate_quaternions)  # (B,22,6)
+    _ensure_finite_tensor(
+        candidate_rotations_6d, "candidate_rotations_6d", new_positions.shape
+    )
+
+    # Resolve the canonical pose first, then derive every returned feature from it.
     fk_positions = None
     if fk_offsets is not None:
         fk_positions = _forward_kinematics(
-            rotations_6d, new_root_pos, fk_offsets, kinematic_chain
+            candidate_rotations_6d, candidate_root_pos, fk_offsets, kinematic_chain
         )
-        new_positions = fk_positions
+        canonical_positions = fk_positions
+    else:
+        canonical_positions = candidate_positions
+    _ensure_finite_tensor(canonical_positions, "canonical_positions", new_positions.shape)
+    if fk_positions is not None:
+        _ensure_finite_tensor(fk_positions, "fk_positions", new_positions.shape)
+
+    quaternions = _compute_ik(
+        canonical_positions, raw_offsets, kinematic_chain, face_joint_indx
+    )
+    _ensure_finite_tensor(quaternions, "canonical_quaternions", new_positions.shape)
+    rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
+    _ensure_finite_tensor(rotations_6d, "canonical_rotations_6d", new_positions.shape)
+    root_quat = quaternions[:, 0]  # (B,4)
+    root_quat_expanded = root_quat.unsqueeze(1).expand(-1, 22, -1)
+    new_root_pos = canonical_positions[:, 0]  # (B, 3)
 
     # 1) Root features: absolute Y and velocity-form X/Z.
     root_height_y = new_root_pos[:, 1:2]
@@ -1046,7 +1090,7 @@ def generated_positions_to_271d(
         root_vel_z = new_root_pos[:, 2:3] - prev_positions_resolved[:, 0, 2:3]
     root_features = torch.cat([root_height_y, root_vel_x, root_vel_z], dim=-1)  # (B,3)
 
-    ric_source = new_positions
+    ric_source = canonical_positions
     ric = ric_source - ric_source[:, 0:1]
     ric = qrot(root_quat_expanded, ric)  # (B,22,3)
 
@@ -1056,11 +1100,11 @@ def generated_positions_to_271d(
         feet_l = torch.zeros((B, 2), device=device, dtype=dtype)
         feet_r = torch.zeros((B, 2), device=device, dtype=dtype)
     else:
-        pos_delta = new_positions - prev_positions_resolved
+        pos_delta = canonical_positions - prev_positions_resolved
         local_vel = qrot(root_quat_expanded, pos_delta)
 
-        vel_l = new_positions[:, fid_l] - prev_positions_resolved[:, fid_l]
-        vel_r = new_positions[:, fid_r] - prev_positions_resolved[:, fid_r]
+        vel_l = canonical_positions[:, fid_l] - prev_positions_resolved[:, fid_l]
+        vel_r = canonical_positions[:, fid_r] - prev_positions_resolved[:, fid_r]
         feet_l = (torch.sum(vel_l**2, dim=-1) < feet_thre).float()
         feet_r = (torch.sum(vel_r**2, dim=-1) < feet_thre).float()
 
@@ -1077,9 +1121,11 @@ def generated_positions_to_271d(
         ],
         dim=-1,
     )
+    _ensure_finite_tensor(new_frame, "raw_frame", new_positions.shape)
 
     if normalizer is not None:
         new_frame = normalizer.normalize(new_frame)
+        _ensure_finite_tensor(new_frame, "normalized_frame", new_positions.shape)
 
     return new_frame, new_root_pos, fk_positions
 

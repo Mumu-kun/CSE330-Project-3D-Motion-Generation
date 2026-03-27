@@ -14,6 +14,22 @@ _EPS4 = np.finfo(float).eps * 4.0
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 
+def _safe_normalize_quaternion(
+    quaternions: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Normalize quaternions and fall back to identity when the norm collapses."""
+    if quaternions.shape[-1] != 4:
+        raise ValueError(
+            f"Expected quaternions with trailing dimension 4, got {quaternions.shape}"
+        )
+
+    norms = torch.norm(quaternions, dim=-1, keepdim=True)
+    identity = torch.zeros_like(quaternions)
+    identity[..., 0] = 1.0
+    normalized = quaternions / norms.clamp(min=eps)
+    return torch.where(norms >= eps, normalized, identity)
+
+
 # PyTorch-backed implementations
 def qinv(q):
     """Invert quaternion(s) q."""
@@ -73,8 +89,9 @@ def quaternion_to_matrix(quaternions):
     Returns:
         Rotation matrices as tensor of shape (..., 3, 3).
     """
+    quaternions = _safe_normalize_quaternion(quaternions)
     r, i, j, k = torch.unbind(quaternions, -1)
-    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+    two_s = 2.0 / (quaternions * quaternions).sum(-1).clamp(min=1e-8)
 
     o = torch.stack(
         (
@@ -95,8 +112,9 @@ def quaternion_to_matrix(quaternions):
 
 def quaternion_to_cont6d(quaternions):
     """Convert quaternions to 6D rotation representation."""
+    quaternions = _safe_normalize_quaternion(quaternions)
     r, i, j, k = torch.unbind(quaternions, -1)
-    two_s = 2.0 / (quaternions * quaternions).sum(-1)
+    two_s = 2.0 / (quaternions * quaternions).sum(-1).clamp(min=1e-8)
 
     c0_x = 1 - two_s * (j * j + k * k)
     c0_y = two_s * (i * j + k * r)

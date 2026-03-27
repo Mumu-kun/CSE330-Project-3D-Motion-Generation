@@ -78,8 +78,8 @@ class Config:
     encoder_text_dim: int = 512  # CLIP embedding size
     encoder_text_proj_dim: int = 128  # Text projection dimension
     encoder_hidden_dim: int = 512  # GRU hidden size
-    encoder_per_joint_dim: int = 512  # Output per-joint context dimension
-    encoder_num_layers: int = 2  # GRU layers
+    encoder_per_joint_dim: int = 64  # Output per-joint context dimension
+    encoder_num_layers: int = 3  # GRU layers
     encoder_num_joints: int = 22  # Number of joints
     encoder_text_scale: float = 1.0  # Text conditioning scale
     encoder_dropout: float = 0.1  # Dropout between GRU layers
@@ -91,8 +91,8 @@ class Config:
     # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
     predictor_config: FlowMatchingPredictorConfig = field(
         default_factory=lambda: FlowMatchingPredictorConfig(
-            hidden_size=64,
-            intermediate_size=4 * 64,
+            hidden_size=128,
+            intermediate_size=3 * 128,
             num_hidden_layers=3,
             num_attention_heads=8,
             hidden_act="silu",
@@ -108,10 +108,23 @@ class Config:
     # Training settings
     batch_size: int = 192
     learning_rate: float = 1e-4
-    num_epochs: int = 400
+    num_epochs: int = 200
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
+
+    horizon: int = 40  # Maximum/target horizon for training
+
+    # Curriculum learning settings
+    # Set to None to disable curriculum (use fixed horizon from horizon field)
+    curriculum: Optional[list[dict[str, int]]] = field(
+        default_factory=lambda: [
+            {"horizon": 5, "epochs": 50},
+            {"horizon": 10, "epochs": 100},
+            {"horizon": 20, "epochs": 150},
+            {"horizon": 40, "epochs": 200},
+        ]
+    )
 
     # CFG (Classifier-Free Guidance) settings
     cfg_dropout: float = 0.1  # Dropout probability for CFG
@@ -127,20 +140,11 @@ class Config:
         True  # Enable endpoint consistency loss after no-grad rollout
     )
     consistency_loss_weight: float = 1.0  # Weight for consistency loss in total loss
-
-    # Horizon settings
-    horizon: int = 20  # Maximum/target horizon for training
-
-    # Curriculum learning settings
-    # Set to None to disable curriculum (use fixed horizon from horizon field)
-    curriculum: Optional[list[dict[str, int]]] = field(
-        default_factory=lambda: [
-            {"horizon": 5, "epochs": 50},
-            {"horizon": 10, "epochs": 100},
-            {"horizon": 20, "epochs": 200},
-            {"horizon": 40, "epochs": 400},
-        ]
-    )
+    use_degenerate_pose_guard: bool = True
+    degenerate_bone_ratio_threshold: float = 0.05
+    degenerate_across_norm_threshold: float = 1e-4
+    degenerate_step_multiplier: float = 5.0
+    degenerate_min_valid_samples_for_consistency: int = 1
 
     # Data loading
     num_workers: int = 4

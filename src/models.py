@@ -128,11 +128,11 @@ class MotionHistoryEncoder(nn.Module):
         )
 
         # Shared MLP: global GRU hidden (B, H) → all joints (B, 22 * D_joint)
-        # self.global_to_joints = nn.Sequential(
-        #     nn.Linear(model_dim, model_dim),
-        #     nn.ReLU(),
-        #     nn.Linear(model_dim, joint_count * per_joint_out_dim),
-        # )
+        self.global_to_joints = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.ReLU(),
+            nn.Linear(model_dim, joint_count * per_joint_out_dim),
+        )
 
     def init_hidden(self, text_emb: torch.Tensor) -> torch.Tensor:
         """
@@ -172,13 +172,13 @@ class MotionHistoryEncoder(nn.Module):
         h_t = h_seq[:, -1, :]  # last timestep in this block, (B, H)
 
         # Shared MLP to per-joint tokens
-        # joint_tokens = self.global_to_joints(h_t)  # (B, 22 * D_joint)
-        # history_features = joint_tokens.view(
-        #     B, self.joint_count, self.per_joint_out_dim
-        # )  # (B, 22, D_joint)
-        history_features = h_t.unsqueeze(1).expand(
-            B, self.joint_count, self.model_dim
-        )  # (B, 22, H)
+        joint_tokens = self.global_to_joints(h_t)  # (B, 22 * D_joint)
+        history_features = joint_tokens.view(
+            B, self.joint_count, self.per_joint_out_dim
+        )  # (B, 22, D_joint)
+        # history_features = h_t.unsqueeze(1).expand(
+        #     B, self.joint_count, self.model_dim
+        # )  # (B, 22, H)
 
         return history_features, h_next
 
