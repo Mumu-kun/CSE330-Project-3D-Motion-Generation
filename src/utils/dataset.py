@@ -261,6 +261,8 @@ class Text2MotionDataset(Dataset):
             motion = motion[start_idx : start_idx + self.current_horizon]
             joints = joints[start_idx : start_idx + self.current_horizon]
 
+        valid_length = min(current_len, target_len)
+
         # ===== FINAL SANITY CHECK =====
         assert (
             motion.shape[0] == target_len
@@ -308,7 +310,8 @@ class Text2MotionDataset(Dataset):
 
         # text_embedding shape: (1, 512) - pooled CLIP embedding
         # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
-        return caption, motion, joints, original_length, text_embedding
+        # valid_length is the number of real frames before zero-padding, capped at target_len.
+        return caption, motion, joints, valid_length, text_embedding
 
     def reset_min_len(self, length: int | None = None):
         if length is None:
@@ -349,8 +352,8 @@ def text2motion_collate_fn(
       - caption: str
       - motion: (max_T, 271) torch.Tensor - full 271D features
       - joints: (max_T, J, 3) torch.Tensor
-      - length: int
-            - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
+      - length: int number of valid frames before padding, capped at the returned horizon
+      - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
     """
     # Lists of items
     captions = [b[0] for b in batch]

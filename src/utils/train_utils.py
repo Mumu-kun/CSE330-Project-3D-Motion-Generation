@@ -442,9 +442,16 @@ class Trainer:
         motion_raw = batch["motion"].to(device)
         joints = batch["joints"].to(device)
         B, T, _ = motion_raw.shape
-        lengths = batch.get(
-            "lengths", torch.full((B,), T, device=device, dtype=torch.long)
-        )
+        raw_lengths = batch.get("lengths")
+        if raw_lengths is None:
+            lengths = torch.full((B,), T, device=device, dtype=torch.long)
+        else:
+            lengths = raw_lengths.to(device=device, dtype=torch.long)
+            if lengths.numel() != B:
+                raise ValueError(
+                    f"Invalid lengths shape {tuple(lengths.shape)}. Expected {B} elements."
+                )
+            lengths = lengths.reshape(B).clamp(min=0, max=T)
 
         motion = (
             self.normalizer.normalize(motion_raw)

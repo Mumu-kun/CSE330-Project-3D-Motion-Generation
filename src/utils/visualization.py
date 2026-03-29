@@ -121,15 +121,17 @@ def plot_3d_motion(
 
     if save_path:
         save_path.parent.mkdir(parents=True, exist_ok=True)
-    target = save_path if save_path else io.BytesIO()
+    target = str(save_path) if save_path else io.BytesIO()
 
-    writer = imageio.get_writer(
-        target,
-        format="mp4",
-        fps=fps,
-        codec="libx264",
-        output_params=["-preset", "ultrafast", "-crf", "28"],
-    )
+    writer_kwargs = {
+        "fps": fps,
+        "codec": "libx264",
+        "output_params": ["-preset", "ultrafast", "-crf", "28"],
+    }
+    if save_path:
+        writer = imageio.get_writer(target, format="FFMPEG", **writer_kwargs)
+    else:
+        writer = imageio.get_writer(target, format="mp4", **writer_kwargs)
 
     for frame_idx in range(len(motion)):
         if follow_root:
