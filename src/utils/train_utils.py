@@ -41,7 +41,6 @@ from utils.motion_utils import (
     flow_output_to_271d,  # kept in case you use it elsewhere
     generated_positions_to_271d,
     extract_prev_frame_features,
-    get_fk_offsets,
     get_dataset_config,
 )
 
@@ -646,17 +645,12 @@ class Trainer:
                 f"motion length {motion.shape[1]} != joints length {j_len}."
             )
 
-        fk_offsets = (
-            get_fk_offsets(joints) if self.config.use_fk else None
-        )  # (B, 22, 3)
-
         pred_steps = j_len - 1
-        hist = motion[:, :-1].clone()
-        hist_joints = joints[:, :-1].clone()
-        prev_relative_shifts = relative_shifts[:, :-1].clone()
-        target_motion = motion[:, 1:].clone()
-        target_joints = joints[:, 1:].clone()
-        target_relative_shifts = relative_shifts[:, 1:].clone()
+        hist = motion[:, :-1]
+        hist_joints = joints[:, :-1]
+        prev_relative_shifts = relative_shifts[:, :-1]
+        target_motion = motion[:, 1:]
+        target_joints = joints[:, 1:]
 
         with timer(self.timing_stats, "forward/gru_init"):
             context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
@@ -668,34 +662,44 @@ class Trainer:
         )
         ode_steps = max(1, int(self.config.rollout_integration_steps))
         dt = 1.0 / float(ode_steps)
-        rollout_guard_bad = 0
-        rollout_guard_total = 0
-        consistency_guard_bad = 0
-        consistency_guard_total = 0
+        current_positions = hist_joints[:, 0].detach().clone()
+        effective_prev_shift = prev_relative_shifts[:, 0].detach().clone()
+        flow_contexts: list[torch.Tensor] = []
+        flow_prev_relative_shifts: list[torch.Tensor] = []
+        flow_x0: list[torch.Tensor] = []
+        flow_x1: list[torch.Tensor] = []
+        flow_xt: list[torch.Tensor] = []
+        flow_t: list[torch.Tensor] = []
+        self.last_guard_stats = {
+            "degenerate_rollout_count": 0.0,
+            "degenerate_rollout_ratio": 0.0,
+            "degenerate_consistency_count": 0.0,
+            "degenerate_consistency_ratio": 0.0,
+        }
 
-        contexts = [context]
+        for step_idx in range(pred_steps):
+            current_positions_before_step = current_positions
+            x1 = target_joints[:, step_idx] - current_positions
+            x0 = torch.randn_like(x1)
+            t = torch.rand(B, device=device)
+            t_ = t.view(B, 1, 1)
+            xt = t_ * x1 + (1 - t_) * x0
+            relative_shifts_step = effective_prev_shift
+            flow_contexts.append(context)
+            flow_prev_relative_shifts.append(relative_shifts_step)
+            flow_x0.append(x0)
+            flow_x1.append(x1)
+            flow_xt.append(xt)
+            flow_t.append(t)
 
-        for step_idx in range(pred_steps - 1):
-            current_positions = hist_joints[:, step_idx]
             rollout_mask = self.get_rollout_mask(
                 B, rollout_prob, device, stochastic_rollout
             )
-
-            next_motion = target_motion[:, step_idx].clone()
-            next_joints = target_joints[:, step_idx].clone()
-
+            next_input = target_motion[:, step_idx].clone()
             if rollout_mask.any():
                 predictor_was_training = pred_model.training
                 pred_model.eval()
-                rolled_count = int(rollout_mask.sum().item())
-
-                context_roll = context[rollout_mask]
-                text_roll = text_for_encoder[rollout_mask]
-                current_positions_roll = current_positions[rollout_mask]
-                prev_relative_shifts_roll = prev_relative_shifts[rollout_mask, step_idx]
-
-                x1 = target_relative_shifts[:, step_idx]
-                x_t_roll = torch.randn_like(x1[rollout_mask])
+                x_t_roll = torch.randn_like(x1)
                 try:
                     with timer(self.timing_stats, "forward/rollout_ode"):
                         with torch.no_grad():
@@ -704,16 +708,16 @@ class Trainer:
                                     self.timing_stats, "forward/rollout_ode_step"
                                 ):
                                     tau = torch.full(
-                                        (rolled_count,),
+                                        (B,),
                                         float(ode_step) * dt,
                                         device=device,
                                     )
                                     pred_roll = pred_model.forward(
-                                        track_features=context_roll,
+                                        track_features=context,
                                         noised_tracks=x_t_roll,
                                         timesteps=tau,
-                                        prev_relative_shifts=prev_relative_shifts_roll,
-                                        text_embedding=text_roll,
+                                        prev_relative_shifts=relative_shifts_step,
+                                        text_embedding=text_for_encoder,
                                         output_attentions=False,
                                         output_hidden_states=False,
                                     )[0]
@@ -723,194 +727,64 @@ class Trainer:
                         pred_model.train()
 
                 with timer(self.timing_stats, "forward/pos_transform"):
-                    pred_positions_roll = current_positions_roll + x_t_roll
-                    rollout_fk_offsets = (
-                        fk_offsets[rollout_mask] if fk_offsets is not None else None
-                    )
-                    degenerate_rollout_mask = self.detect_degenerate_pose_mask(
+                    pred_positions_roll = current_positions + x_t_roll
+                    rollout_frame, _, _ = generated_positions_to_271d(
                         new_positions=pred_positions_roll,
-                        prev_positions=current_positions_roll,
-                        fk_offsets=rollout_fk_offsets,
-                        reference_shifts=prev_relative_shifts_roll,
-                    )
-                    rollout_guard_bad += int(degenerate_rollout_mask.sum().item())
-                    rollout_guard_total += rolled_count
-
-                    rolled_motion = next_motion[rollout_mask].clone()
-                    rolled_joints = next_joints[rollout_mask].clone()
-                    valid_rollout_mask = ~degenerate_rollout_mask
-                    if valid_rollout_mask.any():
-                        rollout_frame, _, fk_positions_roll = (
-                            generated_positions_to_271d(
-                                new_positions=pred_positions_roll[valid_rollout_mask],
-                                prev_positions=current_positions_roll[
-                                    valid_rollout_mask
-                                ],
-                                dataset_type="t2m",
-                                fk_offsets=(
-                                    rollout_fk_offsets[valid_rollout_mask]
-                                    if rollout_fk_offsets is not None
-                                    else None
-                                ),
-                                normalizer=self.normalizer,
-                            )
-                        )
-                        self.ensure_finite_tensor(
-                            rollout_frame,
-                            "rollout_frame",
-                            f"rollout position transform at step {step_idx}",
-                        )
-                        self.ensure_finite_tensor(
-                            fk_positions_roll,
-                            "rollout_fk_positions",
-                            f"rollout position transform at step {step_idx}",
-                        )
-                        canonical_next_joints = (
-                            fk_positions_roll
-                            if fk_positions_roll is not None
-                            else pred_positions_roll[valid_rollout_mask]
-                        )
-                        rolled_motion[valid_rollout_mask] = rollout_frame
-                        rolled_joints[valid_rollout_mask] = canonical_next_joints
-
-                    next_motion[rollout_mask] = rolled_motion
-                    next_joints[rollout_mask] = rolled_joints
-
-                    self.ensure_finite_tensor(
-                        next_motion[rollout_mask],
-                        "rollout_next_motion",
-                        f"rollout guarded update at step {step_idx}",
-                    )
-                    self.ensure_finite_tensor(
-                        next_joints[rollout_mask],
-                        "rollout_next_joints",
-                        f"rollout guarded update at step {step_idx}",
+                        prev_positions=current_positions,
+                        dataset_type="t2m",
+                        normalizer=self.normalizer,
                     )
 
-                hist[:, step_idx + 1] = next_motion.detach()
-                hist_joints[:, step_idx + 1] = next_joints.detach()
-                prev_relative_shifts[:, step_idx + 1] = (
-                    next_joints - current_positions
-                ).detach()
-                target_relative_shifts[:, step_idx + 1] = (
-                    target_joints[:, step_idx + 1] - next_joints
+                next_input[rollout_mask] = rollout_frame[rollout_mask]
+
+                next_positions = target_joints[:, step_idx].clone()
+                next_positions[rollout_mask] = pred_positions_roll[rollout_mask]
+                current_positions = next_positions.detach()
+            else:
+                current_positions = target_joints[:, step_idx].detach()
+
+            if step_idx + 1 < pred_steps:
+                effective_prev_shift = (
+                    current_positions - current_positions_before_step
                 ).detach()
 
             with timer(self.timing_stats, "forward/gru_step"):
                 context, h_state = enc.gru_step(
-                    hist[:, step_idx + 1], text_for_encoder, h_state
+                    next_input.detach(), text_for_encoder, h_state
                 )
-            contexts.append(context)
 
-        contexts_stacked = torch.stack(contexts, dim=1)
+        contexts_stacked = torch.stack(flow_contexts, dim=1)
+        prev_relative_shifts_stacked = torch.stack(flow_prev_relative_shifts, dim=1)
+        x0_stacked = torch.stack(flow_x0, dim=1)
+        x1_stacked = torch.stack(flow_x1, dim=1)
+        xt_stacked = torch.stack(flow_xt, dim=1)
+        t_stacked = torch.stack(flow_t, dim=1)
         contexts_reshaped = contexts_stacked.flatten(0, 1)
-        prev_relative_shifts_reshaped = prev_relative_shifts.flatten(0, 1)
+        prev_relative_shifts_reshaped = prev_relative_shifts_stacked.flatten(0, 1)
         text_batched = (
             text_for_encoder.unsqueeze(1)
             .expand(-1, pred_steps, -1)
             .reshape(B * pred_steps, -1)
         )
-
-        x1 = target_relative_shifts.flatten(0, 1)
-        x0 = torch.randn_like(x1)
+        target_flow = (x1_stacked - x0_stacked).flatten(0, 1)
+        xt = xt_stacked.flatten(0, 1)
+        t = t_stacked.reshape(B * pred_steps)
 
         with timer(self.timing_stats, "forward/predictor"):
-            t = torch.rand((x1.shape[0],), device=device)
-            _t = t[:, None, None]
-            xt = _t * x1 + (1 - _t) * x0
             pred, _, _ = pred_model.forward(
                 track_features=contexts_reshaped,
                 noised_tracks=xt,
                 timesteps=t,
                 prev_relative_shifts=prev_relative_shifts_reshaped,
                 text_embedding=text_batched,
+                output_attentions=False,
+                output_hidden_states=False,
             )
-            flow_loss = F.mse_loss(pred, x1 - x0)
+            flow_loss = F.mse_loss(pred, target_flow)
 
-        consistency_loss = torch.tensor(0.0, device=device)
-        if self.config.use_consistency_loss:
-            hist_joints_reshaped = hist_joints.flatten(0, 1)
-            with timer(self.timing_stats, "forward/consistency_loss"):
-                t = self.consistency_distribution.sample((x1.shape[0],))
-                _t = t[:, None, None]
-                xt = _t * x1 + (1 - _t) * x0
-                pred_t, _, _ = pred_model.forward(
-                    track_features=contexts_reshaped,
-                    noised_tracks=xt,
-                    timesteps=t,
-                    prev_relative_shifts=prev_relative_shifts_reshaped,
-                    text_embedding=text_batched,
-                )
-                dt = 1 - _t
-                pred_x1 = xt + pred_t * dt
-            with timer(self.timing_stats, "forward/pos_transform"):
-                pred_positions = hist_joints_reshaped + pred_x1
-                repeated_fk_offsets = (
-                    torch.repeat_interleave(fk_offsets, pred_steps, dim=0)
-                    if fk_offsets is not None
-                    else None
-                )
-                degenerate_consistency_mask = self.detect_degenerate_pose_mask(
-                    new_positions=pred_positions,
-                    prev_positions=hist_joints_reshaped,
-                    fk_offsets=repeated_fk_offsets,
-                    reference_shifts=prev_relative_shifts_reshaped,
-                )
-                consistency_guard_bad = int(degenerate_consistency_mask.sum().item())
-                consistency_guard_total = int(degenerate_consistency_mask.numel())
-                valid_consistency_mask = ~degenerate_consistency_mask
-                min_valid = max(
-                    1, int(self.config.degenerate_min_valid_samples_for_consistency)
-                )
-                valid_count = int(valid_consistency_mask.sum().item())
-                if valid_count >= min_valid:
-                    pred_frames, _, fk_positions = generated_positions_to_271d(
-                        new_positions=pred_positions[valid_consistency_mask],
-                        prev_positions=hist_joints_reshaped[valid_consistency_mask],
-                        dataset_type="t2m",
-                        fk_offsets=(
-                            repeated_fk_offsets[valid_consistency_mask]
-                            if repeated_fk_offsets is not None
-                            else None
-                        ),
-                        normalizer=self.normalizer,
-                    )
-                    self.ensure_finite_tensor(
-                        pred_frames,
-                        "consistency_frame",
-                        "consistency position transform",
-                    )
-                    self.ensure_finite_tensor(
-                        fk_positions,
-                        "consistency_fk_positions",
-                        "consistency position transform",
-                    )
-                    pred_positions = (
-                        fk_positions
-                        if fk_positions is not None
-                        else pred_positions[valid_consistency_mask]
-                    )
-                    target_positions = target_joints.flatten(0, 1)[
-                        valid_consistency_mask
-                    ]
-                    consistency_loss = F.mse_loss(pred_positions, target_positions)
+        consistency_loss = flow_loss.new_zeros(())
 
-        total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
-        self.last_guard_stats = {
-            "degenerate_rollout_count": float(rollout_guard_bad),
-            "degenerate_rollout_ratio": (
-                float(rollout_guard_bad) / float(rollout_guard_total)
-                if rollout_guard_total > 0
-                else 0.0
-            ),
-            "degenerate_consistency_count": float(consistency_guard_bad),
-            "degenerate_consistency_ratio": (
-                float(consistency_guard_bad) / float(consistency_guard_total)
-                if consistency_guard_total > 0
-                else 0.0
-            ),
-        }
-
+        total_loss = flow_loss
         return total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob
 
     def apply_cfg_dropout(

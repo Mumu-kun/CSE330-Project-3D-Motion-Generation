@@ -131,6 +131,97 @@ FEATURE_SLICES = {
 # ============================================================================
 
 
+def root_features_to_root_positions(
+    root_features: torch.Tensor,
+    prev_root_pos: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Convert velocity-form root features into absolute root positions.
+
+    The velocity-form layout is `[root_height_y, root_vel_x, root_vel_z]`.
+    `prev_root_pos` provides the absolute XYZ position immediately before the
+    first frame in `root_features`.
+
+    Supported shapes:
+    - Single frame: `(..., 3)` with `prev_root_pos` shape `(..., 3)`
+    - Sequence: `(..., T, 3)` with `prev_root_pos` shape `(..., 3)`
+    """
+    if root_features.size(-1) != 3:
+        raise ValueError(
+            "root_features must end with 3 values: [root_height_y, root_vel_x, root_vel_z]"
+        )
+    if prev_root_pos.size(-1) != 3:
+        raise ValueError("prev_root_pos must end with 3 values: [x, y, z]")
+
+    root_height_y = root_features[..., 0:1]
+    root_vel_x = root_features[..., 1:2]
+    root_vel_z = root_features[..., 2:3]
+
+    if root_features.ndim == prev_root_pos.ndim:
+        root_pos_x = prev_root_pos[..., 0:1] + root_vel_x
+        root_pos_z = prev_root_pos[..., 2:3] + root_vel_z
+    elif root_features.ndim == prev_root_pos.ndim + 1:
+        prev_root_pos = prev_root_pos.unsqueeze(-2)
+        root_pos_x = prev_root_pos[..., 0:1] + torch.cumsum(root_vel_x, dim=-2)
+        root_pos_z = prev_root_pos[..., 2:3] + torch.cumsum(root_vel_z, dim=-2)
+    else:
+        raise ValueError(
+            "Expected root_features to be either frame-shaped (..., 3) or sequence-shaped (..., T, 3) "
+            "relative to prev_root_pos (..., 3)"
+        )
+
+    return torch.cat([root_pos_x, root_height_y, root_pos_z], dim=-1)
+
+
+def root_positions_to_root_features(
+    root_positions: torch.Tensor,
+    prev_root_pos: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Convert absolute root positions into velocity-form root features.
+
+    The returned layout is `[root_height_y, root_vel_x, root_vel_z]`.
+    The first velocity entry is measured against `prev_root_pos`.
+
+    Supported shapes:
+    - Single frame: `(..., 3)` with `prev_root_pos` shape `(..., 3)`
+    - Sequence: `(..., T, 3)` with `prev_root_pos` shape `(..., 3)`
+    """
+    if root_positions.size(-1) != 3:
+        raise ValueError("root_positions must end with 3 values: [x, y, z]")
+    if prev_root_pos.size(-1) != 3:
+        raise ValueError("prev_root_pos must end with 3 values: [x, y, z]")
+
+    root_height_y = root_positions[..., 1:2]
+
+    if root_positions.ndim == prev_root_pos.ndim:
+        root_vel_x = root_positions[..., 0:1] - prev_root_pos[..., 0:1]
+        root_vel_z = root_positions[..., 2:3] - prev_root_pos[..., 2:3]
+    elif root_positions.ndim == prev_root_pos.ndim + 1:
+        prev_root_pos = prev_root_pos.unsqueeze(-2)
+        root_vel_x = torch.cat(
+            [
+                root_positions[..., :1, 0:1] - prev_root_pos[..., 0:1],
+                root_positions[..., 1:, 0:1] - root_positions[..., :-1, 0:1],
+            ],
+            dim=-2,
+        )
+        root_vel_z = torch.cat(
+            [
+                root_positions[..., :1, 2:3] - prev_root_pos[..., 2:3],
+                root_positions[..., 1:, 2:3] - root_positions[..., :-1, 2:3],
+            ],
+            dim=-2,
+        )
+    else:
+        raise ValueError(
+            "Expected root_positions to be either frame-shaped (..., 3) or sequence-shaped (..., T, 3) "
+            "relative to prev_root_pos (..., 3)"
+        )
+
+    return torch.cat([root_height_y, root_vel_x, root_vel_z], dim=-1)
+
+
 def get_fk_offsets(positions: torch.Tensor) -> torch.Tensor:
     """
     Compute per-bone FK offsets scaled to match average bone lengths in input data.
@@ -671,22 +762,15 @@ def features_to_positions(
     # root_features[..., 0] = root height Y (absolute)
     # root_features[..., 1] = root velocity X
     # root_features[..., 2] = root velocity Z
-    root_height_y = root_features[..., 0:1]  # (..., 1)
-    root_vel_x = root_features[..., 1:2]  # (..., 1)
-    root_vel_z = root_features[..., 2:3]  # (..., 1)
-
-    # Cumulative sum to recover absolute X and Z positions
-    # For input shape (N, 271), we need to sum along dim=0 (time dimension)
-    # Handle both single sequence (N, 271) and batched (B, N, 271) inputs
     if features.ndim == 2:
-        # Single sequence: (N, 271) -> cumsum along dim=0
-        root_pos_x = torch.cumsum(root_vel_x, dim=0)
-        root_pos_z = torch.cumsum(root_vel_z, dim=0)
+        prev_root_pos = torch.zeros(3, device=features.device, dtype=features.dtype)
     else:
-        # Batched: (B, N, 271) -> cumsum along dim=1 (time dimension)
-        root_pos_x = torch.cumsum(root_vel_x, dim=-2)
-        root_pos_z = torch.cumsum(root_vel_z, dim=-2)
-    global_root_pos = torch.cat([root_pos_x, root_height_y, root_pos_z], dim=-1)
+        prev_root_pos = torch.zeros(
+            features.shape[:-2] + (3,),
+            device=features.device,
+            dtype=features.dtype,
+        )
+    global_root_pos = root_features_to_root_positions(root_features, prev_root_pos)
 
     # Direct transform: RIC -> global
     # global = root_pos + rotate_inverse(RIC, root_rot)

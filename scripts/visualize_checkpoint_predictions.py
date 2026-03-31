@@ -24,12 +24,12 @@ from utils.motion_utils import FeatureNormalizer, generated_positions_to_271d
 from utils.visualization import plot_3d_motion
 
 
-CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest2.pt"
+CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest4.pt"
 DATASET_PATH = PROJECT_ROOT / "tests" / "dataset" / "humanml3d-subset-mini"
 OUTPUT_DIR = (
     PROJECT_ROOT / "output" / "checkpoint_visualizations" / CHECKPOINT_PATH.stem
 )
-MASKED_TEACHER_FORCE_PROB = 0.2
+MASKED_TEACHER_FORCE_PROB = 0.4
 
 
 class _LegacyMotionHistoryEncoder(MotionHistoryEncoder):
@@ -556,7 +556,7 @@ def main() -> None:
     batch_size = 1
     horizon = int(config.horizon)
     one_step_steps = max(1, sample_len - 1)
-    predictor_steps = max(1, int(getattr(config, "rollout_integration_steps", 5)))
+    predictor_steps = 50
     inference_steps = max(
         1, int(getattr(config, "num_inference_steps", predictor_steps))
     )
