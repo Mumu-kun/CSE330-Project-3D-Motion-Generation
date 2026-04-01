@@ -91,9 +91,9 @@ class Config:
     # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
     predictor_config: FlowMatchingPredictorConfig = field(
         default_factory=lambda: FlowMatchingPredictorConfig(
-            hidden_size=128,
-            intermediate_size=3 * 128,
-            num_hidden_layers=3,
+            hidden_size=64,
+            intermediate_size=3 * 64,
+            num_hidden_layers=4,
             num_attention_heads=8,
             hidden_act="silu",
             rms_norm_eps=1e-6,
@@ -108,7 +108,7 @@ class Config:
     # Training settings
     batch_size: int = 200
     learning_rate: float = 1e-4
-    num_epochs: int = 400
+    num_epochs: int = 200
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
@@ -119,10 +119,10 @@ class Config:
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 5, "epochs": 50},
-            {"horizon": 10, "epochs": 100},
-            {"horizon": 20, "epochs": 200},
-            {"horizon": 40, "epochs": 400},
+            {"horizon": 5, "epochs": 60},
+            {"horizon": 10, "epochs": 80},
+            {"horizon": 20, "epochs": 120},
+            {"horizon": 40, "epochs": 200},
         ]
     )
 
@@ -132,7 +132,10 @@ class Config:
     use_fk: bool = False  # Whether to compute FK loss during training
     # Rollout scheduling settings
     rollout_prob_start: float = 0.0  # Rollout probability at first epoch
-    rollout_prob_end: float = 0  # Rollout probability at final epoch
+    rollout_prob_end: float = 0.5  # Rollout probability at final epoch
+    rollout_warmup_fraction: float = (
+        0.1  # Fraction of training with rollout disabled before schedule starts
+    )
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )
@@ -168,6 +171,10 @@ class Config:
 
     def __post_init__(self):
         """Create necessary directories."""
+        self.rollout_warmup_fraction = min(
+            max(float(self.rollout_warmup_fraction), 0.0),
+            1.0 - 1e-6,
+        )
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)

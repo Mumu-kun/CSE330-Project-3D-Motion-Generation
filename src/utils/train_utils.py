@@ -409,6 +409,40 @@ class Trainer:
         self.use_amp = False
         self.amp_dtype = torch.float32
 
+    def _compute_rollout_probability(self, epoch: int) -> float:
+        """Compute rollout probability with an epoch-level warmup window."""
+        if self.config.num_epochs <= 1:
+            return float(self.config.rollout_prob_end)
+
+        progress = float(epoch) / float(self.config.num_epochs - 1)
+        progress = max(0.0, min(1.0, progress))
+        warmup_fraction = min(
+            max(float(self.config.rollout_warmup_fraction), 0.0),
+            1.0 - 1e-6,
+        )
+
+        if warmup_fraction <= 0.0:
+            return float(self.config.rollout_prob_start) + (
+                (
+                    float(self.config.rollout_prob_end)
+                    - float(self.config.rollout_prob_start)
+                )
+                * progress
+            )
+
+        if progress <= warmup_fraction:
+            return 0.0
+
+        schedule_progress = (progress - warmup_fraction) / (1.0 - warmup_fraction)
+        schedule_progress = max(0.0, min(1.0, schedule_progress))
+        return float(self.config.rollout_prob_start) + (
+            (
+                float(self.config.rollout_prob_end)
+                - float(self.config.rollout_prob_start)
+            )
+            * schedule_progress
+        )
+
     @classmethod
     def _build_models_from_config(
         cls,
@@ -687,15 +721,7 @@ class Trainer:
         with timer(self.timing_stats, "forward/gru_init"):
             context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
 
-        if self.config.num_epochs <= 1:
-            rollout_prob = self.config.rollout_prob_end
-        else:
-            progress = float(epoch) / float(self.config.num_epochs - 1)
-            progress = max(0.0, min(1.0, progress))
-            rollout_prob = self.config.rollout_prob_start + (
-                (self.config.rollout_prob_end - self.config.rollout_prob_start)
-                * progress
-            )
+        rollout_prob = self._compute_rollout_probability(epoch)
         ode_steps = max(1, int(self.config.rollout_integration_steps))
         dt = 1.0 / float(ode_steps)
         current_positions = hist_joints[:, 0].detach().clone()
