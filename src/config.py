@@ -106,9 +106,9 @@ class Config:
     )
 
     # Training settings
-    batch_size: int = 192
+    batch_size: int = 200
     learning_rate: float = 1e-4
-    num_epochs: int = 200
+    num_epochs: int = 400
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
@@ -121,26 +121,26 @@ class Config:
         default_factory=lambda: [
             {"horizon": 5, "epochs": 50},
             {"horizon": 10, "epochs": 100},
-            {"horizon": 20, "epochs": 150},
-            {"horizon": 40, "epochs": 200},
+            {"horizon": 20, "epochs": 200},
+            {"horizon": 40, "epochs": 400},
         ]
     )
 
     # CFG (Classifier-Free Guidance) settings
-    cfg_dropout: float = 0.1  # Dropout probability for CFG
+    cfg_dropout: float = 0  # Dropout probability for CFG
 
-    use_fk: bool = True  # Whether to compute FK loss during training
+    use_fk: bool = False  # Whether to compute FK loss during training
     # Rollout scheduling settings
     rollout_prob_start: float = 0.0  # Rollout probability at first epoch
-    rollout_prob_end: float = 0.5  # Rollout probability at final epoch
+    rollout_prob_end: float = 0  # Rollout probability at final epoch
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )
     use_consistency_loss: bool = (
-        True  # Enable endpoint consistency loss after no-grad rollout
+        False  # Enable endpoint consistency loss after no-grad rollout
     )
     consistency_loss_weight: float = 1.0  # Weight for consistency loss in total loss
-    use_degenerate_pose_guard: bool = True
+    use_degenerate_pose_guard: bool = False
     degenerate_bone_ratio_threshold: float = 0.05
     degenerate_across_norm_threshold: float = 1e-4
     degenerate_step_multiplier: float = 5.0

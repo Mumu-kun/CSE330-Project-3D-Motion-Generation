@@ -9,7 +9,7 @@ Redesigned training mechanism:
   - Curriculum controls max history length (in frames).
   - Per-batch, sample history length H ∈ [1, curr_horizon].
 - Standard flow matching objective:
-  - Velocity prediction in a reduced 72D feature space.
+  - Velocity prediction in a reduced 68D feature space.
 - Light CFG support:
   - Optional low-probability dropout of text conditioning.
 - EMA for validation and checkpointing.
@@ -17,11 +17,14 @@ Redesigned training mechanism:
 """
 
 import copy
+import csv
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, Union, TypeVar, Generic
 
+import matplotlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -32,20 +35,24 @@ from tqdm import tqdm
 
 from config import Config
 from models import FlowMatchingPredictor, MotionHistoryEncoder
-from utils.dataset import Text2MotionDataset
 from utils.text_encoder import CLIPEncoder
 from utils.wandb_logger import WandbLogger
 from utils.motion_utils import (
     FeatureNormalizer,
-    RootPositionTracker,  # kept in case you use it elsewhere
-    flow_output_to_271d,  # kept in case you use it elsewhere
+    flow_output_to_positions,
     generated_positions_to_271d,
     extract_prev_frame_features,
-    get_dataset_config,
+    subset_271d_to_72d,
 )
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 # Type variable for generic EMA model typing
 T = TypeVar("T", bound=nn.Module)
+
+LOSS_VS_T_NUM_BINS = 100
+LOSS_VS_T_SCATTER_MAX_POINTS = 5000
 
 # =============================================================================
 # EMA Model Wrapper
@@ -85,7 +92,7 @@ class EMAModel(Generic[T]):
             for ema_p, p in zip(self.model.parameters(), model.parameters()):
                 ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
 
-    def to(self, device: str) -> "EMAModel[T]":
+    def to(self, device: Union[str, torch.device]) -> "EMAModel[T]":
         """Move EMA model to device."""
         self.model.to(device)
         return self
@@ -141,6 +148,223 @@ def timer(stats: Optional[TimingStats], key: str):
         stats.record(key, elapsed_ms)
 
 
+def compute_per_sample_flow_loss(
+    pred: torch.Tensor,
+    target_flow: torch.Tensor,
+) -> torch.Tensor:
+    """Compute one mean-MSE flow loss value per flattened training sample."""
+    if pred.shape != target_flow.shape:
+        raise ValueError(
+            "Per-sample flow loss requires matching shapes, got "
+            f"{tuple(pred.shape)} and {tuple(target_flow.shape)}"
+        )
+    if pred.ndim < 2:
+        raise ValueError(
+            "Per-sample flow loss expects at least 2 dimensions, got "
+            f"{tuple(pred.shape)}"
+        )
+    return F.mse_loss(pred, target_flow, reduction="none").mean(dim=-1)
+
+
+def aggregate_loss_vs_t_bins(
+    t_values: torch.Tensor,
+    per_sample_flow_loss: torch.Tensor,
+    num_bins: int = LOSS_VS_T_NUM_BINS,
+) -> Dict[str, torch.Tensor]:
+    """Aggregate per-sample flow loss into fixed bins over t in [0, 1]."""
+    if num_bins <= 0:
+        raise ValueError(f"num_bins must be positive, got {num_bins}")
+    if t_values.ndim != 1 or per_sample_flow_loss.ndim != 1:
+        raise ValueError(
+            "Loss-vs-t aggregation expects 1D tensors, got "
+            f"{tuple(t_values.shape)} and {tuple(per_sample_flow_loss.shape)}"
+        )
+    if t_values.shape != per_sample_flow_loss.shape:
+        raise ValueError(
+            "Loss-vs-t aggregation expects matching tensor lengths, got "
+            f"{tuple(t_values.shape)} and {tuple(per_sample_flow_loss.shape)}"
+        )
+
+    bin_edges = torch.linspace(0.0, 1.0, steps=num_bins + 1, dtype=torch.float64)
+    bin_centers = (bin_edges[:-1] + bin_edges[1:]) * 0.5
+    counts = torch.zeros(num_bins, dtype=torch.long)
+    mean_losses = torch.full((num_bins,), float("nan"), dtype=torch.float64)
+
+    if t_values.numel() == 0:
+        return {
+            "bin_edges": bin_edges,
+            "bin_centers": bin_centers,
+            "counts": counts,
+            "mean_flow_loss": mean_losses,
+        }
+
+    t_cpu = t_values.detach().to(dtype=torch.float64, device="cpu").clamp_(0.0, 1.0)
+    loss_cpu = per_sample_flow_loss.detach().to(dtype=torch.float64, device="cpu")
+    bin_indices = torch.clamp((t_cpu * num_bins).to(torch.long), max=num_bins - 1)
+
+    counts = torch.bincount(bin_indices, minlength=num_bins)
+    sums = torch.bincount(bin_indices, weights=loss_cpu, minlength=num_bins)
+    nonempty = counts > 0
+    mean_losses[nonempty] = sums[nonempty] / counts[nonempty].to(torch.float64)
+
+    return {
+        "bin_edges": bin_edges,
+        "bin_centers": bin_centers,
+        "counts": counts,
+        "mean_flow_loss": mean_losses,
+    }
+
+
+def _append_csv_rows(
+    csv_path: Path,
+    fieldnames: list[str],
+    rows: list[Dict[str, Any]],
+) -> None:
+    """Append rows to a CSV file, creating the header on first write."""
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+    with csv_path.open("a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
+def _plot_loss_vs_t_curve(
+    plot_path: Path,
+    epoch: int,
+    t_values: torch.Tensor,
+    per_sample_flow_loss: torch.Tensor,
+    aggregated: Dict[str, torch.Tensor],
+) -> None:
+    """Render a high-resolution loss-vs-t plot for one epoch."""
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    t_cpu = t_values.detach().to(dtype=torch.float64, device="cpu")
+    loss_cpu = per_sample_flow_loss.detach().to(dtype=torch.float64, device="cpu")
+    centers = aggregated["bin_centers"].cpu().numpy()
+    mean_losses = aggregated["mean_flow_loss"].cpu().numpy()
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if t_cpu.numel() > 0 and t_cpu.numel() <= LOSS_VS_T_SCATTER_MAX_POINTS:
+        ax.scatter(
+            t_cpu.numpy(),
+            loss_cpu.numpy(),
+            s=8,
+            alpha=0.12,
+            color="tab:gray",
+            linewidths=0,
+        )
+    ax.plot(
+        centers,
+        mean_losses,
+        color="tab:blue",
+        linewidth=2,
+        marker="o",
+        markersize=2,
+    )
+    ax.set_title(f"Flow Loss vs Noise Level t (Epoch {epoch})")
+    ax.set_xlabel("Noise level t")
+    ax.set_ylabel("Per-sample flow loss")
+    ax.set_xlim(0.0, 1.0)
+    ax.grid(True, alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(plot_path, dpi=160)
+    plt.close(fig)
+
+
+def write_loss_vs_t_epoch_artifacts(
+    output_dir: Union[str, Path],
+    epoch: int,
+    global_steps: torch.Tensor,
+    t_values: torch.Tensor,
+    per_sample_flow_loss: torch.Tensor,
+    num_bins: int = LOSS_VS_T_NUM_BINS,
+) -> Dict[str, Path]:
+    """Write raw CSV, binned CSV, and PNG diagnostics for one epoch."""
+    if global_steps.ndim != 1 or t_values.ndim != 1 or per_sample_flow_loss.ndim != 1:
+        raise ValueError(
+            "Loss-vs-t artifact writing expects 1D tensors for steps, t, and loss"
+        )
+    if global_steps.shape != t_values.shape or t_values.shape != per_sample_flow_loss.shape:
+        raise ValueError(
+            "Loss-vs-t artifact writing expects matching tensor lengths, got "
+            f"{tuple(global_steps.shape)}, {tuple(t_values.shape)}, "
+            f"and {tuple(per_sample_flow_loss.shape)}"
+        )
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    steps_cpu = global_steps.detach().to(dtype=torch.long, device="cpu")
+    t_cpu = t_values.detach().to(dtype=torch.float64, device="cpu")
+    loss_cpu = per_sample_flow_loss.detach().to(dtype=torch.float64, device="cpu")
+    aggregated = aggregate_loss_vs_t_bins(t_cpu, loss_cpu, num_bins=num_bins)
+
+    raw_csv_path = output_dir / "loss_vs_t_raw.csv"
+    raw_rows = [
+        {
+            "epoch": epoch,
+            "global_step": int(step),
+            "t": float(t_value),
+            "per_sample_flow_loss": float(loss_value),
+        }
+        for step, t_value, loss_value in zip(
+            steps_cpu.tolist(),
+            t_cpu.tolist(),
+            loss_cpu.tolist(),
+        )
+    ]
+    if raw_rows:
+        _append_csv_rows(
+            raw_csv_path,
+            ["epoch", "global_step", "t", "per_sample_flow_loss"],
+            raw_rows,
+        )
+
+    binned_csv_path = output_dir / "loss_vs_t_binned.csv"
+    edges = aggregated["bin_edges"].tolist()
+    centers = aggregated["bin_centers"].tolist()
+    counts = aggregated["counts"].tolist()
+    mean_losses = aggregated["mean_flow_loss"].tolist()
+    binned_rows = [
+        {
+            "epoch": epoch,
+            "bin_idx": bin_idx,
+            "t_left": float(edges[bin_idx]),
+            "t_right": float(edges[bin_idx + 1]),
+            "t_center": float(centers[bin_idx]),
+            "mean_flow_loss": float(mean_losses[bin_idx]),
+            "count": int(counts[bin_idx]),
+        }
+        for bin_idx in range(num_bins)
+    ]
+    _append_csv_rows(
+        binned_csv_path,
+        [
+            "epoch",
+            "bin_idx",
+            "t_left",
+            "t_right",
+            "t_center",
+            "mean_flow_loss",
+            "count",
+        ],
+        binned_rows,
+    )
+
+    epoch_plot_path = output_dir / f"loss_vs_t_epoch_{epoch:03d}.png"
+    latest_plot_path = output_dir / "loss_vs_t_latest.png"
+    _plot_loss_vs_t_curve(epoch_plot_path, epoch, t_cpu, loss_cpu, aggregated)
+    _plot_loss_vs_t_curve(latest_plot_path, epoch, t_cpu, loss_cpu, aggregated)
+
+    return {
+        "raw_csv": raw_csv_path,
+        "binned_csv": binned_csv_path,
+        "epoch_plot": epoch_plot_path,
+        "latest_plot": latest_plot_path,
+    }
+
+
 class Trainer:
     """Class-based trainer that holds global training dependencies and config."""
 
@@ -170,27 +394,20 @@ class Trainer:
         self.timing_stats: Optional[TimingStats] = (
             TimingStats() if config.enable_profiling else None
         )
-        self.consistency_distribution = torch.distributions.Beta(
-            torch.tensor(50.0, device=self.config.device),
-            torch.tensor(5.0, device=self.config.device),
-        )
-        self.last_guard_stats: Dict[str, float] = {
-            "degenerate_rollout_count": 0.0,
-            "degenerate_rollout_ratio": 0.0,
-            "degenerate_consistency_count": 0.0,
-            "degenerate_consistency_ratio": 0.0,
-        }
-
-    @staticmethod
-    def extract_clean_target(frame: torch.Tensor) -> torch.Tensor:
-        """Extract per-joint 3D track targets from a 271D frame."""
-        return frame[..., 3:69].reshape(*frame.shape[:-1], 22, 3)
-
-    @staticmethod
-    def compute_global_relative_shifts(tracks: torch.Tensor) -> torch.Tensor:
-        """Compute root-relative shifts in track space."""
-        root_track = tracks[:, :1, :]
-        return tracks - root_track
+        self.device: Union[str, torch.device] = config.device
+        self.checkpoint_dir = str(config.checkpoint_dir)
+        self.wandb_logger: Optional[WandbLogger] = None
+        self.encoder_ema: Optional[EMAModel[MotionHistoryEncoder]] = None
+        self.predictor_ema: Optional[EMAModel[FlowMatchingPredictor]] = None
+        self.optimizer: Optional[Optimizer] = None
+        self.scaler: Optional[GradScaler] = None
+        self.training_state: Dict[str, Any] = {}
+        self.curriculum_state: Dict[str, Any] = {}
+        self._latest_flow_diagnostics: Optional[Dict[str, torch.Tensor]] = None
+        self.start_epoch = 0
+        self.device_str = str(config.device)
+        self.use_amp = False
+        self.amp_dtype = torch.float32
 
     @classmethod
     def _build_models_from_config(
@@ -214,8 +431,6 @@ class Trainer:
         predictor = FlowMatchingPredictor(
             feature_size=config.get_predictor_feature_size(),
             config=config.predictor_config,
-            out_channels=config.predictor_config.track_dimensionality,
-            use_relative_shift=True,
         )
         return encoder, predictor
 
@@ -255,22 +470,8 @@ class Trainer:
         )
         return trainer._run_training()
 
-    def setup_training_environment(
-        self,
-    ) -> Tuple[
-        Any,
-        Any,
-        Optional[WandbLogger],
-        EMAModel[MotionHistoryEncoder],
-        EMAModel[FlowMatchingPredictor],
-        Optimizer,
-        GradScaler,
-        int,
-        Dict[str, Any],
-        str,
-        bool,
-    ]:
-        device = self.config.device
+    def setup_training_environment(self) -> None:
+        device = self.device
         lr = self.config.learning_rate
         weight_decay = self.config.weight_decay
         ema_decay = self.config.ema_decay
@@ -279,11 +480,11 @@ class Trainer:
         cfg_dropout = self.config.cfg_dropout
         num_epochs = self.config.num_epochs
 
-        os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+        os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.encoder.to(device)
         self.predictor.to(device)
 
-        wandb_logger = None
+        self.wandb_logger = None
         if self.wandb_project:
             wandb_config = {
                 "lr": lr,
@@ -297,29 +498,36 @@ class Trainer:
                 "predictor_params": sum(p.numel() for p in self.predictor.parameters()),
                 "curriculum": curriculum,
             }
-            wandb_logger = WandbLogger(
+            self.wandb_logger = WandbLogger(
                 project=self.wandb_project,
                 name=self.wandb_run_name,
                 config=wandb_config,
             )
 
-        encoder_ema = EMAModel(self.encoder, decay=ema_decay).to(device)
-        predictor_ema = EMAModel(self.predictor, decay=ema_decay).to(device)
+        self.encoder_ema = EMAModel(self.encoder, decay=ema_decay).to(device)
+        self.predictor_ema = EMAModel(self.predictor, decay=ema_decay).to(device)
         params = list(self.encoder.parameters()) + list(self.predictor.parameters())
-        optimizer = torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay)  # type: ignore[arg-type]
+        self.optimizer = torch.optim.AdamW(  # type: ignore[arg-type]
+            params, lr=lr, weight_decay=weight_decay
+        )
 
-        device_str = str(device)
-        use_amp = device_str.startswith("cuda")
-        scaler = GradScaler("cuda", enabled=use_amp)
+        self.device_str = str(device)
+        self.use_amp = self.device_str.startswith("cuda")
+        self.scaler = GradScaler("cuda", enabled=self.use_amp)
+        self.amp_dtype = torch.float32
+        if self.use_amp:
+            self.amp_dtype = (
+                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            )
 
-        training_state: Dict[str, Any] = {
+        self.training_state = {
             "global_step": 0,
             "best_loss": float("inf"),
             "best_epoch": -1,
             "best_val_loss": float("inf"),
             "best_val_epoch": -1,
         }
-        start_epoch = 0
+        self.start_epoch = 0
 
         if self.resume_from is not None and os.path.exists(self.resume_from):
             print(f"Resuming from checkpoint: {self.resume_from}")
@@ -328,23 +536,27 @@ class Trainer:
             )
             self.encoder.load_state_dict(checkpoint["encoder"])
             self.predictor.load_state_dict(checkpoint["predictor"])
-            encoder_ema.model.load_state_dict(checkpoint["encoder_ema"])
-            predictor_ema.model.load_state_dict(checkpoint["predictor_ema"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            scaler.load_state_dict(checkpoint["scaler"])
-            start_epoch = checkpoint.get("epoch", 0) + 1
-            training_state["global_step"] = checkpoint.get("global_step", 0)
-            training_state["best_loss"] = checkpoint.get("best_loss", float("inf"))
-            training_state["best_epoch"] = checkpoint.get("best_epoch", -1)
-            training_state["best_val_loss"] = checkpoint.get(
+            if self.encoder_ema is not None:
+                self.encoder_ema.model.load_state_dict(checkpoint["encoder_ema"])
+            if self.predictor_ema is not None:
+                self.predictor_ema.model.load_state_dict(checkpoint["predictor_ema"])
+            if self.optimizer is not None:
+                self.optimizer.load_state_dict(checkpoint["optimizer"])
+            if self.scaler is not None:
+                self.scaler.load_state_dict(checkpoint["scaler"])
+            self.start_epoch = checkpoint.get("epoch", 0) + 1
+            self.training_state["global_step"] = checkpoint.get("global_step", 0)
+            self.training_state["best_loss"] = checkpoint.get("best_loss", float("inf"))
+            self.training_state["best_epoch"] = checkpoint.get("best_epoch", -1)
+            self.training_state["best_val_loss"] = checkpoint.get(
                 "best_val_loss", float("inf")
             )
-            training_state["best_val_epoch"] = checkpoint.get("best_val_epoch", -1)
+            self.training_state["best_val_epoch"] = checkpoint.get("best_val_epoch", -1)
             if "current_horizon" in checkpoint:
-                training_state["current_horizon"] = checkpoint["current_horizon"]
+                self.training_state["current_horizon"] = checkpoint["current_horizon"]
             print(
-                f"Resumed from epoch {start_epoch}, "
-                f"step {training_state['global_step']}"
+                f"Resumed from epoch {self.start_epoch}, "
+                f"step {self.training_state['global_step']}"
             )
 
         if curriculum is not None and len(curriculum) > 0:
@@ -359,30 +571,13 @@ class Trainer:
         self.encoder.train()
         self.predictor.train()
 
-        return (
-            device,
-            str(self.config.checkpoint_dir),
-            wandb_logger,
-            encoder_ema,
-            predictor_ema,
-            optimizer,
-            scaler,
-            start_epoch,
-            training_state,
-            device_str,
-            use_amp,
-        )
-
-    def setup_curriculum_state(
-        self,
-        checkpoint_state: Optional[dict] = None,
-    ) -> dict:
+    def setup_curriculum_state(self) -> dict:
         curriculum = self.config.curriculum
         use_curriculum = curriculum is not None and len(curriculum) > 0
 
-        if checkpoint_state and "current_horizon" in checkpoint_state:
-            current_horizon = checkpoint_state["current_horizon"]
-            max_horizon = checkpoint_state["max_horizon"]
+        if "current_horizon" in self.training_state:
+            current_horizon = self.training_state["current_horizon"]
+            max_horizon = self.training_state.get("max_horizon", self.config.horizon)
         elif use_curriculum and curriculum:
             current_horizon = curriculum[0]["horizon"]
             max_horizon = curriculum[-1]["horizon"]
@@ -390,27 +585,36 @@ class Trainer:
             current_horizon = self.config.horizon
             max_horizon = self.config.horizon
 
-        return {
+        self.curriculum_state = {
             "use_curriculum": use_curriculum,
             "current_horizon": current_horizon,
             "max_horizon": max_horizon,
         }
+        return self.curriculum_state
+
+    def _loss_vs_t_output_dir(self) -> Path:
+        """Directory for offline loss-vs-t diagnostics artifacts."""
+        return Path(self.config.output_path) / "diagnostics" / "loss_vs_t"
 
     def save_training_checkpoint(
         self,
-        save_dir: str,
         filename: str,
-        encoder_ema: EMAModel[MotionHistoryEncoder],
-        predictor_ema: EMAModel[FlowMatchingPredictor],
-        optimizer: Optimizer,
-        scaler: GradScaler,
         epoch: int,
-        global_step: int,
         loss: float,
-        curriculum_state: dict,
-        training_state: dict,
     ) -> None:
-        path = os.path.join(save_dir, filename)
+        encoder_ema = self.encoder_ema
+        predictor_ema = self.predictor_ema
+        optimizer = self.optimizer
+        scaler = self.scaler
+        if (
+            encoder_ema is None
+            or predictor_ema is None
+            or optimizer is None
+            or scaler is None
+        ):
+            raise RuntimeError("Training state is not initialized.")
+
+        path = os.path.join(self.checkpoint_dir, filename)
         checkpoint = {
             "encoder": self.encoder.state_dict(),
             "predictor": self.predictor.state_dict(),
@@ -419,38 +623,38 @@ class Trainer:
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "epoch": epoch,
-            "global_step": global_step,
+            "global_step": self.training_state["global_step"],
             "loss": loss,
-            "horizon": curriculum_state["max_horizon"],
-            "current_horizon": curriculum_state["current_horizon"],
-            "use_curriculum": curriculum_state["use_curriculum"],
-            "best_loss": training_state["best_loss"],
-            "best_epoch": training_state["best_epoch"],
-            "best_val_loss": training_state["best_val_loss"],
-            "best_val_epoch": training_state["best_val_epoch"],
+            "horizon": self.curriculum_state["max_horizon"],
+            "current_horizon": self.curriculum_state["current_horizon"],
+            "use_curriculum": self.curriculum_state["use_curriculum"],
+            "best_loss": self.training_state["best_loss"],
+            "best_epoch": self.training_state["best_epoch"],
+            "best_val_loss": self.training_state["best_val_loss"],
+            "best_val_epoch": self.training_state["best_val_epoch"],
         }
         checkpoint["config"] = self.config
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
 
-    def unpack_batch(
+    def incremental_flow_loss(
         self,
-        batch: dict,
-        device: Union[str, torch.device],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+        batch: Dict[str, Any],
+        epoch: int,
+        stochastic_rollout: bool = True,
+        use_cfg_dropout: bool = False,
+        encoder: Optional[MotionHistoryEncoder] = None,
+        predictor: Optional[FlowMatchingPredictor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float]:
+        enc = encoder if encoder is not None else self.encoder
+        pred_model = predictor if predictor is not None else self.predictor
+        device = self.device
+        self._latest_flow_diagnostics = None
+
         motion_raw = batch["motion"].to(device)
         joints = batch["joints"].to(device)
-        B, T, _ = motion_raw.shape
-        raw_lengths = batch.get("lengths")
-        if raw_lengths is None:
-            lengths = torch.full((B,), T, device=device, dtype=torch.long)
-        else:
-            lengths = raw_lengths.to(device=device, dtype=torch.long)
-            if lengths.numel() != B:
-                raise ValueError(
-                    f"Invalid lengths shape {tuple(lengths.shape)}. Expected {B} elements."
-                )
-            lengths = lengths.reshape(B).clamp(min=0, max=T)
+        text = batch["text_clip"].to(device)
+        B = motion_raw.shape[0]
 
         motion = (
             self.normalizer.normalize(motion_raw)
@@ -458,243 +662,81 @@ class Trainer:
             else motion_raw
         )
 
-        if joints.shape[0] != B or joints.shape[1] != T:
-            raise ValueError(
-                f"Batch shape mismatch between motion {motion.shape} and joints {joints.shape}."
-            )
-
-        if "text_clip" in batch:
-            text = batch["text_clip"].to(device)
-        elif "captions" in batch and self.clip_encoder is not None:
-            captions = batch["captions"]
-            with torch.no_grad():
-                text = self.clip_encoder(captions)
-        elif "captions" in batch:
-            raise ValueError(
-                "Raw captions provided but no clip_encoder. "
-                "Pass clip_encoder to Trainer() or provide pre-encoded 'text_clip'."
-            )
-        else:
-            raise ValueError(
-                "No text input found. Batch must contain 'text_clip' or 'captions'."
-            )
-
-        if text.ndim != 3 or text.shape[0] != B or text.shape[1] != 1:
-            raise ValueError(
-                f"Invalid text embedding shape {tuple(text.shape)}. Expected (B, 1, D) with B={B}."
-            )
-
-        return motion, joints, text, lengths, B, T
-
-    def sample_next_frame_window(
-        self,
-        motion: torch.Tensor,
-        joints: torch.Tensor,
-        curr_horizon: int,
-    ):
-        _, T, _ = motion.shape
-        assert curr_horizon <= T - 1, f"curr_horizon {curr_horizon} > T-1 {T-1}"
-        if joints.shape[:2] != motion.shape[:2]:
-            raise ValueError(
-                f"sample_next_frame_window got motion shape {motion.shape} and joints shape {joints.shape}."
-            )
-        relative_shifts = joints[:, 1:] - joints[:, :-1]
-        return motion[:, 1:], joints[:, 1:], relative_shifts, curr_horizon
-
-    def get_rollout_probability(self, epoch: int, total_epochs: int) -> float:
-        if total_epochs <= 1:
-            return self.config.rollout_prob_end
-        progress = float(epoch) / float(total_epochs - 1)
-        progress = max(0.0, min(1.0, progress))
-        return self.config.rollout_prob_start + (
-            (self.config.rollout_prob_end - self.config.rollout_prob_start) * progress
-        )
-
-    def get_rollout_mask(
-        self,
-        batch_size: int,
-        rollout_prob: float,
-        device: Union[str, torch.device],
-        stochastic: bool,
-    ) -> torch.Tensor:
-        p = float(max(0.0, min(1.0, rollout_prob)))
-        if p == 0.0:
-            return torch.zeros(batch_size, dtype=torch.bool, device=device)
-        if p == 1.0:
-            return torch.ones(batch_size, dtype=torch.bool, device=device)
-        if stochastic:
-            return torch.rand(batch_size, device=device) < p
-        threshold = max(1, int(round(p * batch_size)))
-        return torch.arange(batch_size, device=device) < threshold
-
-    @staticmethod
-    def ensure_finite_tensor(
-        tensor: Optional[torch.Tensor], name: str, context: str
-    ) -> None:
-        """Raise a focused error when a training tensor contains NaN/Inf values."""
-        if tensor is None or torch.isfinite(tensor).all():
-            return
-        raise RuntimeError(
-            f"Non-finite tensor detected for {name} during {context}; "
-            f"tensor shape was {tuple(tensor.shape)}"
-        )
-
-    @staticmethod
-    def get_nonfinite_loss_names(loss_terms: Dict[str, torch.Tensor]) -> list[str]:
-        """Return the names of any scalar loss terms that are NaN/Inf."""
-        return [
-            name
-            for name, value in loss_terms.items()
-            if not torch.isfinite(value).all()
-        ]
-
-    def detect_degenerate_pose_mask(
-        self,
-        new_positions: torch.Tensor,
-        prev_positions: torch.Tensor,
-        fk_offsets: Optional[torch.Tensor] = None,
-        reference_shifts: Optional[torch.Tensor] = None,
-        dataset_type: str = "t2m",
-    ) -> torch.Tensor:
-        """Flag poses that are too degenerate to safely send through IK/FK."""
-        batch_size = new_positions.shape[0]
-        device = new_positions.device
         if (
-            not self.config.use_degenerate_pose_guard
-            or batch_size == 0
-            or new_positions.shape != prev_positions.shape
+            use_cfg_dropout
+            and self.config.cfg_dropout > 0.0
+            and torch.rand(1, device=device).item() <= self.config.cfg_dropout
         ):
-            return torch.zeros(batch_size, dtype=torch.bool, device=device)
-
-        cfg = get_dataset_config(dataset_type)
-        parent_indices = []
-        child_indices = []
-        for chain in cfg["kinematic_chain"]:
-            for parent_idx, child_idx in zip(chain[:-1], chain[1:]):
-                parent_indices.append(parent_idx)
-                child_indices.append(child_idx)
-
-        parent_idx_t = torch.tensor(parent_indices, device=device, dtype=torch.long)
-        child_idx_t = torch.tensor(child_indices, device=device, dtype=torch.long)
-
-        bad_mask = ~torch.isfinite(new_positions).reshape(batch_size, -1).all(dim=-1)
-
-        actual_bone_lengths = torch.norm(
-            new_positions[:, child_idx_t] - new_positions[:, parent_idx_t],
-            dim=-1,
-        )
-        if fk_offsets is not None:
-            expected_bone_lengths = torch.norm(fk_offsets[:, child_idx_t], dim=-1)
+            text_for_encoder = torch.zeros(
+                B, self.config.encoder_text_dim, device=device, dtype=text.dtype
+            )
         else:
-            expected_bone_lengths = torch.norm(
-                prev_positions[:, child_idx_t] - prev_positions[:, parent_idx_t],
-                dim=-1,
-            )
-        expected_bone_lengths = expected_bone_lengths.clamp(min=1e-6)
-        bone_ratio_threshold = (
-            self.config.degenerate_bone_ratio_threshold * expected_bone_lengths
-        )
-        bad_mask |= (actual_bone_lengths < bone_ratio_threshold).any(dim=-1)
+            text_for_encoder = text[:, 0, :]
 
-        l_hip, r_hip, sdr_r, sdr_l = cfg["face_joint_indx"]
-        across = (new_positions[:, r_hip] - new_positions[:, l_hip]) + (
-            new_positions[:, sdr_r] - new_positions[:, sdr_l]
-        )
-        across_norm = torch.norm(across, dim=-1)
-        bad_mask |= across_norm < self.config.degenerate_across_norm_threshold
-
-        predicted_step = torch.norm(new_positions - prev_positions, dim=-1).amax(dim=-1)
-        if reference_shifts is not None:
-            reference_step = torch.norm(reference_shifts, dim=-1).amax(dim=-1)
-        else:
-            reference_step = predicted_step.new_zeros(predicted_step.shape)
-        reference_step = reference_step.clamp(min=1e-6)
-        bad_mask |= predicted_step > (
-            self.config.degenerate_step_multiplier * reference_step
-        )
-
-        return bad_mask
-
-    def incremental_flow_loss(
-        self,
-        motion: torch.Tensor,
-        joints: torch.Tensor,
-        relative_shifts: torch.Tensor,
-        text_for_encoder: torch.Tensor,
-        epoch: int,
-        total_epochs: int,
-        device: Union[str, torch.device],
-        stochastic_rollout: bool,
-        encoder: Optional[MotionHistoryEncoder] = None,
-        predictor: Optional[FlowMatchingPredictor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float]:
-        enc = encoder if encoder is not None else self.encoder
-        pred_model = predictor if predictor is not None else self.predictor
-
-        if not hasattr(enc, "gru_step"):
-            raise AttributeError(
-                "Encoder must expose a gru_step(x_t, text_emb, h) method."
-            )
-
-        B, _, _ = motion.shape
-        _, j_len, _, _ = joints.shape
-        if j_len <= 1:
-            raise ValueError("No prediction steps found in target window.")
-        if motion.shape[1] != j_len:
-            raise ValueError(
-                f"motion length {motion.shape[1]} != joints length {j_len}."
-            )
+        motion = motion[:, 1:]
+        joints = joints[:, 1:]
+        j_len = joints.shape[1]
 
         pred_steps = j_len - 1
         hist = motion[:, :-1]
         hist_joints = joints[:, :-1]
-        prev_relative_shifts = relative_shifts[:, :-1]
         target_motion = motion[:, 1:]
         target_joints = joints[:, 1:]
+        current_frame = hist[:, 0].detach().clone()
 
         with timer(self.timing_stats, "forward/gru_init"):
             context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
-        if context is None:
-            raise RuntimeError("Encoder context was not initialized from history.")
 
-        rollout_prob = self.get_rollout_probability(
-            epoch=epoch, total_epochs=total_epochs
-        )
+        if self.config.num_epochs <= 1:
+            rollout_prob = self.config.rollout_prob_end
+        else:
+            progress = float(epoch) / float(self.config.num_epochs - 1)
+            progress = max(0.0, min(1.0, progress))
+            rollout_prob = self.config.rollout_prob_start + (
+                (self.config.rollout_prob_end - self.config.rollout_prob_start)
+                * progress
+            )
         ode_steps = max(1, int(self.config.rollout_integration_steps))
         dt = 1.0 / float(ode_steps)
         current_positions = hist_joints[:, 0].detach().clone()
-        effective_prev_shift = prev_relative_shifts[:, 0].detach().clone()
         flow_contexts: list[torch.Tensor] = []
-        flow_prev_relative_shifts: list[torch.Tensor] = []
+        flow_current_frame_features: list[torch.Tensor] = []
         flow_x0: list[torch.Tensor] = []
         flow_x1: list[torch.Tensor] = []
         flow_xt: list[torch.Tensor] = []
         flow_t: list[torch.Tensor] = []
-        self.last_guard_stats = {
-            "degenerate_rollout_count": 0.0,
-            "degenerate_rollout_ratio": 0.0,
-            "degenerate_consistency_count": 0.0,
-            "degenerate_consistency_ratio": 0.0,
-        }
 
         for step_idx in range(pred_steps):
-            current_positions_before_step = current_positions
-            x1 = target_joints[:, step_idx] - current_positions
+            current_frame_features = extract_prev_frame_features(
+                current_frame,
+                normalizer=self.normalizer,
+            )
+            x1 = subset_271d_to_72d(
+                target_motion[:, step_idx],
+                prev_frame=current_frame,
+                normalizer=self.normalizer,
+            )
             x0 = torch.randn_like(x1)
-            t = torch.rand(B, device=device)
-            t_ = t.view(B, 1, 1)
+            t = torch.rand(B, device=device, dtype=x1.dtype)
+            t_ = t.view(B, 1)
             xt = t_ * x1 + (1 - t_) * x0
-            relative_shifts_step = effective_prev_shift
             flow_contexts.append(context)
-            flow_prev_relative_shifts.append(relative_shifts_step)
+            flow_current_frame_features.append(current_frame_features)
             flow_x0.append(x0)
             flow_x1.append(x1)
             flow_xt.append(xt)
             flow_t.append(t)
 
-            rollout_mask = self.get_rollout_mask(
-                B, rollout_prob, device, stochastic_rollout
-            )
+            p = float(max(0.0, min(1.0, rollout_prob)))
+            if p == 0.0:
+                rollout_mask = torch.zeros(B, dtype=torch.bool, device=device)
+            elif p == 1.0:
+                rollout_mask = torch.ones(B, dtype=torch.bool, device=device)
+            elif stochastic_rollout:
+                rollout_mask = torch.rand(B, device=device) < p
+            else:
+                threshold = max(1, int(round(p * B)))
+                rollout_mask = torch.arange(B, device=device) < threshold
             next_input = target_motion[:, step_idx].clone()
             if rollout_mask.any():
                 predictor_was_training = pred_model.training
@@ -714,9 +756,9 @@ class Trainer:
                                     )
                                     pred_roll = pred_model.forward(
                                         track_features=context,
-                                        noised_tracks=x_t_roll,
+                                        noisy_features=x_t_roll,
                                         timesteps=tau,
-                                        prev_relative_shifts=relative_shifts_step,
+                                        current_frame_features=current_frame_features,
                                         text_embedding=text_for_encoder,
                                         output_attentions=False,
                                         output_hidden_states=False,
@@ -727,7 +769,21 @@ class Trainer:
                         pred_model.train()
 
                 with timer(self.timing_stats, "forward/pos_transform"):
-                    pred_positions_roll = current_positions + x_t_roll
+                    x_t_roll_raw = (
+                        self.normalizer.denormalize_flow_output(x_t_roll)
+                        if self.normalizer is not None
+                        else x_t_roll
+                    )
+                    current_frame_raw = (
+                        self.normalizer.denormalize(current_frame)
+                        if self.normalizer is not None
+                        else current_frame
+                    )
+                    pred_positions_roll = flow_output_to_positions(
+                        x_t_roll_raw,
+                        prev_root_pos=current_positions[:, 0],
+                        prev_root_rot_6d=current_frame_raw[:, 69:75],
+                    )
                     rollout_frame, _, _ = generated_positions_to_271d(
                         new_positions=pred_positions_roll,
                         prev_positions=current_positions,
@@ -743,10 +799,7 @@ class Trainer:
             else:
                 current_positions = target_joints[:, step_idx].detach()
 
-            if step_idx + 1 < pred_steps:
-                effective_prev_shift = (
-                    current_positions - current_positions_before_step
-                ).detach()
+            current_frame = next_input.detach()
 
             with timer(self.timing_stats, "forward/gru_step"):
                 context, h_state = enc.gru_step(
@@ -754,13 +807,13 @@ class Trainer:
                 )
 
         contexts_stacked = torch.stack(flow_contexts, dim=1)
-        prev_relative_shifts_stacked = torch.stack(flow_prev_relative_shifts, dim=1)
+        current_frame_features_stacked = torch.stack(flow_current_frame_features, dim=1)
         x0_stacked = torch.stack(flow_x0, dim=1)
         x1_stacked = torch.stack(flow_x1, dim=1)
         xt_stacked = torch.stack(flow_xt, dim=1)
         t_stacked = torch.stack(flow_t, dim=1)
         contexts_reshaped = contexts_stacked.flatten(0, 1)
-        prev_relative_shifts_reshaped = prev_relative_shifts_stacked.flatten(0, 1)
+        current_frame_features_reshaped = current_frame_features_stacked.flatten(0, 1)
         text_batched = (
             text_for_encoder.unsqueeze(1)
             .expand(-1, pred_steps, -1)
@@ -773,211 +826,41 @@ class Trainer:
         with timer(self.timing_stats, "forward/predictor"):
             pred, _, _ = pred_model.forward(
                 track_features=contexts_reshaped,
-                noised_tracks=xt,
+                noisy_features=xt,
                 timesteps=t,
-                prev_relative_shifts=prev_relative_shifts_reshaped,
+                current_frame_features=current_frame_features_reshaped,
                 text_embedding=text_batched,
                 output_attentions=False,
                 output_hidden_states=False,
             )
+            per_sample_flow_loss = compute_per_sample_flow_loss(pred, target_flow)
             flow_loss = F.mse_loss(pred, target_flow)
+
+        self._latest_flow_diagnostics = {
+            "t": t.detach().cpu(),
+            "per_sample_flow_loss": per_sample_flow_loss.detach().cpu(),
+        }
 
         consistency_loss = flow_loss.new_zeros(())
 
         total_loss = flow_loss
         return total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob
 
-    def apply_cfg_dropout(
-        self,
-        text: torch.Tensor,
-        device: Union[str, torch.device],
-        batch_size: int,
-    ) -> Optional[torch.Tensor]:
-        if self.config.cfg_dropout <= 0.0:
-            return text
-        if torch.rand(1).item() > self.config.cfg_dropout:
-            return text
-        return None
-
-    def prepare_text_for_encoder(
-        self,
-        text_input: Optional[torch.Tensor],
-        device: Union[str, torch.device],
-        batch_size: int,
-    ) -> torch.Tensor:
-        if text_input is None:
-            return torch.zeros(batch_size, self.config.encoder_text_dim, device=device)
-        if text_input.ndim != 3:
-            raise ValueError(
-                f"Invalid text input rank {text_input.ndim}. Expected rank 3 with shape (B, 1, {self.config.encoder_text_dim})."
-            )
-        if text_input.shape[0] != batch_size:
-            raise ValueError(
-                f"Invalid text batch size {text_input.shape[0]}. Expected {batch_size}."
-            )
-        if (
-            text_input.shape[1] != 1
-            or text_input.shape[2] != self.config.encoder_text_dim
-        ):
-            raise ValueError(
-                f"Invalid text input shape {tuple(text_input.shape)}. Expected (B, 1, {self.config.encoder_text_dim})."
-            )
-        return text_input[:, 0, :]
-
-    def log_batch_metrics(
-        self,
-        wandb_logger: Optional[WandbLogger],
-        loss: torch.Tensor,
-        lr: float,
-        epoch: int,
-        grad_norm: torch.Tensor,
-        batch_time: float,
-        B: int,
-        current_horizon: int,
-        effective_horizon: int,
-        num_pred_frames: int,
-        loss_components: dict,
-        global_step: int,
-    ) -> None:
-        if wandb_logger is None:
-            return
-        log_dict = {}
-        for key, value in loss_components.items():
-            log_dict[f"train/loss_{key}"] = (
-                value.item() if hasattr(value, "item") else value
-            )
-        log_dict.update(
-            {
-                "train/loss": loss.item(),
-                "train/lr": lr,
-                "train/epoch": epoch,
-                "train/grad_norm": (
-                    grad_norm.item() if hasattr(grad_norm, "item") else grad_norm
-                ),
-                "train/batch_time": batch_time,
-                "train/samples_per_sec": (B / batch_time if batch_time > 0 else 0),
-                "train/current_horizon": current_horizon,
-                "train/effective_horizon": effective_horizon,
-                "train/num_pred_frames": num_pred_frames,
-            }
-        )
-        wandb_logger.log(log_dict, step=global_step)
-
-    def log_epoch_metrics(
-        self,
-        wandb_logger: Optional[WandbLogger],
-        avg_epoch_loss: float,
-        epoch: int,
-        current_horizon: int,
-        val_metrics: dict,
-        global_step: int,
-    ) -> None:
-        if wandb_logger is None:
-            return
-        log_dict = {
-            "epoch/avg_loss": avg_epoch_loss,
-            "epoch/num": epoch,
-            "epoch/current_horizon": current_horizon,
-        }
-        if val_metrics and "val_loss" in val_metrics:
-            log_dict["epoch/val_loss"] = val_metrics["val_loss"]
-        wandb_logger.log(log_dict, step=global_step)
-
-    def handle_checkpointing(
-        self,
-        save_dir: str,
-        encoder_ema: EMAModel[MotionHistoryEncoder],
-        predictor_ema: EMAModel[FlowMatchingPredictor],
-        optimizer: Optimizer,
-        scaler: GradScaler,
-        epoch: int,
-        global_step: int,
-        avg_epoch_loss: float,
-        curriculum_state: dict,
-        training_state: dict,
-        val_metrics: dict,
-    ) -> dict:
-        self.save_training_checkpoint(
-            save_dir=save_dir,
-            filename="latest.pt",
-            encoder_ema=encoder_ema,
-            predictor_ema=predictor_ema,
-            optimizer=optimizer,
-            scaler=scaler,
-            epoch=epoch,
-            global_step=global_step,
-            loss=avg_epoch_loss,
-            curriculum_state=curriculum_state,
-            training_state=training_state,
-        )
-
-        if avg_epoch_loss < training_state["best_loss"]:
-            tqdm.write(
-                f"New best model! (Loss: {training_state['best_loss']:.6f} -> {avg_epoch_loss:.6f})"
-            )
-            training_state["best_loss"] = avg_epoch_loss
-            training_state["best_epoch"] = epoch
-            self.save_training_checkpoint(
-                save_dir=save_dir,
-                filename="best.pt",
-                encoder_ema=encoder_ema,
-                predictor_ema=predictor_ema,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                global_step=global_step,
-                loss=avg_epoch_loss,
-                curriculum_state=curriculum_state,
-                training_state=training_state,
-            )
-
-        if self.config.save_best_val and val_metrics and "val_loss" in val_metrics:
-            val_loss = val_metrics["val_loss"]
-            if val_loss < training_state["best_val_loss"]:
-                tqdm.write(
-                    "New best validation model! "
-                    f"(Val Loss: {training_state['best_val_loss']:.6f} -> {val_loss:.6f})"
-                )
-                training_state["best_val_loss"] = val_loss
-                training_state["best_val_epoch"] = epoch
-                self.save_training_checkpoint(
-                    save_dir=save_dir,
-                    filename="best_val.pt",
-                    encoder_ema=encoder_ema,
-                    predictor_ema=predictor_ema,
-                    optimizer=optimizer,
-                    scaler=scaler,
-                    epoch=epoch,
-                    global_step=global_step,
-                    loss=avg_epoch_loss,
-                    curriculum_state=curriculum_state,
-                    training_state=training_state,
-                )
-
-        return training_state
-
     def validate(
         self,
         encoder: Optional[MotionHistoryEncoder] = None,
         predictor: Optional[FlowMatchingPredictor] = None,
         epoch: int = 0,
-        total_epochs: Optional[int] = None,
         horizon: Optional[int] = None,
         num_batches: Optional[int] = None,
-        device: Optional[Union[str, torch.device]] = None,
     ) -> dict:
         if self.val_dataloader is None:
             return {}
 
-        if total_epochs is None:
-            total_epochs = self.config.num_epochs
         if horizon is None:
             horizon = self.config.horizon
         if num_batches is None:
             num_batches = self.config.val_batches
-        device_value: Union[str, torch.device] = (
-            self.config.device if device is None else device
-        )
         enc = encoder if encoder is not None else self.encoder
         pred = predictor if predictor is not None else self.predictor
         enc.eval()
@@ -997,35 +880,23 @@ class Trainer:
                 if num_batches > 0 and i >= num_batches:
                     break
 
-                motion, joints, text, _lengths, B, _T = self.unpack_batch(
-                    batch=batch, device=device_value
-                )
-                motion, joints, relative_shifts, _ = self.sample_next_frame_window(
-                    motion=motion,
-                    joints=joints,
-                    curr_horizon=horizon,
-                )
-                text_for_encoder = self.prepare_text_for_encoder(text, device_value, B)
+                batch_size = batch["motion"].shape[0]
 
                 total_loss, flow_loss, consistency_loss, _, _ = (
                     self.incremental_flow_loss(
-                        motion=motion,
-                        joints=joints,
-                        relative_shifts=relative_shifts,
-                        text_for_encoder=text_for_encoder,
+                        batch=batch,
                         epoch=epoch,
-                        total_epochs=total_epochs,
-                        device=device_value,
                         stochastic_rollout=True,
+                        use_cfg_dropout=False,
                         encoder=enc,
                         predictor=pred,
                     )
                 )
 
-                total_total_loss += total_loss.item() * B
-                total_flow_loss += flow_loss.item() * B
-                total_consistency_loss += consistency_loss.item() * B
-                total_samples += B
+                total_total_loss += total_loss.item() * batch_size
+                total_flow_loss += flow_loss.item() * batch_size
+                total_consistency_loss += consistency_loss.item() * batch_size
+                total_samples += batch_size
 
         enc.train()
         pred.train()
@@ -1039,25 +910,19 @@ class Trainer:
         self,
     ) -> Tuple[EMAModel[MotionHistoryEncoder], EMAModel[FlowMatchingPredictor]]:
         """Run training with class-owned config/state and helper methods."""
-        (
-            device,
-            checkpoint_dir,
-            wandb_logger,
-            encoder_ema,
-            predictor_ema,
-            optimizer,
-            scaler,
-            start_epoch,
-            training_state,
-            device_str,
-            use_amp,
-        ) = self.setup_training_environment()
-
-        curriculum_state = self.setup_curriculum_state(
-            checkpoint_state=(
-                training_state if "current_horizon" in training_state else None
-            ),
-        )
+        self.setup_training_environment()
+        self.setup_curriculum_state()
+        optimizer = self.optimizer
+        scaler = self.scaler
+        encoder_ema = self.encoder_ema
+        predictor_ema = self.predictor_ema
+        if (
+            optimizer is None
+            or scaler is None
+            or encoder_ema is None
+            or predictor_ema is None
+        ):
+            raise RuntimeError("Training environment is not initialized.")
 
         num_epochs = self.config.num_epochs
         lr = self.config.learning_rate
@@ -1065,37 +930,36 @@ class Trainer:
         val_interval = self.config.val_interval
         val_batches = self.config.val_batches
         val_use_ema = self.config.val_use_ema
+        wandb_logger = self.wandb_logger
 
-        amp_dtype = torch.float32
-        if use_amp:
-            amp_dtype = (
-                torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            )
-
-        epoch = start_epoch - 1
+        epoch = self.start_epoch - 1
         try:
-            training_state = training_state
             for epoch in tqdm(
-                range(start_epoch, num_epochs), desc="Training", unit="epoch"
+                range(self.start_epoch, num_epochs), desc="Training", unit="epoch"
             ):
-                prev_horizon = curriculum_state["current_horizon"]
-                if curriculum_state["use_curriculum"] and self.config.curriculum:
+                prev_horizon = self.curriculum_state["current_horizon"]
+                if self.curriculum_state["use_curriculum"] and self.config.curriculum:
                     for level in reversed(self.config.curriculum):
                         if epoch <= level["epochs"]:
-                            curriculum_state["current_horizon"] = level["horizon"]
+                            self.curriculum_state["current_horizon"] = level["horizon"]
                         else:
                             break
-                    if curriculum_state["current_horizon"] != prev_horizon:
+                    if self.curriculum_state["current_horizon"] != prev_horizon:
                         tqdm.write(
                             "Curriculum update: "
-                            f"horizon {prev_horizon} -> {curriculum_state['current_horizon']}"
+                            f"horizon {prev_horizon} -> {self.curriculum_state['current_horizon']}"
                         )
 
                 epoch_loss = 0.0
                 num_batches = 0
                 pred_horizon = 1
+                epoch_diag_steps: list[torch.Tensor] = []
+                epoch_diag_t: list[torch.Tensor] = []
+                epoch_diag_loss: list[torch.Tensor] = []
 
-                self.dataloader.dataset.set_horizon(1 + curriculum_state["current_horizon"] + pred_horizon)  # type: ignore
+                self.dataloader.dataset.set_horizon(  # type: ignore
+                    1 + self.curriculum_state["current_horizon"] + pred_horizon
+                )
 
                 pbar = tqdm(
                     self.dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch"
@@ -1104,30 +968,18 @@ class Trainer:
                 timing_log_interval = max(1, int(self.config.timing_log_interval))
 
                 for batch in pbar:
-                    with timer(self.timing_stats, "data_load"):
-                        motion, joints, text, lengths, B, T = self.unpack_batch(
-                            batch=batch,
-                            device=device,
-                        )
-
-                        motion, joints, relative_shifts, effective_horizon = (
-                            self.sample_next_frame_window(
-                                motion=motion,
-                                joints=joints,
-                                curr_horizon=curriculum_state["current_horizon"],
-                            )
-                        )
-
-                    text_input = self.apply_cfg_dropout(text, device, B)
-                    with timer(self.timing_stats, "text_prep"):
-                        text_for_encoder = self.prepare_text_for_encoder(
-                            text_input, device, B
-                        )
+                    batch_size = batch["motion"].shape[0]
+                    effective_horizon = self.curriculum_state["current_horizon"]
+                    step_before_update = self.training_state["global_step"]
 
                     optimizer.zero_grad(set_to_none=True)
 
                     with timer(self.timing_stats, "forward"):
-                        with torch.amp.autocast(device_str, dtype=amp_dtype, enabled=use_amp):  # type: ignore
+                        with torch.amp.autocast(
+                            self.device_str,
+                            dtype=self.amp_dtype,
+                            enabled=self.use_amp,
+                        ):  # type: ignore
                             (
                                 loss,
                                 flow_loss,
@@ -1135,38 +987,55 @@ class Trainer:
                                 pred_horizon,
                                 rollout_prob,
                             ) = self.incremental_flow_loss(
-                                motion=motion,
-                                joints=joints,
-                                relative_shifts=relative_shifts,
-                                text_for_encoder=text_for_encoder,
+                                batch=batch,
                                 epoch=epoch,
-                                total_epochs=num_epochs,
-                                device=device,
                                 stochastic_rollout=True,
+                                use_cfg_dropout=True,
                             )
 
-                    nonfinite_losses = self.get_nonfinite_loss_names(
-                        {
+                    nonfinite_losses = [
+                        name
+                        for name, value in {
                             "loss": loss,
                             "flow_loss": flow_loss,
                             "consistency_loss": consistency_loss,
-                        }
-                    )
+                        }.items()
+                        if not torch.isfinite(value).all()
+                    ]
                     if nonfinite_losses:
                         tqdm.write(
-                            f"[Epoch {epoch}] [Step {training_state['global_step']}] "
+                            f"[Epoch {epoch}] [Step {self.training_state['global_step']}] "
                             "Skipping batch with non-finite losses: "
                             + ", ".join(nonfinite_losses)
                         )
                         if wandb_logger is not None:
                             wandb_logger.log(
                                 {"train/skipped_nonfinite_batch": 1},
-                                step=training_state["global_step"],
+                                step=self.training_state["global_step"],
                             )
                         pbar.set_postfix({"skip": ",".join(nonfinite_losses)})
                         optimizer.zero_grad(set_to_none=True)
-                        training_state["global_step"] += 1
+                        self.training_state["global_step"] += 1
                         continue
+
+                    diagnostics = self._latest_flow_diagnostics
+                    if diagnostics is not None:
+                        t_diag = diagnostics["t"]
+                        loss_diag = diagnostics["per_sample_flow_loss"]
+                        if t_diag.shape != loss_diag.shape:
+                            raise RuntimeError(
+                                "Flow diagnostics shape mismatch: "
+                                f"{tuple(t_diag.shape)} vs {tuple(loss_diag.shape)}"
+                            )
+                        epoch_diag_t.append(t_diag)
+                        epoch_diag_loss.append(loss_diag)
+                        epoch_diag_steps.append(
+                            torch.full(
+                                t_diag.shape,
+                                step_before_update,
+                                dtype=torch.long,
+                            )
+                        )
 
                     with timer(self.timing_stats, "backward"):
                         scaler.scale(loss).backward()
@@ -1194,36 +1063,42 @@ class Trainer:
                             "L_flow": f"{flow_loss.item():.4f}",
                             "L_cons": f"{consistency_loss.item():.4f}",
                             "p_roll": f"{rollout_prob:.2f}",
-                            "deg_roll": f"{self.last_guard_stats['degenerate_rollout_ratio']:.2f}",
-                            "deg_cons": f"{self.last_guard_stats['degenerate_consistency_ratio']:.2f}",
                             "lr": f"{lr:.2e}",
                         }
                     )
 
-                    self.log_batch_metrics(
-                        wandb_logger=wandb_logger,
-                        loss=loss,
-                        lr=lr,
-                        epoch=epoch,
-                        grad_norm=grad_norm,
-                        batch_time=batch_time,
-                        B=B,
-                        current_horizon=curriculum_state["current_horizon"],
-                        effective_horizon=effective_horizon,
-                        num_pred_frames=pred_horizon,
-                        loss_components={
-                            "L_total": loss.item(),
-                            "L_flow": flow_loss.item(),
-                            "L_consistency": consistency_loss.item(),
-                            "rollout_prob": rollout_prob,
-                            **self.last_guard_stats,
-                        },
-                        global_step=training_state["global_step"],
-                    )
+                    if wandb_logger is not None:
+                        log_dict = {
+                            "train/loss": loss.item(),
+                            "train/lr": lr,
+                            "train/epoch": epoch,
+                            "train/grad_norm": (
+                                grad_norm.item()
+                                if hasattr(grad_norm, "item")
+                                else grad_norm
+                            ),
+                            "train/batch_time": batch_time,
+                            "train/samples_per_sec": (
+                                batch_size / batch_time if batch_time > 0 else 0
+                            ),
+                            "train/current_horizon": self.curriculum_state[
+                                "current_horizon"
+                            ],
+                            "train/effective_horizon": effective_horizon,
+                            "train/num_pred_frames": pred_horizon,
+                            "train/loss_L_total": loss.item(),
+                            "train/loss_L_flow": flow_loss.item(),
+                            "train/loss_L_consistency": consistency_loss.item(),
+                            "train/loss_rollout_prob": rollout_prob,
+                        }
+                        wandb_logger.log(
+                            log_dict, step=self.training_state["global_step"]
+                        )
 
                     if (
                         self.timing_stats is not None
-                        and (training_state["global_step"] + 1) % timing_log_interval
+                        and (self.training_state["global_step"] + 1)
+                        % timing_log_interval
                         == 0
                     ):
                         timing_dict = self.timing_stats.get_averages()
@@ -1233,24 +1108,33 @@ class Trainer:
                                     f"time/{key}_ms": val
                                     for key, val in timing_dict.items()
                                 },
-                                step=training_state["global_step"],
+                                step=self.training_state["global_step"],
                             )
                         tqdm.write(
-                            f"[Step {training_state['global_step']}] {str(self.timing_stats)}"
+                            f"[Step {self.training_state['global_step']}] {str(self.timing_stats)}"
                         )
 
-                    if training_state["global_step"] % 100 == 0:
+                    if self.training_state["global_step"] % 100 == 0:
                         tqdm.write(
-                            f"[Epoch {epoch}] [Step {training_state['global_step']}] "
+                            f"[Epoch {epoch}] [Step {self.training_state['global_step']}] "
                             f"loss={loss.item():.6f} lr={lr:.2e}"
                         )
 
                     epoch_loss += loss.item()
                     num_batches += 1
-                    training_state["global_step"] += 1
+                    self.training_state["global_step"] += 1
 
                 pbar.close()
                 avg_epoch_loss = epoch_loss / max(1, num_batches)
+                if epoch_diag_t and epoch_diag_loss and epoch_diag_steps:
+                    write_loss_vs_t_epoch_artifacts(
+                        output_dir=self._loss_vs_t_output_dir(),
+                        epoch=epoch,
+                        global_steps=torch.cat(epoch_diag_steps),
+                        t_values=torch.cat(epoch_diag_t),
+                        per_sample_flow_loss=torch.cat(epoch_diag_loss),
+                        num_bins=LOSS_VS_T_NUM_BINS,
+                    )
                 tqdm.write(f"==> End of Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}")
 
                 val_metrics: dict = {}
@@ -1269,11 +1153,9 @@ class Trainer:
                             val_metrics = self.validate(
                                 encoder=val_encoder,
                                 predictor=val_predictor,
-                                horizon=curriculum_state["current_horizon"],
+                                horizon=self.curriculum_state["current_horizon"],
                                 num_batches=val_batches,
-                                device=device,
                                 epoch=epoch,
-                                total_epochs=num_epochs,
                             )
 
                         val_loss = val_metrics["val_loss"]
@@ -1285,43 +1167,68 @@ class Trainer:
                                     "val/loss": val_loss,
                                     "val/epoch": epoch,
                                 },
-                                step=training_state["global_step"],
+                                step=self.training_state["global_step"],
                             )
                     except Exception as e:
                         tqdm.write(f"Validation error: {str(e)}")
                         val_metrics = {}
 
-                self.log_epoch_metrics(
-                    wandb_logger=wandb_logger,
-                    avg_epoch_loss=avg_epoch_loss,
-                    epoch=epoch,
-                    current_horizon=curriculum_state["current_horizon"],
-                    val_metrics=val_metrics,
-                    global_step=training_state["global_step"],
-                )
+                if wandb_logger is not None:
+                    epoch_log = {
+                        "epoch/avg_loss": avg_epoch_loss,
+                        "epoch/num": epoch,
+                        "epoch/current_horizon": self.curriculum_state[
+                            "current_horizon"
+                        ],
+                    }
+                    if val_metrics and "val_loss" in val_metrics:
+                        epoch_log["epoch/val_loss"] = val_metrics["val_loss"]
+                    wandb_logger.log(
+                        epoch_log,
+                        step=self.training_state["global_step"],
+                    )
 
-                if (
-                    self.config.checkpoint_interval > 0
-                    and (epoch + 1) % self.config.checkpoint_interval == 0
-                ) or (
-                    val_metrics
-                    and val_metrics.get("val_loss", float("inf"))
-                    < training_state["best_val_loss"]
-                ):
-                    with timer(self.timing_stats, "checkpoint"):
-                        training_state = self.handle_checkpointing(
-                            save_dir=checkpoint_dir,
-                            encoder_ema=encoder_ema,
-                            predictor_ema=predictor_ema,
-                            optimizer=optimizer,
-                            scaler=scaler,
+                with timer(self.timing_stats, "checkpoint"):
+                    if (
+                        self.config.checkpoint_interval > 0
+                        and (epoch + 1) % self.config.checkpoint_interval == 0
+                    ):
+                        self.save_training_checkpoint(
+                            filename="latest.pt",
                             epoch=epoch,
-                            global_step=training_state["global_step"],
-                            avg_epoch_loss=avg_epoch_loss,
-                            curriculum_state=curriculum_state,
-                            training_state=training_state,
-                            val_metrics=val_metrics,
+                            loss=avg_epoch_loss,
                         )
+                        if avg_epoch_loss < self.training_state["best_loss"]:
+                            tqdm.write(
+                                "New best model! "
+                                f"(Loss: {self.training_state['best_loss']:.6f} -> {avg_epoch_loss:.6f})"
+                            )
+                            self.training_state["best_loss"] = avg_epoch_loss
+                            self.training_state["best_epoch"] = epoch
+                            self.save_training_checkpoint(
+                                filename="best.pt",
+                                epoch=epoch,
+                                loss=avg_epoch_loss,
+                            )
+
+                    if (
+                        self.config.save_best_val
+                        and val_metrics
+                        and "val_loss" in val_metrics
+                    ):
+                        val_loss = val_metrics["val_loss"]
+                        if val_loss < self.training_state["best_val_loss"]:
+                            tqdm.write(
+                                "New best validation model! "
+                                f"(Val Loss: {self.training_state['best_val_loss']:.6f} -> {val_loss:.6f})"
+                            )
+                            self.training_state["best_val_loss"] = val_loss
+                            self.training_state["best_val_epoch"] = epoch
+                            self.save_training_checkpoint(
+                                filename="best_val.pt",
+                                epoch=epoch,
+                                loss=avg_epoch_loss,
+                            )
 
                 if self.timing_stats is not None:
                     tqdm.write(str(self.timing_stats))
@@ -1332,37 +1239,29 @@ class Trainer:
                                 f"epoch_time/{key}_ms": val
                                 for key, val in epoch_timing.items()
                             },
-                            step=training_state["global_step"],
+                            step=self.training_state["global_step"],
                         )
                     self.timing_stats.reset()
 
         except KeyboardInterrupt:
             tqdm.write("Training interrupted. Saving emergency checkpoint...")
             self.save_training_checkpoint(
-                save_dir=checkpoint_dir,
                 filename="latest_interrupted.pt",
-                encoder_ema=encoder_ema,
-                predictor_ema=predictor_ema,
-                optimizer=optimizer,
-                scaler=scaler,
                 epoch=epoch,
-                global_step=training_state["global_step"],
                 loss=0.0,
-                curriculum_state=curriculum_state,
-                training_state=training_state,
             )
             tqdm.write("Done.")
 
         if wandb_logger is not None:
             summary = {
-                "best_loss": training_state["best_loss"],
-                "best_epoch": training_state["best_epoch"],
-                "best_val_loss": training_state["best_val_loss"],
-                "best_val_epoch": training_state["best_val_epoch"],
+                "best_loss": self.training_state["best_loss"],
+                "best_epoch": self.training_state["best_epoch"],
+                "best_val_loss": self.training_state["best_val_loss"],
+                "best_val_epoch": self.training_state["best_val_epoch"],
             }
-            if curriculum_state["use_curriculum"]:
-                summary["final_horizon"] = curriculum_state["current_horizon"]
-                summary["max_horizon"] = curriculum_state["max_horizon"]
+            if self.curriculum_state["use_curriculum"]:
+                summary["final_horizon"] = self.curriculum_state["current_horizon"]
+                summary["max_horizon"] = self.curriculum_state["max_horizon"]
             wandb_logger.log_summary(summary)
             wandb_logger.finish()
 

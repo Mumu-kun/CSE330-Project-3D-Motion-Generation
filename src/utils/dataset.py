@@ -263,17 +263,6 @@ class Text2MotionDataset(Dataset):
 
         valid_length = min(current_len, target_len)
 
-        # ===== FINAL SANITY CHECK =====
-        assert (
-            motion.shape[0] == target_len
-        ), f"Motion shape[0]={motion.shape[0]}, expected {target_len}"
-        assert (
-            motion.shape[1] == 271
-        ), f"Motion shape[1]={motion.shape[1]}, expected 271"
-        assert (
-            joints.shape[0] == target_len
-        ), f"Joints shape[0]={joints.shape[0]}, expected {target_len}"
-
         # ===== GET TEXT EMBEDDING =====
         text_embedding = self.text_cache[caption]
         if isinstance(text_embedding, np.ndarray):
@@ -361,27 +350,6 @@ def text2motion_collate_fn(
     joints_list = [b[2] for b in batch]
     lengths = [b[3] for b in batch]
     text_embs_list = [b[4] for b in batch]
-
-    # Helper to ensure all are tensors
-    def to_tensor(x):
-        if isinstance(x, np.ndarray):
-            return torch.from_numpy(x).float()
-        elif isinstance(x, torch.Tensor):
-            return x.float()
-        else:
-            return torch.tensor(x).float()
-
-    # Convert all to tensors (redundant safety check)
-    motions_list = [to_tensor(x) for x in motions_list]
-    joints_list = [to_tensor(x) for x in joints_list]
-    text_embs_list = [to_tensor(x) for x in text_embs_list]
-
-    for idx, text_emb in enumerate(text_embs_list):
-        if text_emb.ndim != 2 or text_emb.shape[0] != 1 or text_emb.shape[1] != CLIP_EMBED_DIM:
-            raise ValueError(
-                f"Invalid text embedding at batch index {idx}: shape {tuple(text_emb.shape)}. "
-                f"Expected (1, {CLIP_EMBED_DIM})."
-            )
 
     # Stack tensors directly
     motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)

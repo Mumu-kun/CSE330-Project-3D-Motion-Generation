@@ -1,415 +1,263 @@
 # High-Level Architecture Design: Human Motion Generation
 
-This project focuses on generating high-quality 3D human motion sequences from textual descriptions. The architecture is a two-stage pipeline that combines spatiotemporal transformer encoding with continuous flow matching.
+This document summarizes the architecture that is actually implemented in `src/`. The project is a text-conditioned autoregressive motion generator built around a GRU history encoder, a flow-matching spatial transformer, and a frame-by-frame conversion pipeline between absolute positions and compact motion features.
 
-## 1. Conceptual Workflow
+## 1. System Summary
 
-The generation process follows a "Conditioned Denoising" paradigm:
-1. **Context Construction**: Past motion history and text prompts are encoded into a rich latent representation using a spatiotemporal transformer.
-2. **Relative-Shift Flow Prediction**: A spatial transformer predicts the flow field of the clean next relative shift in joint-track space.
-3. **Iterative Refinement**: The predicted flow is integrated over ODE steps to obtain a clean next relative shift, then applied as displacement on the current 22 track positions.
+At a high level, each generated frame is produced in four stages:
 
----
+1. Encode recent 271D motion history with text conditioning.
+2. Predict a denoised next-frame state in a reduced 68D representation.
+3. Convert that reduced state into absolute global joint positions.
+4. Convert the new positions back into a 271D frame and append them to history.
 
-## 2. Model Architecture
+The recurrent state is therefore not a latent-only state. It is a pair of concrete, interpretable histories:
+- absolute joint positions;
+- derived 271D feature frames.
 
-### A. Motion History Encoder (GRU-based Context Encoder)
+## 2. Main Components
 
-The encoder uses a **GRU (Gated Recurrent Unit)** architecture to process motion history and text conditioning.
+### A. Motion History Encoder
 
-#### Forward Pass Data Pipeline
+Implemented in `src/models.py` as `MotionHistoryEncoder`.
 
-```
-Input: motion_seq(B, T, 271), text_emb(B, 512)
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  1. TEXT PROJECTION                                         │
-│     text_proj = Linear(text_emb)           # (B, text_proj_dim)│
-│     t_scaled = text_scale * text_proj       # Apply text scale │
-│     t_rep = t_scaled.unsqueeze(1).expand(B, T, -1)  # (B,T,D)│
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  2. INITIALIZE GRU HIDDEN STATE                             │
-│     h0 = text_to_hidden(text_emb)       # (B, hidden_dim)  │
-│     h0 = h0.unsqueeze(0).repeat(num_layers, 1, 1)  # (L,B,H)│
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  3. CONCATENATE MOTION + TEXT                               │
-│     gru_input = cat([motion_seq, t_rep], dim=-1)           │
-│                                     # (B, T, motion_dim + text_proj_dim)│
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  4. GRU FORWARD PASS                                        │
-│     h_seq, h_next = gru(gru_input, h0)  # h_seq: (B,T,H) │
-│     h_last = h_seq[:, -1, :]             # Last timestep  │
-│                                     # (B, hidden_dim)     │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  5. MLP TO PER-JOINT TOKENS                                 │
-│     joint_tokens = global_to_joints(h_last)                 │
-│                                     # (B, 22 * per_joint_dim)│
-│     history_features = joint_tokens.view(B, 22, per_joint_dim)│
-│                                     # (B, 22, per_joint_dim)│
-└─────────────────────────────────────────────────────────────┘
+Role:
+- reads a variable-length motion window `(B, T, 271)`;
+- conditions each timestep on pooled CLIP text `(B, 512)`;
+- emits one context token per joint `(B, 22, D_joint)`.
 
-Output: history_features(B, 22, per_joint_dim)
+Current data path:
+
+```text
+motion history (B, T, 271)
+text embedding (B, 512)
+    -> text_to_hidden(text) for GRU initial state
+    -> text_proj(text) repeated across T
+    -> concat(motion, repeated_text)
+    -> GRU over time
+    -> last hidden state
+    -> MLP
+    -> reshape to (B, 22, per_joint_out_dim)
 ```
 
-#### Step Function (for AR inference)
+Why it exists:
+- The GRU supplies temporal memory cheaply.
+- The predictor can then operate over joints at a single frame rather than running a full spatiotemporal transformer over the whole sequence.
 
-For autoregressive generation, the encoder provides a `step()` method:
+### B. Flow Matching Predictor
 
-```
-Input: x_t(B, 271), text_emb(B, 512), h(Optional[L, B, H])
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  1. PREPARE SINGLE TIMESTEP INPUT                          │
-│     motion_in = x_t.unsqueeze(1)         # (B, 1, 271)    │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  2. RUN GRU BLOCK (same as forward pass)                   │
-│     history_features, h_next = _gru_block(motion_in, text_emb, h)│
-└─────────────────────────────────────────────────────────────┘
+Implemented in `src/models.py` as `FlowMatchingPredictor`.
 
-Output: history_features(B, 22, per_joint_dim), h_next(L, B, H)
-```
+Role:
+- predicts flow in a reduced next-frame state space;
+- reasons jointly over root and non-root joints using attention across 22 tokens.
 
----
+Current tokenization:
+- token 0: root
+- tokens 1-21: non-root joints
 
-### B. Flow Matching Predictor (Spatial Transformer)
+Per-token inputs are assembled from three sources:
+- noisy reduced-state features;
+- per-joint history features from the GRU encoder;
+- current-frame causal features extracted from the latest 271D frame.
 
-The core generation engine that predicts velocity fields in track space for the next relative shift.
+Conditioning path:
 
-#### Forward Pass Data Pipeline
-
-```
-Input: noised_tracks(B,22,D), timesteps(B,),
-             global_cond(B,H), track_features(B,22,F),
-             relative_shifts(B,22,D optional)
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  1. FEATURE CONCATENATION                                   │
-│     x_in = cat([noised_tracks, track_features,              │
-│                 relative_shifts if enabled], dim=-1)        │
-│                                    # (B,22,input_dim)       │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  2. INPUT PROJECTION                                        │
-│     hidden = Linear(input_dim -> hidden_size)(x_in)         │
-│                                    # (B,22,H)               │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  3. TIME + GLOBAL CONDITIONING                              │
-│     t_emb = SinusoidalEmbedder(timesteps)   # (B,H)         │
-│     adaln_cond = t_emb + global_cond        # (B,H)         │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  4. SPATIAL TRACK TRANSFORMER STACK                         │
-│     Repeat N layers:                                         │
-│       - LayerNorm + AdaLN modulation                         │
-│       - MultiheadAttention over 22 tracks (no masking)       │
-│       - gated residual                                        │
-│       - LayerNorm + AdaLN + gated MLP residual               │
-│     hidden = SpatialTrackLayers(hidden, adaln_cond)          │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  5. OUTPUT PROJECTION                                       │
-│     hidden = LayerNorm(hidden)                              │
-│     (shift, scale) = AdaLN(adaln_cond).chunk(2)             │
-│     hidden = hidden * (1 + scale) + shift                   │
-│     flow = Linear(H -> D)(hidden)                           │
-│                                    # (B,22,D)               │
-└─────────────────────────────────────────────────────────────┘
-
-Output: flow(B,22,D) - predicted flow field in track space
-
-#### Prediction Goal
-
-For each frame, the model predicts the flow field of the clean next relative shift in 22-track space.
-
-```
-Given: current tracks P_curr in R^(B x 22 x D)
-Initialize: x_t ~ N(0, I) in R^(B x 22 x D)
-
-ODE integration:
-    x_t <- x_t + f_theta(x_t, t, context) * dt
-
-After N steps:
-    Delta_rel_next_clean = x_t
-
-Displacement update:
-    P_next = P_curr + Delta_rel_next_clean
-```
+```text
+time t -> sinusoidal embedding -> MLP
+text -> linear projection
+time embedding + text projection -> AdaLN conditioning
 ```
 
----
+Structure prior:
+- A `KinematicChainEncoder` provides a fixed embedding per joint based on chain id and depth.
+- Each transformer layer adds this prior through a learned scalar gate, initialized as a no-op.
 
-### C. Human Motion Generator (Pipeline Wrapper)
+### C. Frame Conversion Layer
 
-Integrates the Encoder and Predictor into a single interface for autoregressive generation.
+Implemented primarily in `src/utils/motion_utils.py`.
 
-#### Generation Loop Data Pipeline
+This layer is what keeps training and inference grounded in explicit motion geometry.
 
-```
-Input: text, num_frames, num_steps, guidance_scale, input_features
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  1. TEXT ENCODING                                           │
-│     if text is str: text = clip_encoder(text) # (1,1,512)   │
-│     elif text is list: text = clip_encoder(text)            │
-│     B = text.shape[0]                                       │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  2. HISTORY INITIALIZATION                                  │
-│     if input_features is None:                              │
-│         root_pos = zeros(B, 3)                              │
-│         root_tracker = RootPositionTracker(root_pos)        │
-│         feature_history = null_history.expand(B, 1, 271)    │
-│     else:                                                   │
-│         feature_history = input_features.clone()            │
-│         root_tracker = RootPositionTracker.from_history(...)│
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  FOR frame_idx in range(num_frames):                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3a. EXTRACT LAST FRAME                               │  │
-│  │      last_frame = feature_history[:, -1]  # (B, 271)  │  │
-│  │      prev_root_pos = root_tracker.get()   # (B, 3)    │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                    │                                        │
-│                    ▼                                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3b. ENCODE CONTEXT                                   │  │
-│  │      context = encoder(encoder_input, text_emb)       │  │
-│  │                         # (B, 22, per_joint_dim)      │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                    │                                        │
-│                    ▼                                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3c. TRACK-SPACE ODE INITIALIZATION                   │  │
-│  │      x_t = randn(B, 22, D)                            │  │
-│  │      dt = 1.0 / num_steps                             │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                    │                                        │
-│                    ▼                                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3d. FLOW MATCHING ODE LOOP                           │  │
-│  │      for step in range(num_steps):                    │  │
-│  │          t = full((B,), step * dt)                    │  │
-│  │          rel = x_t - x_t[:, :1, :]                    │  │
-│  │          g = zeros(B, H)                              │  │
-│  │          pred = predictor(x_t, t, g, context, rel)[0] │  │
-│  │          x_t = x_t + pred * dt                        │  │
-│  └───────────────────────────────────────────────────────┘  │
-│                    │                                        │
-│                    ▼                                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3e. INTERPRET ODE RESULT                             │  │
-│  │      clean_next_relative_shift = x_t                  │  │
-│  │      next_track_positions = current_positions         │  │
-│  │                             + clean_next_relative_shift│  │
-│  └───────────────────────────────────────────────────────┘  │
-│                    │                                        │
-│                    ▼                                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3f. CONVERT TO 271D FEATURE FRAME                     │  │
-│  │      Pack/convert and call flow_output_to_271d(...)    │  │
-│  │      to produce new_frame (B,271) and new_root_pos(B,3)│  │
-│  └───────────────────────────────────────────────────────┘  │
-│                    │                                        │
-│                    ▼                                        │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  3g. UPDATE HISTORY                                   │  │
-│  │      root_tracker.update(new_frame)                   │  │
-│  │      feature_history = cat([feature_history,          │  │
-│  │                          new_frame.unsqueeze(1)], dim=1)│  │
-│  │                      # (B, N+1, 271)                  │  │
-│  └───────────────────────────────────────────────────────┘  │
-│  END FOR                                                    │
-└─────────────────────────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────────────────────────┐
-│  4. CONVERT TO POSITIONS                                    │
-│     position_history = features_to_positions(feature_history)│
-│                                    # (B, N+num_frames, 22, 3)│
-└─────────────────────────────────────────────────────────────┘
+Key responsibilities:
+- convert full 271D frames to the 68D predictor target;
+- reconstruct absolute positions from predicted reduced states;
+- derive fresh 271D features from generated positions;
+- optionally canonicalize generated positions with FK-consistent offsets.
 
-Output: position_history(B, N+num_frames, 22, 3)
+This conversion layer is the bridge between:
+- the model-friendly reduced state used by flow matching;
+- the motion-friendly 271D representation used by the encoder and dataset.
+
+### D. Human Motion Generator
+
+Implemented in `src/models.py` as `HumanMotionGenerator`.
+
+Role:
+- orchestrates encoder, predictor, and conversion utilities for autoregressive generation.
+
+Important implementation choice:
+- the generator keeps **absolute positions** as the primary autoregressive state;
+- 271D features are re-derived every step instead of treating the predictor output as a complete persistent feature frame.
+
+That makes the generation loop easier to reason about and avoids accumulating drift from repeated feature-only updates.
+
+## 3. Current Data Representations
+
+### 271D frame representation
+
+Used by:
+- dataset loading;
+- GRU history encoding;
+- feature normalization;
+- frame-by-frame reconstruction after generation.
+
+Layout:
+
+```text
+[0:3]    root height y, root vel x, root vel z
+[3:69]   22 joints x 3D RIC positions
+[69:201] 22 joints x 6D rotations
+[201:267]22 joints x 3D root-local velocities
+[267:271]4 foot-contact values
 ```
 
----
+### 68D reduced predictor state
 
-## 3. Data Representation
+Used by:
+- flow-matching target construction;
+- ODE integration at inference time.
 
-### 271D Feature Format (HumanML3D Custom)
+Layout:
 
-| Index Range | Feature Type     | Description                            |
-| :---------- | :--------------- | :------------------------------------- |
-| `[0:3]`     | Root Global      | Height Y, Velocity X, Velocity Z       |
-| `[3:69]`    | RIC Positions    | 22 joints × 3D relative positions      |
-| `[69:201]`  | 6D Rotations     | 22 joints × 6D rotation representation |
-| `[201:267]` | Local Velocities | 22 joints × 3D velocities              |
-| `[267:271]` | Foot Contacts    | 4 binary contact flags                 |
-
-### Flow Matching Target (72D, Legacy Bridge Format)
-
-| Index Range | Feature Type  | Description                              |
-| :---------- | :------------ | :--------------------------------------- |
-| `[0:9]`     | Root Features | Height(1) + Velocity(2) + Rotation_6d(6) |
-| `[9:72]`    | Joint RIC     | 21 joints × 3D RIC positions             |
-
-### Track-Space Flow State (Current Predictor Interface)
-
-| Tensor            | Shape        | Description                                                   |
-| :---------------- | :----------- | :------------------------------------------------------------ |
-| `noised_tracks`   | `(B, 22, D)` | Current noisy track-space state used in ODE integration       |
-| `track_features`  | `(B, 22, F)` | Per-track conditional context from MotionHistoryEncoder       |
-| `relative_shifts` | `(B, 22, D)` | Relative offsets, typically computed as `x_t - x_t[:, :1, :]` |
-| `flow_prediction` | `(B, 22, D)` | Predicted flow field for clean next relative shift            |
-
-### Previous Frame Features (261D, Legacy Representation)
-
-| Index Range | Feature Type   | Description                              |
-| :---------- | :------------- | :--------------------------------------- |
-| `[0:9]`     | Root Features  | Height(1) + Velocity(2) + Rotation_6d(6) |
-| `[9:261]`   | Joint Features | 21 joints × 12D (RIC + Rot + Vel)        |
-
----
-
-## 4. Training Configuration
-
-| Parameter               | Value | Description                                      |
-| :---------------------- | :---- | :----------------------------------------------- |
-| `encoder_hidden_dim`    | 256   | GRU hidden dimension                             |
-| `encoder_num_layers`    | 2     | MotionHistoryEncoder GRU layers                  |
-| `encoder_per_joint_dim` | 64    | Per-joint context vector dimension               |
-| `predictor_model_dim`   | 128   | FlowMatchingPredictor hidden dimension           |
-| `predictor_num_layers`  | 2     | FlowMatchingPredictor spatial transformer layers |
-| `batch_size`            | 192   | Training batch size                              |
-| `learning_rate`         | 1e-4  | Adam learning rate                               |
-| `num_epochs`            | 1000  | Total training epochs                            |
-| `dropout`               | 0.1   | Dropout rate                                     |
-| `ema_decay`             | 0.999 | EMA decay for validation                         |
-| `cfg_dropout`           | 0.1   | CFG dropout probability                          |
-
-### Progressive Horizon Curriculum
-
-Training uses progressive context windows:
-- Stage 1: 16 frames
-- Stage 2: 32 frames
-- Stage 3: 64 frames
-- Stage 4: 128 frames (optional)
-
----
-
-## 5. Data Flow Diagram
-
-```mermaid
-graph TD
-    Text[Text Prompt] --> CLIP[CLIP Encoder]
-    History[Motion History 271D] --> Encoder[MotionHistoryEncoder]
-    CLIP --> Encoder
-    Encoder --> Context[Context Vectors Bx22x64]
-    
-    Noise[Gaussian Noise Bx22xD] --> Predictor[FlowMatchingPredictor]
-    Context --> Predictor
-    Rel[Relative Shifts Bx22xD] --> Predictor
-    Time[Flow Time t] --> Predictor
-    Global[Global Cond BxH] --> Predictor
-    
-    Predictor --> Flow[Flow Field Bx22xD]
-    Flow --> Euler[Euler ODE Step]
-    Euler --> CleanShift[Clean Next Relative Shift Bx22xD]
-    CleanShift --> Displace[Displace Current 22 Tracks]
-    Displace --> Convert[Bridge + flow_output_to_271d]
-    Convert --> NewFrame[New Frame 271D]
+```text
+[0:5]   root height, root vel x/z, sin(dyaw), cos(dyaw)
+[5:68]  21 non-root joints x 3D RIC positions
 ```
 
----
+Important note:
+- the helper that builds this state is still named `subset_271d_to_72d(...)`;
+- that name is legacy, but the implemented state is 68D.
 
-## 6. Inference Pipeline
+### 257D current-frame conditioning
 
-```mermaid
-sequenceDiagram
-    participant Text as Text Prompt
-    participant CLIP as CLIP Encoder
-    participant MHE as MotionHistoryEncoder
-    participant FMP as FlowMatchingPredictor
-    participant ODE as ODE Solver
-    
-    loop For each frame
-        Text->>CLIP: Encode text
-        CLIP->>MHE: CLIP embeddings
-        History->>MHE: Feature history
-        MHE->>FMP: Context vectors
-        loop N ODE steps
-            FMP->>ODE: Predict relative-shift flow field
-            ODE->>FMP: Updated x_t
-        end
-        ODE->>History: Apply clean next relative shift as displacement
-        ODE->>History: Append new frame
-    end
+Used only as predictor conditioning.
+
+Layout:
+
+```text
+[0:5]    root height, root vel x/z, sin(yaw), cos(yaw)
+[5:257]  21 x (RIC 3 + rot6d 6 + vel 3)
 ```
 
----
+## 4. Training Architecture
 
-## 7. Key Implementation Details
+Training is implemented in `src/utils/train_utils.py` and centers on `Trainer.incremental_flow_loss(...)`.
 
-### Tensor Shape Transformations Summary
+### Training step
 
-| Stage              | Operation                  | Input Shape                            | Output Shape                     |
-| :----------------- | :------------------------- | :------------------------------------- | :------------------------------- |
-| Text Projection    | Linear + Expand            | `(B, L_text, 512)`                     | `(B, L_text, 22, D)`             |
-| Global Token       | Extract + Linear           | `(B, T, 271)`                          | `(B, T, 1, D)`                   |
-| Track Tokens       | Extract + View + Linear    | `(B, T, 271)`                          | `(B, T, 21, D)`                  |
-| Motion Assembly    | Concat                     | `(B, T, 1, D)` + `(B, T, 21, D)`       | `(B, T, 22, D)`                  |
-| Sequence Concat    | Concat                     | `(B, L_text, 22, D)` + `(B, T, 22, D)` | `(B, L_text+T, 22, D)`           |
-| Spatial Attention  | Reshape + Attn             | `(B, T, 22, D)`                        | `(B*T, 22, D)` → `(B, T, 22, D)` |
-| Temporal Attention | Transpose + Reshape + Attn | `(B, T, 22, D)`                        | `(B*22, T, D)` → `(B, T, 22, D)` |
-| Output Extraction  | Slice                      | `(B, L_text+T, 22, D)`                 | `(B, T, 22, D)`                  |
+For each batch:
 
-### Addition Operations (Broadcasting)
+1. Load raw motion and joints from the dataloader.
+2. Normalize 271D motion if a `FeatureNormalizer` is configured.
+3. Walk through the sequence one frame at a time with `encoder.gru_step(...)`.
+4. For each prediction step:
+   - extract current-frame conditioning from the latest frame;
+   - build the target reduced next-frame state;
+   - sample Gaussian noise `x0`;
+   - sample a random noise level `t`;
+   - interpolate `xt = t*x1 + (1-t)*x0`;
+   - predict the flow target `x1 - x0`.
+5. Accumulate MSE across all flattened frame-level samples.
 
-| Operation            | Left Shape      | Right Shape     | Result Shape    |
-| :------------------- | :-------------- | :-------------- | :-------------- |
-| Kinematic Bias       | `(B, T, 22, D)` | `(1, 1, 22, D)` | `(B, T, 22, D)` |
-| History + Prev       | `(B, 22, D)`    | `(B, 22, D)`    | `(B, 22, D)`    |
-| Cond + Noisy         | `(B, 22, D)`    | `(B, 22, D)`    | `(B, 22, D)`    |
-| Time Bias            | `(B, 22, D)`    | `(B, 1, D)`     | `(B, 22, D)`    |
-| Kinematic Bias (FMP) | `(B, 22, D)`    | `(1, 22, D)`    | `(B, 22, D)`    |
+### Optional rollout during training
 
----
+The training loop can partially replace teacher-forced next inputs with model-generated rollouts.
 
-## 8. Why This Architecture?
+Current behavior:
+- rollout probability is linearly scheduled from `rollout_prob_start` to `rollout_prob_end`;
+- rollout generation runs a short ODE loop in reduced-state space;
+- the rolled state is converted to positions, then back to a 271D frame before being fed into the GRU on the next step.
 
-- **Flow Matching**: Offers stable training dynamics compared to GANs, with faster inference than diffusion models
-- **Kinematic Chain Bias**: Ensures anatomically plausible motion by encoding skeletal hierarchy
-- **Dual-Stage Design**: Separates context understanding (Encoder) from generation (Predictor)
-- **HumanML3D Compatible**: Works with standard datasets and BVH visualization tools
+This gives the encoder some exposure to its own generated history without abandoning stable teacher-forced supervision.
+
+### Validation and EMA
+
+Validation uses the same incremental loss machinery with optional EMA models.
+
+Implemented support includes:
+- EMA copies of encoder and predictor;
+- best-train and best-validation checkpoints;
+- loss-vs-t diagnostic CSV/plot artifacts;
+- optional timing instrumentation for forward/backward and rollout hotspots.
+
+## 5. Inference Architecture
+
+Inference is implemented in `HumanMotionGenerator.generate_sequence(...)`.
+
+### Generation loop
+
+For each output frame:
+
+1. Take the latest history window of 271D frames.
+2. Encode that window with the GRU history encoder.
+3. Extract current-frame causal features from the latest frame.
+4. Initialize a noisy reduced state `x_t ~ N(0, I)` in 68D.
+5. Integrate the predictor over `num_steps` Euler updates.
+6. Denormalize the reduced state if needed.
+7. Convert it to absolute joint positions with:
+   - previous root position;
+   - previous root rotation.
+8. Convert the new positions back into a 271D frame.
+9. Append positions, features, and relative shifts to history.
+
+### Position-first design
+
+One of the most important current design choices is that inference is position-first:
+
+- new positions are the canonical generated artifact;
+- 271D features are derived from those positions after generation;
+- relative shifts are derived outputs, not the primary recurrent state.
+
+This keeps the loop aligned with geometric utilities such as IK, FK, root-motion integration, and foot-contact recomputation.
+
+### FK-consistent option
+
+When `use_fk=True`, the generator:
+- computes FK offsets from the seed history;
+- allows `generated_positions_to_271d(...)` to produce FK-consistent positions;
+- replaces raw predicted positions with those FK-consistent positions when available.
+
+That path aims to keep bone structure more stable during long rollouts.
+
+## 6. Why This Architecture Makes Sense
+
+The current design separates concerns cleanly:
+
+- The GRU handles temporal accumulation over history.
+- The transformer handles spatial coupling across joints for the next frame.
+- The motion utilities keep the model anchored to explicit geometry.
+
+That split is especially useful here because the predictor does not need to model full-sequence attention. It only needs to solve a well-conditioned next-frame denoising problem with rich contextual inputs.
+
+## 7. Practical Notes
+
+### What is no longer true
+
+Older project notes may still mention:
+- a 72D predictor target;
+- track-space relative-shift prediction as the main runtime state;
+- a 261D previous-frame representation;
+- CLIP long-text chunk averaging.
+
+Those do not describe the current implementation accurately.
+
+### What to trust first
+
+When docs and comments disagree, use these files as the source of truth:
+- `src/models.py`
+- `src/utils/motion_utils.py`
+- `src/utils/train_utils.py`
+- `src/config.py`
+
+This document has been aligned to those files.

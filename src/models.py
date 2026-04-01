@@ -28,6 +28,8 @@ from utils.motion_utils import (
     sequence_joints_to_features,
     generated_positions_to_271d,
     FeatureNormalizer,
+    extract_prev_frame_features,
+    flow_output_to_positions,
 )
 
 
@@ -388,24 +390,32 @@ class FlowMatchingPredictor(nn.Module):
         feature_size: int,  # Size of track features per track (from encoder/detector)
         config: FlowMatchingPredictorConfig,  # Model configuration
         out_channels: Optional[int] = None,
-        use_relative_shift: bool = True,
         **kwargs,
     ):
         super().__init__()
-        self.out_channels = (
-            out_channels or config.track_dimensionality
-        )  # Usually 2 (x,y)
-        self.use_relative_shift = use_relative_shift
-
-        # Input projection: concatenate all features -> hidden_size
-        input_dim = (
-            config.track_dimensionality  # noised_tracks (x,y coordinates to denoise)
-            + feature_size  # track_features (from video encoder, etc.)
-            + (
-                config.track_dimensionality if use_relative_shift else 0
-            )  # relative_shifts (if used, provided externally)
+        del out_channels, kwargs
+        self.feature_size = feature_size
+        self.root_state_dim = 5
+        self.joint_state_dim = 3
+        self.root_frame_dim = 5
+        self.joint_frame_dim = 12
+        self.joint_count = 22
+        self.non_root_joint_count = self.joint_count - 1
+        self.flow_dim = self.root_state_dim + (
+            self.non_root_joint_count * self.joint_state_dim
         )
-        self.input_projection = nn.Linear(input_dim, config.hidden_size)
+        self.current_frame_feature_dim = self.root_frame_dim + (
+            self.non_root_joint_count * self.joint_frame_dim
+        )
+
+        self.root_input_projection = nn.Linear(
+            self.root_state_dim + feature_size + self.root_frame_dim,
+            config.hidden_size,
+        )
+        self.joint_input_projection = nn.Linear(
+            self.joint_state_dim + feature_size + self.joint_frame_dim,
+            config.hidden_size,
+        )
 
         self.global_cond_projection = nn.Linear(
             config.global_cond_dim, config.hidden_size
@@ -438,7 +448,8 @@ class FlowMatchingPredictor(nn.Module):
             nn.SiLU(),
             self.output_adaln_linear,
         )
-        self.output_projection = nn.Linear(config.hidden_size, self.out_channels)
+        self.root_output_head = nn.Linear(config.hidden_size, self.root_state_dim)
+        self.joint_output_head = nn.Linear(config.hidden_size, self.joint_state_dim)
 
         self._initialize_weights()
 
@@ -465,18 +476,50 @@ class FlowMatchingPredictor(nn.Module):
         # Zero-out output layers:
         nn.init.constant_(self.output_adaln_linear.weight, 0)
         nn.init.constant_(self.output_adaln_linear.bias, 0)
-        nn.init.constant_(self.output_projection.weight, 0)
-        nn.init.constant_(self.output_projection.bias, 0)
+        nn.init.constant_(self.root_output_head.weight, 0)
+        nn.init.constant_(self.root_output_head.bias, 0)
+        nn.init.constant_(self.joint_output_head.weight, 0)
+        nn.init.constant_(self.joint_output_head.bias, 0)
+
+    def _split_noisy_features(
+        self, noisy_features: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if noisy_features.ndim != 2 or noisy_features.shape[-1] != self.flow_dim:
+            raise ValueError(
+                f"Expected noisy_features shape (B, {self.flow_dim}), got {tuple(noisy_features.shape)}"
+            )
+        root_state = noisy_features[:, : self.root_state_dim]
+        joint_state = noisy_features[:, self.root_state_dim :].reshape(
+            noisy_features.shape[0], self.non_root_joint_count, self.joint_state_dim
+        )
+        return root_state, joint_state
+
+    def _split_current_frame_features(
+        self, current_frame_features: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if (
+            current_frame_features.ndim != 2
+            or current_frame_features.shape[-1] != self.current_frame_feature_dim
+        ):
+            raise ValueError(
+                "Expected current_frame_features shape "
+                f"(B, {self.current_frame_feature_dim}), got {tuple(current_frame_features.shape)}"
+            )
+        root_features = current_frame_features[:, : self.root_frame_dim]
+        joint_features = current_frame_features[:, self.root_frame_dim :].reshape(
+            current_frame_features.shape[0],
+            self.non_root_joint_count,
+            self.joint_frame_dim,
+        )
+        return root_features, joint_features
 
     def forward(
         self,
-        noised_tracks: torch.Tensor,  # (B, N, D) - noised trajectory coordinates to denoise
+        noisy_features: torch.Tensor,  # (B, 68) - noised reduced-state features
         timesteps: torch.Tensor,  # (B,) or (B, 1) - denoising timesteps in [0,1]
         text_embedding: torch.Tensor,  # (B, F) - Text embedding for global conditioning
-        track_features: torch.Tensor,  # (B, N, F) - per-track features from encoder/detector
-        prev_relative_shifts: Optional[
-            torch.Tensor
-        ] = None,  # (B, N, D) - precomputed relative shifts (optional)
+        track_features: torch.Tensor,  # (B, 22, F) - per-joint features from MotionHistoryEncoder
+        current_frame_features: torch.Tensor,  # (B, 257) - current frame state features
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         **kwargs,  # Ignore attention_mask, position_ids, etc.
@@ -487,31 +530,52 @@ class FlowMatchingPredictor(nn.Module):
         Forward pass of the Flow Matching Predictor
 
         Args:
-            track_features: (B, N, F) - Features per track (e.g., from video encoder)
-            noised_tracks: (B, N, D) - Noised trajectory coordinates to predict flow for
+            track_features: (B, 22, F) - Per-joint context features from MotionHistoryEncoder
+            noisy_features: (B, 68) - Noised reduced-state motion features to predict flow for
             timesteps: (B,) or (B, 1) - Denoising timesteps t in [0,1]
-            relative_shifts: (B, N, D) - Precomputed relative position shifts (optional, default None)
+            current_frame_features: (B, 257) - Current frame root/joint conditioning features
             text_embedding: (B, F) - Text embedding for global conditioning
             output_attentions: Whether to return attention weights (not implemented in this simplified version)
             output_hidden_states: Whether to return hidden states (not implemented in this simplified version)
 
         Returns:
-            flow_prediction: (B, N, D) - Predicted velocity field for denoising
+            flow_prediction: (B, 68) - Predicted velocity field for denoising
         """
 
-        # 1. Feature concatenation along feature dimension
-        features_to_concat = [noised_tracks, track_features]
-        if self.use_relative_shift:
-            if prev_relative_shifts is None:
-                prev_relative_shifts = torch.zeros_like(noised_tracks)
-            features_to_concat.append(prev_relative_shifts)
+        if track_features.ndim != 3 or track_features.shape[1] != self.joint_count:
+            raise ValueError(
+                f"Expected track_features shape (B, {self.joint_count}, F), got {tuple(track_features.shape)}"
+            )
+        if track_features.shape[0] != noisy_features.shape[0]:
+            raise ValueError(
+                "Batch size mismatch between noisy_features and track_features: "
+                f"{tuple(noisy_features.shape)} vs {tuple(track_features.shape)}"
+            )
+        if current_frame_features.shape[0] != noisy_features.shape[0]:
+            raise ValueError(
+                "Batch size mismatch between noisy_features and current_frame_features: "
+                f"{tuple(noisy_features.shape)} vs {tuple(current_frame_features.shape)}"
+            )
 
-        concatenated_features = torch.cat(
-            features_to_concat, dim=-1
-        )  # (B, N, F+E+[2]+D)
+        root_state, joint_state = self._split_noisy_features(noisy_features)
+        root_current, joint_current = self._split_current_frame_features(
+            current_frame_features
+        )
+        root_track_features = track_features[:, :1, :]
+        joint_track_features = track_features[:, 1:, :]
 
-        # 2. Input projection to transformer dimension
-        hidden_states = self.input_projection(concatenated_features)  # (B, N, H)
+        root_inputs = torch.cat(
+            [root_state.unsqueeze(1), root_track_features, root_current.unsqueeze(1)],
+            dim=-1,
+        )
+        joint_inputs = torch.cat(
+            [joint_state, joint_track_features, joint_current],
+            dim=-1,
+        )
+
+        root_hidden = self.root_input_projection(root_inputs)
+        joint_hidden = self.joint_input_projection(joint_inputs)
+        hidden_states = torch.cat([root_hidden, joint_hidden], dim=1)  # (B, 22, H)
 
         # Build static per-joint kinematic tokens once and reuse across layers.
         B, N, H = hidden_states.shape
@@ -569,7 +633,11 @@ class FlowMatchingPredictor(nn.Module):
         shift, scale = self.output_adaln(adaln_conditioning).chunk(2, dim=-1)
         normed_states = normed_states * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-        flow_prediction = self.output_projection(normed_states)  # (B, N, D)
+        root_prediction = self.root_output_head(normed_states[:, 0])
+        joint_prediction = self.joint_output_head(normed_states[:, 1:]).reshape(
+            B, self.non_root_joint_count * self.joint_state_dim
+        )
+        flow_prediction = torch.cat([root_prediction, joint_prediction], dim=-1)
 
         return (
             flow_prediction,
@@ -583,7 +651,7 @@ class HumanMotionGenerator:
     Top-level wrapper for the Human Motion Generation pipeline.
     Integrates MotionHistoryEncoder (Context) and FlowMatchingPredictor (Spatial Generation).
 
-    Updated to use 271D features and proper 72D → 271D conversion for autoregressive generation.
+    Updated to use 271D features and proper reduced-state → 271D conversion for autoregressive generation.
     """
 
     def __init__(
@@ -654,7 +722,7 @@ class HumanMotionGenerator:
         Returns:
             position_history: (B, N+num_frames, 22, 3) - Absolute global joint positions including initial history
             feature_history: (B, N+num_frames, 271) - 271D features derived from position history
-            prev_relative_shifts: (B, N+num_frames, 22, 3) - Relative shifts from previous frames
+            relative_shift_history: (B, N+num_frames, 22, 3) - Relative shifts between frames
         """
         self.eval()
         with torch.no_grad():
@@ -692,7 +760,7 @@ class HumanMotionGenerator:
             if input_positions is None:
                 # Cold start from a zero pose frame.
                 position_history = torch.zeros(
-                    (B, 1, self.encoder.joint_count, self.predictor.out_channels),
+                    (B, 1, self.encoder.joint_count, self.config.joint_dim),
                     device=device,
                 )
                 feature_history = sequence_joints_to_features(
@@ -729,15 +797,15 @@ class HumanMotionGenerator:
                 else feature_history
             )
 
-            prev_relative_shifts = torch.zeros(
-                (B, 1, self.encoder.joint_count, self.predictor.out_channels),
+            relative_shift_history = torch.zeros(
+                (B, 1, self.encoder.joint_count, self.config.joint_dim),
                 device=device,
             )
 
             if position_history.shape[1] > 1:
-                prev_relative_shifts = torch.cat(
+                relative_shift_history = torch.cat(
                     [
-                        prev_relative_shifts,
+                        relative_shift_history,
                         position_history[:, 1:] - position_history[:, :-1],
                     ],
                     dim=1,
@@ -769,32 +837,28 @@ class HumanMotionGenerator:
                     encoder_input,
                     text_emb,
                 )  # (B, 22, per_joint_dim)
+                current_frame = feature_history[:, -1]
+                current_frame_features = extract_prev_frame_features(
+                    current_frame,
+                    normalizer=self.normalizer,
+                )
 
                 # ========================================
                 # Step C: Flow matching ODE loop
-                # x_t starts as random noise in track space (B, 22, 3)
+                # x_t starts as random noise in normalized reduced flow space.
                 # ========================================
-                x_t = torch.randn(
-                    (B, self.encoder.joint_count, self.predictor.out_channels),
-                    device=device,
-                )
+                x_t = torch.randn((B, self.predictor.flow_dim), device=device)
                 dt = 1.0 / num_steps
 
-                # N-step flow matching in tokenized track space.
+                # N-step flow matching in tokenized reduced flow space.
                 for step in range(num_steps):
                     t = torch.full((B,), step * dt, device=device)
-                    relative_shifts = (
-                        prev_relative_shifts[:, -1]
-                        if prev_relative_shifts.shape[1] > 0
-                        else None
-                    )
 
-                    # Predict velocity using new forward signature
                     flow_output = self.predictor.forward(
                         track_features=context_cond,
-                        noised_tracks=x_t,
+                        noisy_features=x_t,
                         timesteps=t,
-                        prev_relative_shifts=relative_shifts,
+                        current_frame_features=current_frame_features,
                         text_embedding=text_emb,
                         output_attentions=False,
                         output_hidden_states=False,
@@ -805,10 +869,24 @@ class HumanMotionGenerator:
                     x_t = x_t + pred * dt
 
                 # ========================================
-                # Step E: Apply displacement and convert positions → 271D (incremental)
+                # Step E: Convert reduced-state prediction -> positions -> 271D (incremental)
                 # ========================================
-                relative_shift = x_t  # (B, 22, 3)
-                new_positions = current_positions + relative_shift  # (B, 22, 3)
+                flow_output_raw = (
+                    self.normalizer.denormalize_flow_output(x_t)
+                    if self.normalizer is not None
+                    else x_t
+                )
+                current_frame_raw = (
+                    self.normalizer.denormalize(current_frame)
+                    if self.normalizer is not None
+                    else current_frame
+                )
+                new_positions = flow_output_to_positions(
+                    flow_output_raw,
+                    prev_root_pos=current_positions[:, 0],
+                    prev_root_rot_6d=current_frame_raw[:, 69:75],
+                )
+                relative_shift = new_positions - current_positions
                 new_frame, _, fk_positions = generated_positions_to_271d(
                     new_positions=new_positions,
                     prev_positions=current_positions,
@@ -832,14 +910,14 @@ class HumanMotionGenerator:
                 feature_history = torch.cat(
                     [feature_history, new_frame.unsqueeze(1)], dim=1
                 )  # (B, N+1, 271)
-                prev_relative_shifts = torch.cat(
-                    [prev_relative_shifts, relative_shift.unsqueeze(1)], dim=1
+                relative_shift_history = torch.cat(
+                    [relative_shift_history, relative_shift.unsqueeze(1)], dim=1
                 )  # (B, T, 22, 3)
 
                 if (frame_idx + 1) % 50 == 0:
                     print(f"Generated {frame_idx + 1}/{num_frames} frames")
 
-            return position_history, feature_history, prev_relative_shifts
+            return position_history, feature_history, relative_shift_history
 
     @classmethod
     def load_from_checkpoint(
@@ -888,8 +966,6 @@ class HumanMotionGenerator:
         predictor = FlowMatchingPredictor(
             feature_size=feature_size,
             config=predictor_config,
-            out_channels=None,
-            use_relative_shift=True,
             normalizer=normalizer,
         ).to(device)
 

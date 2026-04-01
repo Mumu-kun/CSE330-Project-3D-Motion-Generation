@@ -276,6 +276,66 @@ def _ensure_finite_tensor(
     )
 
 
+def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
+    """Wrap angles to [-pi, pi] in a differentiable way."""
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def root_rot6d_to_yaw(root_rot_6d: torch.Tensor) -> torch.Tensor:
+    """Extract yaw from the yaw-only root 6D rotation convention."""
+    if root_rot_6d.shape[-1] != 6:
+        raise ValueError(
+            f"Expected root_rot_6d with trailing dimension 6, got {root_rot_6d.shape}"
+        )
+    rotation_matrix = cont6d_to_matrix(root_rot_6d)
+    return torch.atan2(-rotation_matrix[..., 2, 0], rotation_matrix[..., 0, 0])
+
+
+def yaw_to_root_rot6d(yaw: torch.Tensor) -> torch.Tensor:
+    """Convert yaw angles to the root 6D rotation convention used by this repo."""
+    cos_yaw = torch.cos(yaw)
+    sin_yaw = torch.sin(yaw)
+    zeros = torch.zeros_like(yaw)
+    ones = torch.ones_like(yaw)
+    return torch.stack(
+        [cos_yaw, zeros, -sin_yaw, zeros, ones, zeros],
+        dim=-1,
+    )
+
+
+def yaw_to_sin_cos(yaw: torch.Tensor) -> torch.Tensor:
+    """Encode an angle as [sin(angle), cos(angle)]."""
+    return torch.stack([torch.sin(yaw), torch.cos(yaw)], dim=-1)
+
+
+def sin_cos_to_yaw(sin_cos: torch.Tensor) -> torch.Tensor:
+    """Decode [sin(angle), cos(angle)] back to an angle."""
+    if sin_cos.shape[-1] != 2:
+        raise ValueError(
+            f"Expected sin_cos with trailing dimension 2, got {sin_cos.shape}"
+        )
+    return torch.atan2(sin_cos[..., 0], sin_cos[..., 1])
+
+
+def root_rot6d_to_yaw_sin_cos(root_rot_6d: torch.Tensor) -> torch.Tensor:
+    """Convert root 6D rotation to [sin(yaw), cos(yaw)]."""
+    return yaw_to_sin_cos(root_rot6d_to_yaw(root_rot_6d))
+
+
+def compute_root_delta_yaw_sin_cos(
+    root_rot_6d: torch.Tensor,
+    prev_root_rot_6d: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute [sin(dyaw), cos(dyaw)] between consecutive root rotations."""
+    current_yaw = root_rot6d_to_yaw(root_rot_6d)
+    if prev_root_rot_6d is None:
+        delta_yaw = torch.zeros_like(current_yaw)
+    else:
+        prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
+        delta_yaw = _wrap_angle(current_yaw - prev_yaw)
+    return yaw_to_sin_cos(delta_yaw)
+
+
 def _compute_ik(
     positions: torch.Tensor,
     raw_offsets: torch.Tensor,
@@ -468,28 +528,45 @@ def _forward_kinematics(
 # ============================================================================
 
 
-def subset_271d_to_72d(x: torch.Tensor) -> torch.Tensor:
+def subset_271d_to_72d(
+    x: torch.Tensor,
+    prev_frame: Optional[torch.Tensor] = None,
+    normalizer: Optional["FeatureNormalizer"] = None,
+) -> torch.Tensor:
     """
-    Subset 271D features to 72D features for training.
-    Args:
-        x: (..., 271) tensor of 271D features
-    Returns:
-        x_72d: (..., 72) tensor of 72D features
+    Subset 271D features to the reduced 68D predictor state.
+
+    Reduced layout:
+      [0:5]   Root: height (1) + velocity (2) + sin(dyaw), cos(dyaw) (2)
+      [5:68]  Joint RIC positions: 21 non-root joints x 3D
+
+    Height/velocity/RIC preserve the input scale. If `normalizer` is provided,
+    yaw is recovered from denormalized root 6D rotations while the returned
+    height/velocity/RIC slices stay in the input feature space.
     """
-    slices = [
-        slice(0, 1),  # root height
-        slice(1, 3),  # root velocity
-        slice(69, 75),  # root rotation 6D
-        slice(6, 69),  # joint RIC positions
-    ]
+    if x.shape[-1] != 271:
+        raise ValueError(f"Expected x to have trailing dimension 271, got {x.shape}")
+    if prev_frame is not None and prev_frame.shape != x.shape:
+        raise ValueError(
+            f"Expected prev_frame shape {tuple(x.shape)}, got {tuple(prev_frame.shape)}"
+        )
 
-    x_72d_list = []
+    raw_x = normalizer.denormalize(x) if normalizer is not None else x
+    raw_prev = (
+        normalizer.denormalize(prev_frame)
+        if (normalizer is not None and prev_frame is not None)
+        else prev_frame
+    )
 
-    for sl in slices:
-        x_72d_list.append(x[..., sl])
+    root_height = x[..., 0:1]
+    root_vel = x[..., 1:3]
+    root_delta_yaw = compute_root_delta_yaw_sin_cos(
+        raw_x[..., 69:75],
+        None if raw_prev is None else raw_prev[..., 69:75],
+    )
+    joint_ric = x[..., 6:69]
 
-    x_72d = torch.cat(x_72d_list, dim=-1)
-    return x_72d
+    return torch.cat([root_height, root_vel, root_delta_yaw, joint_ric], dim=-1)
 
 
 def _subset_unused(x: torch.Tensor) -> torch.Tensor:
@@ -566,54 +643,82 @@ class FeatureNormalizer:
     def denormalize_flow_output(self, flow_output: torch.Tensor) -> torch.Tensor:
         """
         Denormalize flow output to original scale.
-        Flow Output: 72D
-            - Root token output (first 9D):
-                1D height + 2D velocity + 6D rotation
+        Reduced Flow Output: 68D
+            - Root token output (first 5D):
+                1D height + 2D velocity + sin(dyaw), cos(dyaw)
             - Joint tokens output (next 63D):
                 21 joints x 3D RIC positions
         Args:
-            flow_output: (..., 72) tensor of flow output (72,) or (B, 72) or (B, N, 72)
+            flow_output: (..., 68) tensor of reduced flow output
         Returns:
-            denormalized_flow_output: (..., 72) tensor of denormalized flow output
+            denormalized_flow_output: (..., 68) tensor of denormalized flow output
         """
-        if flow_output.shape[-1] != 72:
+        if flow_output.shape[-1] != 68:
             raise ValueError(
-                f"Expected flow_output to have shape (..., 72), got {flow_output.shape}"
+                f"Expected flow_output to have shape (..., 68), got {flow_output.shape}"
             )
 
         if flow_output.device != self.mean.device:
             self.mean = self.mean.to(flow_output.device)
             self.std = self.std.to(flow_output.device)
 
-        mean_72d = subset_271d_to_72d(self.mean)
-        std_72d = subset_271d_to_72d(self.std)
-        return flow_output * std_72d + mean_72d
+        mean_68d = torch.cat(
+            [
+                self.mean[0:3],
+                torch.zeros(2, device=flow_output.device, dtype=flow_output.dtype),
+                self.mean[6:69],
+            ],
+            dim=0,
+        )
+        std_68d = torch.cat(
+            [
+                self.std[0:3],
+                torch.ones(2, device=flow_output.device, dtype=flow_output.dtype),
+                self.std[6:69],
+            ],
+            dim=0,
+        )
+        return flow_output * std_68d + mean_68d
 
     def normalize_flow_output(self, flow_output: torch.Tensor) -> torch.Tensor:
         """
         Normalize flow output from raw scale to normalized scale.
-        Flow Output: 72D
-            - Root token output (first 9D):
-                1D height + 2D velocity + 6D rotation
+        Reduced Flow Output: 68D
+            - Root token output (first 5D):
+                1D height + 2D velocity + sin(dyaw), cos(dyaw)
             - Joint tokens output (next 63D):
                 21 joints x 3D RIC positions
         Args:
-            flow_output: (..., 72) tensor of raw flow output
+            flow_output: (..., 68) tensor of raw reduced flow output
         Returns:
-            normalized_flow_output: (..., 72) tensor of normalized flow output
+            normalized_flow_output: (..., 68) tensor of normalized flow output
         """
-        if flow_output.shape[-1] != 72:
+        if flow_output.shape[-1] != 68:
             raise ValueError(
-                f"Expected flow_output to have shape (..., 72), got {flow_output.shape}"
+                f"Expected flow_output to have shape (..., 68), got {flow_output.shape}"
             )
 
         if flow_output.device != self.mean.device:
             self.mean = self.mean.to(flow_output.device)
             self.std = self.std.to(flow_output.device)
 
-        mean_72d = subset_271d_to_72d(self.mean)
-        std_72d = subset_271d_to_72d(self.std)
-        return (flow_output - mean_72d) / std_72d
+        mean_68d = torch.cat(
+            [
+                self.mean[0:3],
+                torch.zeros(2, device=flow_output.device, dtype=flow_output.dtype),
+                self.mean[6:69],
+            ],
+            dim=0,
+        )
+        std_68d = torch.cat(
+            [
+                self.std[0:3],
+                torch.ones(2, device=flow_output.device, dtype=flow_output.dtype),
+                self.std[6:69],
+            ],
+            dim=0,
+        )
+        return (flow_output - mean_68d) / std_68d
 
 
 def sequence_joints_to_features(
@@ -786,19 +891,19 @@ def flow_output_to_positions(
     prev_root_rot_6d: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Reconstruct global joint positions from FlowMatchingPredictor output (72D).
+    Reconstruct global joint positions from reduced predictor output (68D).
 
-    FlowMatchingPredictor output format (72D):
-        [0:9]   Root features: height (1D) + velocity (2D) + rotation_6d (6D)
-        [9:72]  Joint RIC positions: 21 non-root joints x 3D = 63D
+    Reduced predictor output format (68D):
+        [0:5]   Root features: height (1D) + velocity (2D) + sin(dyaw), cos(dyaw)
+        [5:68]  Joint RIC positions: 21 non-root joints x 3D = 63D
 
     This function is designed for autoregressive generation where:
     - Root position is updated using predicted velocity
-    - Root rotation comes from the prediction
+    - Root rotation is integrated from previous yaw + predicted delta yaw
     - Joint positions are reconstructed from RIC
 
     Args:
-        flow_output: FlowMatchingPredictor output (B, 72)
+        flow_output: FlowMatchingPredictor output (B, 68)
         prev_root_pos: Previous frame root position (B, 3)
         prev_root_rot_6d: Previous frame root rotation in 6D (B, 6)
 
@@ -809,13 +914,13 @@ def flow_output_to_positions(
     device = flow_output.device
     dtype = flow_output.dtype
 
-    # Extract root features (9D)
+    # Extract root features (5D)
     root_height = flow_output[:, 0:1]  # (B, 1)
     root_vel = flow_output[:, 1:3]  # (B, 2) - velocity X, Z
-    root_rot_6d = flow_output[:, 3:9]  # (B, 6)
+    root_delta_yaw = flow_output[:, 3:5]  # (B, 2) - sin(dyaw), cos(dyaw)
 
     # Extract joint RIC positions (63D -> 21 joints x 3D)
-    joint_ric = flow_output[:, 9:72].reshape(B, 21, 3)  # (B, 21, 3)
+    joint_ric = flow_output[:, 5:68].reshape(B, 21, 3)  # (B, 21, 3)
 
     # Reconstruct root position
     # Height is absolute, X and Z are updated by velocity
@@ -824,7 +929,13 @@ def flow_output_to_positions(
     new_root_z = prev_root_pos[:, 2:3] + root_vel[:, 1:2]  # Z from velocity
     new_root_pos = torch.cat([new_root_x, new_root_y, new_root_z], dim=-1)  # (B, 3)
 
-    # Convert root rotation to quaternion
+    # Integrate root yaw from the previous frame.
+    prev_root_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
+    delta_yaw = sin_cos_to_yaw(root_delta_yaw)
+    root_yaw = _wrap_angle(prev_root_yaw + delta_yaw)
+    root_rot_6d = yaw_to_root_rot6d(root_yaw)
+
+    # Convert integrated root rotation to quaternion
     root_quat = cont6d_to_quaternion(root_rot_6d)  # (B, 4)
 
     # Reconstruct joint positions from RIC
@@ -848,17 +959,17 @@ def flow_output_to_displacements(
     flow_output: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Extract joint displacements from FlowMatchingPredictor output (72D).
+    Extract joint displacements from reduced predictor output (68D).
 
     This is a simpler interpretation where the output represents
     per-joint displacements that can be added to current positions.
 
-    FlowMatchingPredictor output format (72D):
-        [0:9]   Root features: height (1D) + velocity (2D) + rotation_6d (6D)
-        [9:72]  Joint RIC positions: 21 non-root joints x 3D = 63D
+    Reduced predictor output format (68D):
+        [0:5]   Root features: height (1D) + velocity (2D) + sin(dyaw), cos(dyaw)
+        [5:68]  Joint RIC positions: 21 non-root joints x 3D = 63D
 
     Args:
-        flow_output: FlowMatchingPredictor output (B, 72)
+        flow_output: FlowMatchingPredictor output (B, 68)
 
     Returns:
         Joint displacements (B, 22, 3) - can be added to current positions
@@ -874,7 +985,7 @@ def flow_output_to_displacements(
     root_disp = torch.cat([root_disp_x, root_disp_y, root_disp_z], dim=-1)  # (B, 3)
 
     # Extract joint RIC as displacements
-    joint_disps = flow_output[:, 9:72].reshape(B, 21, 3)  # (B, 21, 3)
+    joint_disps = flow_output[:, 5:68].reshape(B, 21, 3)  # (B, 21, 3)
 
     # Combine: root displacement at index 0, then 21 joint displacements
     # Note: For joint 0 (root), we use the root displacement
@@ -886,25 +997,36 @@ def flow_output_to_displacements(
     return displacements
 
 
-def extract_prev_frame_features(frame: torch.Tensor) -> torch.Tensor:
+def extract_prev_frame_features(
+    frame: torch.Tensor,
+    normalizer: Optional["FeatureNormalizer"] = None,
+) -> torch.Tensor:
     """
-    Extract 261D features from 271D previous frame.
+    Extract the 257D causal conditioning features from a 271D frame.
 
-    261D Output Format:
-        [0:9]     Root: height(1) + vel(2) + rot_6d(6)
-        [9:261]   Joints: 21 x 12D (RIC + rot + vel) = 252D
+    257D Output Format:
+        [0:5]     Root: height(1) + vel(2) + sin(yaw), cos(yaw)
+        [5:257]   Joints: 21 x 12D (RIC + rot + vel) = 252D
 
     Args:
-        frame: (B, 271) single frame in RAW format
+        frame: (B, 271) single frame in raw or normalized feature space.
+        normalizer: Optional canonical feature normalizer. When provided, root yaw
+            is recovered from the denormalized root 6D rotation while the other
+            slices preserve the input feature scale.
 
     Returns:
-        features: (B, 261)
+        features: (B, 257)
     """
-    # Root features (9D): height + velocity + rotation
+    if frame.ndim != 2 or frame.shape[-1] != 271:
+        raise ValueError(f"Expected frame shape (B, 271), got {tuple(frame.shape)}")
+
+    raw_frame = normalizer.denormalize(frame) if normalizer is not None else frame
+
+    # Root features (5D): height + velocity + yaw sin/cos
     root_height = frame[:, 0:1]
     root_vel = frame[:, 1:3]
-    root_rot6d = frame[:, 69:75]
-    root_features = torch.cat([root_height, root_vel, root_rot6d], dim=-1)  # (B, 9)
+    root_yaw = root_rot6d_to_yaw_sin_cos(raw_frame[:, 69:75])
+    root_features = torch.cat([root_height, root_vel, root_yaw], dim=-1)  # (B, 5)
 
     # Joint features: 21 joints x 12D each (RIC + rotation + velocity)
     # RIC: [6:69] = 63D for 21 joints
@@ -916,11 +1038,11 @@ def extract_prev_frame_features(frame: torch.Tensor) -> torch.Tensor:
 
     joint_features = torch.cat([joint_ric, joint_rot, joint_vel], dim=-1)  # (B, 252)
 
-    return torch.cat([root_features, joint_features], dim=-1)  # (B, 261)
+    return torch.cat([root_features, joint_features], dim=-1)  # (B, 257)
 
 
 def flow_output_to_271d(
-    flow_output: torch.Tensor,  # (B, 72)
+    flow_output: torch.Tensor,  # (B, 68)
     prev_frame: torch.Tensor,  # (B, 271)
     prev_root_pos: torch.Tensor,  # (B, 3)  <-- tracked externally
     dataset_type: str = "t2m",
@@ -957,8 +1079,8 @@ def flow_output_to_271d(
     # -------------------------------------------------
     root_height = flow_output[:, 0:1]  # (B,1)
     root_vel = flow_output[:, 1:3]  # (B,2)
-    root_rot_6d = flow_output[:, 3:9]  # (B,6)
-    joint_ric_21 = flow_output[:, 9:72].reshape(B, 21, 3)
+    root_delta_yaw = flow_output[:, 3:5]  # (B,2)
+    joint_ric_21 = flow_output[:, 5:68].reshape(B, 21, 3)
 
     # -------------------------------------------------
     # 2. Update absolute root position (incremental)
@@ -991,6 +1113,10 @@ def flow_output_to_271d(
     # -------------------------------------------------
     # 5. Reconstruct new positions
     # -------------------------------------------------
+    prev_root_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
+    delta_yaw = sin_cos_to_yaw(root_delta_yaw)
+    root_yaw = _wrap_angle(prev_root_yaw + delta_yaw)
+    root_rot_6d = yaw_to_root_rot6d(root_yaw)
     root_quat = cont6d_to_quaternion(root_rot_6d)
     root_quat_exp = root_quat.unsqueeze(1).expand(-1, 21, -1)
 
