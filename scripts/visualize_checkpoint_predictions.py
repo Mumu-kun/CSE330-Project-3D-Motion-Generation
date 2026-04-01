@@ -71,7 +71,7 @@ def _load_long_sample(
             f"No sample in {DATASET_PATH} is long enough for horizon={config.horizon}."
         )
 
-    sample_index = int(candidate_indices[-1])
+    sample_index = int(candidate_indices[-3])
     sample_name = dataset.name_list[sample_index]
     sample_len = int(dataset.data_dict[sample_name]["length"])
 
@@ -214,7 +214,7 @@ def main() -> None:
     motion_norm = normalizer.normalize(motion_raw)
 
     horizon = int(config.horizon)
-    predictor_steps = 50
+    predictor_steps = 3
     inference_steps = max(
         1,
         int(getattr(config, "num_inference_steps", predictor_steps)),
@@ -254,13 +254,13 @@ def main() -> None:
             f"Sample '{sample_name}' length {sample_len} is not longer than horizon {horizon}."
         )
 
-    seed_positions = joints[:, :horizon]
-    rollout_frames = sample_len - horizon
+    seed_positions = joints[:, :10]
+    rollout_frames = sample_len - 10
     with torch.no_grad():
         rollout_positions, _, _ = generator.generate_sequence(
             text=text_clip,
             num_frames=rollout_frames,
-            num_steps=inference_steps,
+            num_steps=predictor_steps,
             horizon=horizon,
             input_positions=seed_positions,
             guidance_scale=1.0,

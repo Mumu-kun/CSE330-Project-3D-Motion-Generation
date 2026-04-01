@@ -18,6 +18,7 @@ Redesigned training mechanism:
 
 import copy
 import csv
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -404,15 +405,16 @@ class Trainer:
         self.training_state: Dict[str, Any] = {}
         self.curriculum_state: Dict[str, Any] = {}
         self._latest_flow_diagnostics: Optional[Dict[str, torch.Tensor]] = None
+        self._checkpoint_flow_diagnostics: Optional[Dict[str, torch.Tensor]] = None
         self.start_epoch = 0
         self.device_str = str(config.device)
         self.use_amp = False
         self.amp_dtype = torch.float32
 
-    def _compute_rollout_probability(self, epoch: int) -> float:
-        """Compute rollout probability with an epoch-level warmup window."""
+    def _compute_post_warmup_progress(self, epoch: int) -> float | None:
+        """Return rollout-schedule progress after warmup, or None during warmup."""
         if self.config.num_epochs <= 1:
-            return float(self.config.rollout_prob_end)
+            return 1.0
 
         progress = float(epoch) / float(self.config.num_epochs - 1)
         progress = max(0.0, min(1.0, progress))
@@ -422,19 +424,23 @@ class Trainer:
         )
 
         if warmup_fraction <= 0.0:
-            return float(self.config.rollout_prob_start) + (
-                (
-                    float(self.config.rollout_prob_end)
-                    - float(self.config.rollout_prob_start)
-                )
-                * progress
-            )
-
+            return progress
         if progress <= warmup_fraction:
+            return None
+        return max(
+            0.0,
+            min(1.0, (progress - warmup_fraction) / (1.0 - warmup_fraction)),
+        )
+
+    def _compute_rollout_probability(self, epoch: int) -> float:
+        """Compute rollout probability with an epoch-level warmup window."""
+        if self.config.num_epochs <= 1:
+            return float(self.config.rollout_prob_end)
+
+        schedule_progress = self._compute_post_warmup_progress(epoch)
+        if schedule_progress is None:
             return 0.0
 
-        schedule_progress = (progress - warmup_fraction) / (1.0 - warmup_fraction)
-        schedule_progress = max(0.0, min(1.0, schedule_progress))
         return float(self.config.rollout_prob_start) + (
             (
                 float(self.config.rollout_prob_end)
@@ -442,6 +448,64 @@ class Trainer:
             )
             * schedule_progress
         )
+
+    def _compute_rollout_block_length(self, epoch: int) -> int:
+        """Compute the scheduled contiguous rollout block length for this epoch."""
+        start = max(1, int(self.config.rollout_block_len_start))
+        end = max(start, int(self.config.rollout_block_len_end))
+
+        if self.config.num_epochs <= 1:
+            return end
+
+        schedule_progress = self._compute_post_warmup_progress(epoch)
+        if schedule_progress is None:
+            return start
+
+        scheduled_length = start + (end - start) * schedule_progress
+        rounded_length = int(math.floor(scheduled_length + 0.5))
+        return max(start, min(end, rounded_length))
+
+    def _compute_t_sampling_power(self, epoch: int) -> float:
+        """Compute the effective high-t power-law exponent for this epoch."""
+        if self.config.t_sampling_mode != "power":
+            return 0.0
+
+        target_power = max(0.0, float(self.config.t_sampling_power))
+        if target_power == 0.0 or self.config.num_epochs <= 1:
+            return target_power
+
+        warmup_fraction = min(
+            max(float(self.config.t_sampling_power_warmup_fraction), 0.0),
+            1.0,
+        )
+        if warmup_fraction <= 0.0:
+            return target_power
+
+        progress = float(epoch) / float(self.config.num_epochs - 1)
+        progress = max(0.0, min(1.0, progress))
+        if progress >= warmup_fraction:
+            return target_power
+
+        return target_power * (progress / warmup_fraction)
+
+    def _sample_training_timesteps(
+        self,
+        batch_size: int,
+        device: Union[str, torch.device],
+        dtype: torch.dtype,
+        epoch: int,
+    ) -> torch.Tensor:
+        """Sample training timesteps according to the configured PDF."""
+        u = torch.rand(batch_size, device=device, dtype=dtype)
+        if self.config.t_sampling_mode == "uniform":
+            return u
+
+        power = self._compute_t_sampling_power(epoch)
+        if power <= 0.0:
+            return u
+
+        # Inverse CDF for p(t) = (k + 1) * t^k on [0, 1].
+        return u.pow(1.0 / (power + 1.0))
 
     @classmethod
     def _build_models_from_config(
@@ -630,6 +694,10 @@ class Trainer:
         """Directory for offline loss-vs-t diagnostics artifacts."""
         return Path(self.config.output_path) / "diagnostics" / "loss_vs_t"
 
+    def _loss_vs_t_checkpoint_output_dir(self, filename: str) -> Path:
+        """Directory for loss-vs-t artifacts associated with a checkpoint file."""
+        return self._loss_vs_t_output_dir() / "checkpoints" / Path(filename).stem
+
     def save_training_checkpoint(
         self,
         filename: str,
@@ -671,6 +739,17 @@ class Trainer:
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
 
+        diagnostics = self._checkpoint_flow_diagnostics
+        if diagnostics is not None:
+            write_loss_vs_t_epoch_artifacts(
+                output_dir=self._loss_vs_t_checkpoint_output_dir(filename),
+                epoch=epoch,
+                global_steps=diagnostics["global_steps"],
+                t_values=diagnostics["t"],
+                per_sample_flow_loss=diagnostics["per_sample_flow_loss"],
+                num_bins=LOSS_VS_T_NUM_BINS,
+            )
+
     def incremental_flow_loss(
         self,
         batch: Dict[str, Any],
@@ -682,6 +761,7 @@ class Trainer:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float]:
         enc = encoder if encoder is not None else self.encoder
         pred_model = predictor if predictor is not None else self.predictor
+        del stochastic_rollout
         device = self.device
         self._latest_flow_diagnostics = None
 
@@ -722,9 +802,11 @@ class Trainer:
             context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
 
         rollout_prob = self._compute_rollout_probability(epoch)
+        rollout_block_len = self._compute_rollout_block_length(epoch)
         ode_steps = max(1, int(self.config.rollout_integration_steps))
         dt = 1.0 / float(ode_steps)
         current_positions = hist_joints[:, 0].detach().clone()
+        rollout_steps_remaining = torch.zeros(B, dtype=torch.long, device=device)
         flow_contexts: list[torch.Tensor] = []
         flow_current_frame_features: list[torch.Tensor] = []
         flow_x0: list[torch.Tensor] = []
@@ -743,7 +825,12 @@ class Trainer:
                 normalizer=self.normalizer,
             )
             x0 = torch.randn_like(x1)
-            t = torch.rand(B, device=device, dtype=x1.dtype)
+            t = self._sample_training_timesteps(
+                batch_size=B,
+                device=device,
+                dtype=x1.dtype,
+                epoch=epoch,
+            )
             t_ = t.view(B, 1)
             xt = t_ * x1 + (1 - t_) * x0
             flow_contexts.append(context)
@@ -754,20 +841,27 @@ class Trainer:
             flow_t.append(t)
 
             p = float(max(0.0, min(1.0, rollout_prob)))
-            if p == 0.0:
-                rollout_mask = torch.zeros(B, dtype=torch.bool, device=device)
-            elif p == 1.0:
-                rollout_mask = torch.ones(B, dtype=torch.bool, device=device)
-            elif stochastic_rollout:
-                rollout_mask = torch.rand(B, device=device) < p
-            else:
-                threshold = max(1, int(round(p * B)))
-                rollout_mask = torch.arange(B, device=device) < threshold
+            active_rollout_mask = rollout_steps_remaining > 0
+            eligible_mask = ~active_rollout_mask
+            if p > 0.0 and eligible_mask.any():
+                if p >= 1.0:
+                    start_mask = eligible_mask
+                else:
+                    start_mask = eligible_mask & (torch.rand(B, device=device) < p)
+                if start_mask.any():
+                    rollout_steps_remaining[start_mask] = rollout_block_len
+            rollout_mask = rollout_steps_remaining > 0
+
             next_input = target_motion[:, step_idx].clone()
             if rollout_mask.any():
+                active_indices = rollout_mask.nonzero(as_tuple=False).squeeze(-1)
+                active_context = context[active_indices]
+                active_current_frame_features = current_frame_features[active_indices]
+                active_text_for_encoder = text_for_encoder[active_indices]
+                active_current_positions = current_positions[active_indices]
                 predictor_was_training = pred_model.training
                 pred_model.eval()
-                x_t_roll = torch.randn_like(x1)
+                x_t_roll = torch.randn_like(x1[active_indices])
                 try:
                     with timer(self.timing_stats, "forward/rollout_ode"):
                         with torch.no_grad():
@@ -776,16 +870,16 @@ class Trainer:
                                     self.timing_stats, "forward/rollout_ode_step"
                                 ):
                                     tau = torch.full(
-                                        (B,),
+                                        (active_indices.numel(),),
                                         float(ode_step) * dt,
                                         device=device,
                                     )
                                     pred_roll = pred_model.forward(
-                                        track_features=context,
+                                        track_features=active_context,
                                         noisy_features=x_t_roll,
                                         timesteps=tau,
-                                        current_frame_features=current_frame_features,
-                                        text_embedding=text_for_encoder,
+                                        current_frame_features=active_current_frame_features,
+                                        text_embedding=active_text_for_encoder,
                                         output_attentions=False,
                                         output_hidden_states=False,
                                     )[0]
@@ -800,30 +894,33 @@ class Trainer:
                         if self.normalizer is not None
                         else x_t_roll
                     )
+                    current_frame_active = current_frame[active_indices]
                     current_frame_raw = (
-                        self.normalizer.denormalize(current_frame)
+                        self.normalizer.denormalize(current_frame_active)
                         if self.normalizer is not None
-                        else current_frame
+                        else current_frame_active
                     )
                     pred_positions_roll = flow_output_to_positions(
                         x_t_roll_raw,
-                        prev_root_pos=current_positions[:, 0],
+                        prev_root_pos=active_current_positions[:, 0],
                         prev_root_rot_6d=current_frame_raw[:, 69:75],
                     )
                     rollout_frame, _, _ = generated_positions_to_271d(
                         new_positions=pred_positions_roll,
-                        prev_positions=current_positions,
+                        prev_positions=active_current_positions,
                         dataset_type="t2m",
                         normalizer=self.normalizer,
                     )
 
-                next_input[rollout_mask] = rollout_frame[rollout_mask]
+                next_input[active_indices] = rollout_frame
 
                 next_positions = target_joints[:, step_idx].clone()
-                next_positions[rollout_mask] = pred_positions_roll[rollout_mask]
+                next_positions[active_indices] = pred_positions_roll
                 current_positions = next_positions.detach()
             else:
                 current_positions = target_joints[:, step_idx].detach()
+
+            rollout_steps_remaining[rollout_mask] -= 1
 
             current_frame = next_input.detach()
 
@@ -976,6 +1073,7 @@ class Trainer:
                             f"horizon {prev_horizon} -> {self.curriculum_state['current_horizon']}"
                         )
 
+                self._checkpoint_flow_diagnostics = None
                 epoch_loss = 0.0
                 num_batches = 0
                 pred_horizon = 1
@@ -1153,14 +1251,11 @@ class Trainer:
                 pbar.close()
                 avg_epoch_loss = epoch_loss / max(1, num_batches)
                 if epoch_diag_t and epoch_diag_loss and epoch_diag_steps:
-                    write_loss_vs_t_epoch_artifacts(
-                        output_dir=self._loss_vs_t_output_dir(),
-                        epoch=epoch,
-                        global_steps=torch.cat(epoch_diag_steps),
-                        t_values=torch.cat(epoch_diag_t),
-                        per_sample_flow_loss=torch.cat(epoch_diag_loss),
-                        num_bins=LOSS_VS_T_NUM_BINS,
-                    )
+                    self._checkpoint_flow_diagnostics = {
+                        "global_steps": torch.cat(epoch_diag_steps),
+                        "t": torch.cat(epoch_diag_t),
+                        "per_sample_flow_loss": torch.cat(epoch_diag_loss),
+                    }
                 tqdm.write(f"==> End of Epoch {epoch}: Avg Loss = {avg_epoch_loss:.6f}")
 
                 val_metrics: dict = {}

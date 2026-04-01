@@ -646,6 +646,95 @@ class FlowMatchingPredictor(nn.Module):
         )
 
 
+def _build_inference_time_boundaries(
+    num_steps: int,
+    *,
+    power: float,
+    device: torch.device | str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Build end-biased ODE boundaries on [0, 1] using t = 1 - (1 - s)^p."""
+    steps = max(1, int(num_steps))
+    s = torch.linspace(0.0, 1.0, steps=steps + 1, device=device, dtype=dtype)
+    return 1.0 - (1.0 - s).pow(power)
+
+
+def integrate_flow_ode(
+    *,
+    predictor: FlowMatchingPredictor,
+    track_features: torch.Tensor,
+    current_frame_features: torch.Tensor,
+    text_embedding: torch.Tensor,
+    num_steps: int,
+    time_schedule_power: float = 2.0,
+    initial_state: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Integrate the inference-time flow ODE using an end-biased power grid and Heun.
+    """
+    batch_size = track_features.shape[0]
+    device = track_features.device
+    dtype = track_features.dtype
+    if time_schedule_power <= 0.0:
+        raise ValueError(
+            "time_schedule_power must be positive, got "
+            f"{time_schedule_power}"
+        )
+
+    if initial_state is None:
+        x_t = torch.randn(
+            (batch_size, predictor.flow_dim),
+            device=device,
+            dtype=dtype,
+        )
+    else:
+        if initial_state.shape != (batch_size, predictor.flow_dim):
+            raise ValueError(
+                "Expected initial_state shape "
+                f"({batch_size}, {predictor.flow_dim}), got {tuple(initial_state.shape)}"
+            )
+        x_t = initial_state.to(device=device, dtype=dtype)
+
+    tau = _build_inference_time_boundaries(
+        num_steps,
+        power=float(time_schedule_power),
+        device=device,
+        dtype=dtype,
+    )
+
+    for step in range(tau.shape[0] - 1):
+        t_start = tau[step]
+        t_end = tau[step + 1]
+        dt = t_end - t_start
+
+        t_start_batch = t_start.expand(batch_size)
+        k1 = predictor(
+            track_features=track_features,
+            noisy_features=x_t,
+            timesteps=t_start_batch,
+            current_frame_features=current_frame_features,
+            text_embedding=text_embedding,
+            output_attentions=False,
+            output_hidden_states=False,
+        )[0]
+
+        x_euler = x_t + dt * k1
+        t_end_batch = t_end.expand(batch_size)
+        k2 = predictor(
+            track_features=track_features,
+            noisy_features=x_euler,
+            timesteps=t_end_batch,
+            current_frame_features=current_frame_features,
+            text_embedding=text_embedding,
+            output_attentions=False,
+            output_hidden_states=False,
+        )[0]
+
+        x_t = x_t + 0.5 * dt * (k1 + k2)
+
+    return x_t
+
+
 class HumanMotionGenerator:
     """
     Top-level wrapper for the Human Motion Generation pipeline.
@@ -847,26 +936,14 @@ class HumanMotionGenerator:
                 # Step C: Flow matching ODE loop
                 # x_t starts as random noise in normalized reduced flow space.
                 # ========================================
-                x_t = torch.randn((B, self.predictor.flow_dim), device=device)
-                dt = 1.0 / num_steps
-
-                # N-step flow matching in tokenized reduced flow space.
-                for step in range(num_steps):
-                    t = torch.full((B,), step * dt, device=device)
-
-                    flow_output = self.predictor.forward(
-                        track_features=context_cond,
-                        noisy_features=x_t,
-                        timesteps=t,
-                        current_frame_features=current_frame_features,
-                        text_embedding=text_emb,
-                        output_attentions=False,
-                        output_hidden_states=False,
-                    )
-
-                    # Unpack tuple: (flow_prediction, hidden_states, attentions)
-                    pred = flow_output[0]
-                    x_t = x_t + pred * dt
+                x_t = integrate_flow_ode(
+                    predictor=self.predictor,
+                    track_features=context_cond,
+                    current_frame_features=current_frame_features,
+                    text_embedding=text_emb,
+                    num_steps=num_steps,
+                    time_schedule_power=self.config.inference_t_schedule_power,
+                )
 
                 # ========================================
                 # Step E: Convert reduced-state prediction -> positions -> 271D (incremental)

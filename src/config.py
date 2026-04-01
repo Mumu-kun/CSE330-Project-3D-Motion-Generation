@@ -91,8 +91,8 @@ class Config:
     # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
     predictor_config: FlowMatchingPredictorConfig = field(
         default_factory=lambda: FlowMatchingPredictorConfig(
-            hidden_size=64,
-            intermediate_size=3 * 64,
+            hidden_size=96,
+            intermediate_size=4 * 96,
             num_hidden_layers=4,
             num_attention_heads=8,
             hidden_act="silu",
@@ -108,34 +108,43 @@ class Config:
     # Training settings
     batch_size: int = 200
     learning_rate: float = 1e-4
-    num_epochs: int = 200
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
     ema_decay: float = 0.999
-
-    horizon: int = 40  # Maximum/target horizon for training
 
     # Curriculum learning settings
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 5, "epochs": 60},
-            {"horizon": 10, "epochs": 80},
-            {"horizon": 20, "epochs": 120},
-            {"horizon": 40, "epochs": 200},
+            {"horizon": 5, "epochs": 100},
+            {"horizon": 10, "epochs": 200},
+            {"horizon": 20, "epochs": 400},
+            {"horizon": 40, "epochs": 800},
         ]
     )
 
+    horizon: int = 40  # Maximum/target horizon for training
+    _num_epochs: int = 200
+
     # CFG (Classifier-Free Guidance) settings
     cfg_dropout: float = 0  # Dropout probability for CFG
+
+    # Training-time timestep sampling
+    t_sampling_mode: str = "power"  # "uniform" or "power"
+    t_sampling_power: float = 2.0  # Power-law exponent k in p(t)=(k+1)t^k
+    t_sampling_power_warmup_fraction: float = (
+        0.25  # Fraction of training used to ramp k from 0 to target
+    )
 
     use_fk: bool = False  # Whether to compute FK loss during training
     # Rollout scheduling settings
     rollout_prob_start: float = 0.0  # Rollout probability at first epoch
     rollout_prob_end: float = 0.5  # Rollout probability at final epoch
     rollout_warmup_fraction: float = (
-        0.1  # Fraction of training with rollout disabled before schedule starts
+        0.5  # Fraction of training with rollout disabled before schedule starts
     )
+    rollout_block_len_start: int = 1  # Rollout block length at schedule start
+    rollout_block_len_end: int = 8  # Rollout block length at schedule end
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )
@@ -155,6 +164,9 @@ class Config:
 
     # Inference settings
     num_inference_steps: int = 20  # Number of flow matching steps
+    inference_t_schedule_power: float = (
+        3.0  # End-bias power p in t=1-(1-s)^p for inference ODE time boundaries
+    )
     guidance_scale: float = 1.0  # CFG scale for inference
 
     # Validation settings
@@ -170,10 +182,34 @@ class Config:
     unit_length = 5
 
     def __post_init__(self):
-        """Create necessary directories."""
+        self.t_sampling_mode = str(self.t_sampling_mode).lower()
+        if self.t_sampling_mode not in {"uniform", "power"}:
+            raise ValueError(
+                "t_sampling_mode must be 'uniform' or 'power', got "
+                f"{self.t_sampling_mode!r}"
+            )
+        self.t_sampling_power = max(0.0, float(self.t_sampling_power))
+        self.t_sampling_power_warmup_fraction = min(
+            max(float(self.t_sampling_power_warmup_fraction), 0.0),
+            1.0,
+        )
         self.rollout_warmup_fraction = min(
             max(float(self.rollout_warmup_fraction), 0.0),
             1.0 - 1e-6,
+        )
+        self.rollout_block_len_start = max(1, int(self.rollout_block_len_start))
+        self.rollout_block_len_end = max(
+            self.rollout_block_len_start,
+            int(self.rollout_block_len_end),
+        )
+        self.inference_t_schedule_power = float(self.inference_t_schedule_power)
+        if self.inference_t_schedule_power <= 0.0:
+            raise ValueError(
+                "inference_t_schedule_power must be positive, got "
+                f"{self.inference_t_schedule_power}"
+            )
+        self.num_epochs = (
+            self.curriculum[-1]["epochs"] if self.curriculum else self._num_epochs
         )
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)

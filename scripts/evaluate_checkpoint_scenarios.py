@@ -72,7 +72,10 @@ def _numeric_keys(rows: list[dict[str, Any]]) -> list[str]:
     keys: list[str] = []
     for key in rows[0].keys():
         values = [row.get(key) for row in rows]
-        if all(isinstance(value, (int, float, np.floating)) and not isinstance(value, bool) for value in values):
+        if all(
+            isinstance(value, (int, float, np.floating)) and not isinstance(value, bool)
+            for value in values
+        ):
             keys.append(key)
     return keys
 
@@ -257,7 +260,8 @@ def _run_mixed_teacher_force_rollout(
             )
             gt_next_positions = joints[:, frame_idx + 1]
             use_teacher_force = bool(
-                torch.rand(1, device=joints.device).item() < float(scenario.teacher_force_prob)
+                torch.rand(1, device=joints.device).item()
+                < float(scenario.teacher_force_prob)
             )
             teacher_force_mask.append(use_teacher_force)
             next_positions = gt_next_positions if use_teacher_force else pred_positions
@@ -350,12 +354,16 @@ def aggregate_scenario_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, A
             "sample_ids": [str(row["sample_id"]) for row in scenario_rows],
         }
         for key in numeric_keys:
-            aggregate[key] = float(np.mean([_to_float(row[key]) for row in scenario_rows]))
+            aggregate[key] = float(
+                np.mean([_to_float(row[key]) for row in scenario_rows])
+            )
         scenario_aggregates[scenario_name] = aggregate
     return scenario_aggregates
 
 
-def aggregate_top_joints(per_joint_rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def aggregate_top_joints(
+    per_joint_rows: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
     grouped: dict[str, dict[int, list[float]]] = {}
     for row in per_joint_rows:
         scenario_name = str(row["scenario"])
@@ -420,7 +428,9 @@ def render_report(summary: dict[str, Any]) -> str:
     findings: list[str] = []
     improvements: list[str] = []
 
-    if rollout["joint_l2_mean"] > max(teacher["joint_l2_mean"] * 3.0, teacher["joint_l2_mean"] + 0.1):
+    if rollout["joint_l2_mean"] > max(
+        teacher["joint_l2_mean"] * 3.0, teacher["joint_l2_mean"] + 0.1
+    ):
         findings.append(
             "Rollout drift dominates: `rollout_default` is much worse than "
             f"`teacher_forced_one_step` ({rollout['joint_l2_mean']:.4f} vs {teacher['joint_l2_mean']:.4f})."
@@ -465,12 +475,16 @@ def render_report(summary: dict[str, Any]) -> str:
 
     root_ratio = rollout["root_l2_mean"] / max(rollout["nonroot_joint_l2_mean"], 1e-8)
     if root_ratio > 1.2:
-        findings.append("Root motion errors are larger than non-root errors in `rollout_default`.")
+        findings.append(
+            "Root motion errors are larger than non-root errors in `rollout_default`."
+        )
         improvements.append(
             "Inspect root velocity and delta-yaw behavior, since root motion is likely amplifying downstream drift."
         )
     elif root_ratio < (1.0 / 1.2):
-        findings.append("Non-root articulation errors dominate over root motion in `rollout_default`.")
+        findings.append(
+            "Non-root articulation errors dominate over root motion in `rollout_default`."
+        )
         improvements.append(
             "Inspect limb articulation quality and the joints with the highest rollout error before adjusting root-motion losses."
         )
@@ -479,7 +493,9 @@ def render_report(summary: dict[str, Any]) -> str:
     if not findings:
         findings.append("No single failure mode dominated the default scenario matrix.")
     if not improvements:
-        improvements.append("The evaluator did not detect a dominant correction path; inspect per-sample outputs directly.")
+        improvements.append(
+            "The evaluator did not detect a dominant correction path; inspect per-sample outputs directly."
+        )
 
     lines = [
         "# Checkpoint Scenario Evaluation",
@@ -629,7 +645,9 @@ def run_checkpoint_scenario_evaluation(
                 "teacher_forced_one_step",
                 "rollout_default",
             }:
-                representative_sequences[scenario.name] = predicted_unbatched.detach().cpu()
+                representative_sequences[scenario.name] = (
+                    predicted_unbatched.detach().cpu()
+                )
 
     apply_teacher_forced_deltas(scenario_rows)
     scenario_aggregates = aggregate_scenario_rows(scenario_rows)
@@ -699,7 +717,7 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional output directory. Defaults to output/checkpoint_evaluation/<checkpoint_stem>.",
     )
-    parser.add_argument("--split", default="test", help="Dataset split to evaluate.")
+    parser.add_argument("--split", default="val", help="Dataset split to evaluate.")
     parser.add_argument(
         "--num-samples",
         type=int,
@@ -735,7 +753,9 @@ def main() -> None:
         seed=args.seed,
         render_videos=not args.skip_videos,
     )
-    print(f"Wrote evaluation bundle to {args.output_dir or 'default output directory'}.")
+    print(
+        f"Wrote evaluation bundle to {args.output_dir or 'default output directory'}."
+    )
     print(json.dumps(summary["scenario_aggregates"], indent=2))
 
 
