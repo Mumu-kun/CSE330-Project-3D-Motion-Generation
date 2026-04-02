@@ -9,12 +9,16 @@ import torch
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config import Config
+import utils.train_utils as train_utils
 from utils.motion_utils import (  # noqa: E402
     FeatureNormalizer,
+    extract_prev_frame_features,
     features_to_positions,
+    flow_output_to_positions,
     generated_positions_to_271d,
     get_fk_offsets,
     sequence_joints_to_features,
+    subset_271d_to_72d,
 )
 from utils.train_utils import Trainer  # noqa: E402
 
@@ -66,48 +70,51 @@ class RecordingPredictor(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
-        self.recorded_prev_relative_shifts: list[torch.Tensor] = []
+        self.flow_dim = 68
+        self.recorded_current_frame_features: list[torch.Tensor] = []
         self.recorded_batch_sizes: list[int] = []
 
     def forward(
         self,
-        noised_tracks: torch.Tensor,
+        noisy_features: torch.Tensor,
         timesteps: torch.Tensor,
         text_embedding: torch.Tensor,
         track_features: torch.Tensor,
-        prev_relative_shifts: torch.Tensor | None = None,
-        output_attentions: bool = False,
-        output_hidden_states: bool = False,
-        **kwargs,
-    ) -> tuple[torch.Tensor, None, None]:
-        self.recorded_batch_sizes.append(int(noised_tracks.shape[0]))
-        if prev_relative_shifts is not None:
-            self.recorded_prev_relative_shifts.append(
-                prev_relative_shifts.detach().clone()
-            )
-        # One Euler step with dt=1 should land exactly at zero displacement.
-        return -noised_tracks + self.anchor.view(1, 1, 1) * 0, None, None
-
-
-class ZeroPredictor(RecordingPredictor):
-    def forward(
-        self,
-        noised_tracks: torch.Tensor,
-        timesteps: torch.Tensor,
-        text_embedding: torch.Tensor,
-        track_features: torch.Tensor,
-        prev_relative_shifts: torch.Tensor | None = None,
+        current_frame_features: torch.Tensor,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, None, None]:
         del timesteps, text_embedding, track_features, output_attentions, output_hidden_states, kwargs
-        self.recorded_batch_sizes.append(int(noised_tracks.shape[0]))
-        if prev_relative_shifts is not None:
-            self.recorded_prev_relative_shifts.append(
-                prev_relative_shifts.detach().clone()
-            )
-        return torch.zeros_like(noised_tracks) + self.anchor.view(1, 1, 1) * 0, None, None
+        self.recorded_batch_sizes.append(int(noisy_features.shape[0]))
+        self.recorded_current_frame_features.append(
+            current_frame_features.detach().clone()
+        )
+        return -noisy_features + self.anchor.view(1, 1) * 0, None, None
+
+
+class ZeroPredictor(RecordingPredictor):
+    def forward(
+        self,
+        noisy_features: torch.Tensor,
+        timesteps: torch.Tensor,
+        text_embedding: torch.Tensor,
+        track_features: torch.Tensor,
+        current_frame_features: torch.Tensor,
+        output_attentions: bool = False,
+        output_hidden_states: bool = False,
+        **kwargs,
+    ) -> tuple[torch.Tensor, None, None]:
+        del timesteps, text_embedding, track_features, output_attentions, output_hidden_states, kwargs
+        self.recorded_batch_sizes.append(int(noisy_features.shape[0]))
+        self.recorded_current_frame_features.append(
+            current_frame_features.detach().clone()
+        )
+        return (
+            torch.zeros_like(noisy_features) + self.anchor.view(1, 1) * 0,
+            None,
+            None,
+        )
 
 
 class ZeroThenZeroEndpointPredictor(RecordingPredictor):
@@ -117,26 +124,33 @@ class ZeroThenZeroEndpointPredictor(RecordingPredictor):
 
     def forward(
         self,
-        noised_tracks: torch.Tensor,
+        noisy_features: torch.Tensor,
         timesteps: torch.Tensor,
         text_embedding: torch.Tensor,
         track_features: torch.Tensor,
-        prev_relative_shifts: torch.Tensor | None = None,
+        current_frame_features: torch.Tensor,
         output_attentions: bool = False,
         output_hidden_states: bool = False,
         **kwargs,
     ) -> tuple[torch.Tensor, None, None]:
         del text_embedding, track_features, output_attentions, output_hidden_states, kwargs
-        self.recorded_batch_sizes.append(int(noised_tracks.shape[0]))
-        if prev_relative_shifts is not None:
-            self.recorded_prev_relative_shifts.append(
-                prev_relative_shifts.detach().clone()
-            )
+        self.recorded_batch_sizes.append(int(noisy_features.shape[0]))
+        self.recorded_current_frame_features.append(
+            current_frame_features.detach().clone()
+        )
         self.forward_calls += 1
         if self.forward_calls == 2:
-            denom = (1 - timesteps.view(-1, 1, 1)).clamp(min=1e-6)
-            return (-noised_tracks / denom) + self.anchor.view(1, 1, 1) * 0, None, None
-        return torch.zeros_like(noised_tracks) + self.anchor.view(1, 1, 1) * 0, None, None
+            denom = (1 - timesteps.view(-1, 1)).clamp(min=1e-6)
+            return (
+                (-noisy_features / denom) + self.anchor.view(1, 1) * 0,
+                None,
+                None,
+            )
+        return (
+            torch.zeros_like(noisy_features) + self.anchor.view(1, 1) * 0,
+            None,
+            None,
+        )
 
 
 def _make_trainer(
@@ -274,7 +288,9 @@ def test_detect_degenerate_pose_mask_flags_absurd_step() -> None:
     assert torch.equal(mask, torch.tensor([True]))
 
 
-def test_incremental_flow_loss_rollout_writes_generated_history() -> None:
+def test_incremental_flow_loss_rollout_writes_generated_history(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gt_features, gt_positions = _load_sample("000070")
     base_motion = gt_features[1:5]
     base_joints = gt_positions[1:5]
@@ -283,21 +299,44 @@ def test_incremental_flow_loss_rollout_writes_generated_history() -> None:
 
     motion = torch.stack([base_motion, base_motion], dim=0)
     joints = torch.stack([base_joints, translated_joints], dim=0)
-    relative_shifts = torch.stack(
-        [
-            gt_positions[1:5] - gt_positions[0:4],
-            gt_positions[1:5] - gt_positions[0:4],
-        ],
-        dim=0,
-    )
     text_for_encoder = torch.zeros(2, 512)
 
     config = Config(device="cpu")
+    config.num_epochs = 2
     config.use_fk = False
     config.rollout_prob_start = 0.5
     config.rollout_prob_end = 0.5
     config.rollout_integration_steps = 1
     config.use_consistency_loss = False
+
+    rand_outputs = iter(
+        [
+            torch.tensor([0.25, 0.75], dtype=torch.float32),
+            torch.tensor([0.0, 0.9], dtype=torch.float32),
+            torch.tensor([0.30, 0.60], dtype=torch.float32),
+            torch.tensor([0.9, 0.9], dtype=torch.float32),
+        ]
+    )
+    original_rand = torch.rand
+
+    def fake_rand(*size, **kwargs):
+        if len(size) == 1 and isinstance(size[0], int) and size[0] == 2:
+            tensor = next(rand_outputs)
+            device = kwargs.get("device")
+            dtype = kwargs.get("dtype", tensor.dtype)
+            return tensor.to(device=device, dtype=dtype)
+        return original_rand(*size, **kwargs)
+
+    monkeypatch.setattr(torch, "rand", fake_rand)
+    rollout_frame_features: list[torch.Tensor] = []
+
+    def fake_integrate_flow_ode(**kwargs):
+        rollout_frame_features.append(
+            kwargs["current_frame_features"].detach().clone()
+        )
+        return torch.zeros_like(kwargs["initial_state"])
+
+    monkeypatch.setattr(train_utils, "integrate_flow_ode", fake_integrate_flow_ode)
 
     encoder = RecordingEncoder()
     predictor = RecordingPredictor()
@@ -309,67 +348,53 @@ def test_incremental_flow_loss_rollout_writes_generated_history() -> None:
         normalizer=_identity_normalizer(),
     )
 
-    trainer.incremental_flow_loss(
-        motion=motion,
-        joints=joints,
-        relative_shifts=relative_shifts,
-        text_for_encoder=text_for_encoder,
-        epoch=0,
-        total_epochs=2,
-        device="cpu",
-        stochastic_rollout=False,
-    )
+    batch = {
+        "motion": motion,
+        "joints": joints,
+        "text_clip": text_for_encoder.unsqueeze(1),
+    }
 
-    current_positions_step0 = joints[:1, 0]
+    trainer.incremental_flow_loss(batch=batch, epoch=1)
+
+    current_positions_step0 = joints[:1, 1]
+    zero_flow = torch.zeros(1, 68)
+    rollout_positions = flow_output_to_positions(
+        zero_flow,
+        prev_root_pos=current_positions_step0[:, 0],
+        prev_root_rot_6d=motion[:1, 1, 69:75],
+    )
     expected_rollout_frame, _, _ = generated_positions_to_271d(
-        new_positions=current_positions_step0,
+        new_positions=rollout_positions,
         prev_positions=current_positions_step0,
         dataset_type="t2m",
         normalizer=trainer.normalizer,
     )
 
-    assert len(encoder.recorded_inputs) == 4
+    assert len(encoder.recorded_inputs) == 3
     assert torch.allclose(
         encoder.recorded_inputs[1][:1], expected_rollout_frame, atol=1e-4, rtol=1e-4
     )
     assert torch.allclose(
-        encoder.recorded_inputs[1][1:2], motion[1:2, 1], atol=1e-5, rtol=1e-5
+        encoder.recorded_inputs[1][1:2], motion[1:2, 2], atol=1e-5, rtol=1e-5
     )
-    expected_step1_shift = torch.zeros_like(current_positions_step0)
-    assert len(predictor.recorded_prev_relative_shifts) >= 2
+    assert len(rollout_frame_features) == 2
     assert torch.allclose(
-        predictor.recorded_prev_relative_shifts[1][0:1],
-        expected_step1_shift,
+        rollout_frame_features[1],
+        extract_prev_frame_features(expected_rollout_frame),
         atol=1e-6,
         rtol=1e-6,
     )
-    assert torch.allclose(
-        predictor.recorded_prev_relative_shifts[1][1:2],
-        relative_shifts[1:2, 1],
-        atol=1e-6,
-        rtol=1e-6,
-    )
-    assert trainer.last_guard_stats == {
-        "degenerate_rollout_count": 0.0,
-        "degenerate_rollout_ratio": 0.0,
-        "degenerate_consistency_count": 0.0,
-        "degenerate_consistency_ratio": 0.0,
-    }
 
-def test_incremental_flow_loss_batches_main_flow_call() -> None:
+def test_incremental_flow_loss_batches_main_flow_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     gt_features, gt_positions = _load_sample("000070")
     motion = torch.stack([gt_features[1:5], gt_features[1:5]], dim=0)
     joints = torch.stack([gt_positions[1:5], gt_positions[1:5]], dim=0)
-    relative_shifts = torch.stack(
-        [
-            gt_positions[1:5] - gt_positions[0:4],
-            gt_positions[1:5] - gt_positions[0:4],
-        ],
-        dim=0,
-    )
     text_for_encoder = torch.zeros(2, 512)
 
     config = Config(device="cpu")
+    config.num_epochs = 2
     config.use_fk = False
     config.rollout_prob_start = 0.5
     config.rollout_prob_end = 0.5
@@ -385,23 +410,41 @@ def test_incremental_flow_loss_batches_main_flow_call() -> None:
         normalizer=_identity_normalizer(),
     )
 
-    trainer.incremental_flow_loss(
-        motion=motion,
-        joints=joints,
-        relative_shifts=relative_shifts,
-        text_for_encoder=text_for_encoder,
-        epoch=0,
-        total_epochs=2,
-        device="cpu",
-        stochastic_rollout=False,
-    )
+    batch = {
+        "motion": motion,
+        "joints": joints,
+        "text_clip": text_for_encoder.unsqueeze(1),
+    }
 
-    pred_steps = joints.shape[1] - 1
+    rollout_rand_outputs = iter(
+        [
+            torch.tensor([0.25, 0.75], dtype=torch.float32),
+            torch.tensor([0.0, 0.9], dtype=torch.float32),
+            torch.tensor([0.30, 0.60], dtype=torch.float32),
+            torch.tensor([0.9, 0.9], dtype=torch.float32),
+        ]
+    )
+    original_rand = torch.rand
+
+    def fake_rand(*size, **kwargs):
+        if len(size) == 1 and isinstance(size[0], int) and size[0] == 2:
+            tensor = next(rollout_rand_outputs)
+            device = kwargs.get("device")
+            dtype = kwargs.get("dtype", tensor.dtype)
+            return tensor.to(device=device, dtype=dtype)
+        return original_rand(*size, **kwargs)
+
+    def fake_integrate_flow_ode(**kwargs):
+        return torch.zeros_like(kwargs["initial_state"])
+
+    monkeypatch.setattr(torch, "rand", fake_rand)
+    monkeypatch.setattr(train_utils, "integrate_flow_ode", fake_integrate_flow_ode)
+    trainer.incremental_flow_loss(batch=batch, epoch=1)
+
+    pred_steps = batch["joints"].shape[1] - 2
     expected_batched_size = motion.shape[0] * pred_steps
     assert predictor.recorded_batch_sizes.count(expected_batched_size) == 1
-    assert predictor.recorded_batch_sizes == [motion.shape[0]] * pred_steps + [
-        expected_batched_size
-    ]
+    assert predictor.recorded_batch_sizes == [expected_batched_size]
 
 
 def test_incremental_flow_loss_rollout_targets_ground_truth_from_effective_state(
@@ -410,10 +453,10 @@ def test_incremental_flow_loss_rollout_targets_ground_truth_from_effective_state
     gt_features, gt_positions = _load_sample("000070")
     motion = gt_features[1:5].unsqueeze(0)
     joints = gt_positions[1:5].unsqueeze(0)
-    relative_shifts = (gt_positions[1:5] - gt_positions[0:4]).unsqueeze(0)
     text_for_encoder = torch.zeros(1, 512)
 
     config = Config(device="cpu")
+    config.num_epochs = 1
     config.use_fk = False
     config.rollout_prob_start = 1.0
     config.rollout_prob_end = 1.0
@@ -430,31 +473,45 @@ def test_incremental_flow_loss_rollout_targets_ground_truth_from_effective_state
         normalizer=_identity_normalizer(),
     )
 
-    _, flow_loss, _, pred_steps, _ = trainer.incremental_flow_loss(
-        motion=motion,
-        joints=joints,
-        relative_shifts=relative_shifts,
-        text_for_encoder=text_for_encoder,
-        epoch=0,
-        total_epochs=2,
-        device="cpu",
-        stochastic_rollout=False,
-    )
+    batch = {
+        "motion": motion,
+        "joints": joints,
+        "text_clip": text_for_encoder.unsqueeze(1),
+    }
 
-    current_positions = joints[:, 0:1].expand(-1, pred_steps, -1, -1)
-    expected_targets = joints[:, 1:] - current_positions
+    _, flow_loss, _, pred_steps, _ = trainer.incremental_flow_loss(batch=batch, epoch=0)
+
+    rollout_positions = flow_output_to_positions(
+        torch.zeros(1, 68),
+        prev_root_pos=joints[:, 1, 0],
+        prev_root_rot_6d=motion[:, 1, 69:75],
+    )
+    rollout_frame, _, _ = generated_positions_to_271d(
+        new_positions=rollout_positions,
+        prev_positions=joints[:, 1],
+        dataset_type="t2m",
+        normalizer=trainer.normalizer,
+    )
+    expected_targets = torch.stack(
+        [
+            subset_271d_to_72d(motion[:, 2], prev_frame=motion[:, 1]),
+            subset_271d_to_72d(motion[:, 3], prev_frame=rollout_frame),
+        ],
+        dim=1,
+    )
     expected_flow_loss = expected_targets.square().mean()
     assert torch.isclose(flow_loss, expected_flow_loss, atol=1e-6, rtol=1e-6)
+    assert pred_steps == expected_targets.shape[1]
 
 
 def test_incremental_flow_loss_returns_zero_consistency_for_now() -> None:
     gt_features, gt_positions = _load_sample("000070")
-    motion = gt_features[1:3].unsqueeze(0)
-    joints = gt_positions[1:3].unsqueeze(0)
-    relative_shifts = (gt_positions[1:3] - gt_positions[0:2]).unsqueeze(0)
+    motion = gt_features[1:4].unsqueeze(0)
+    joints = gt_positions[1:4].unsqueeze(0)
     text_for_encoder = torch.zeros(1, 512)
 
     config = Config(device="cpu")
+    config.num_epochs = 1
     config.use_fk = False
     config.rollout_prob_start = 1.0
     config.rollout_prob_end = 1.0
@@ -470,25 +527,19 @@ def test_incremental_flow_loss_returns_zero_consistency_for_now() -> None:
         normalizer=_identity_normalizer(),
     )
 
+    batch = {
+        "motion": motion,
+        "joints": joints,
+        "text_clip": text_for_encoder.unsqueeze(1),
+    }
+
     total_loss, flow_loss, consistency_loss, _, _ = trainer.incremental_flow_loss(
-        motion=motion,
-        joints=joints,
-        relative_shifts=relative_shifts,
-        text_for_encoder=text_for_encoder,
+        batch=batch,
         epoch=0,
-        total_epochs=2,
-        device="cpu",
-        stochastic_rollout=False,
     )
 
     assert torch.isclose(consistency_loss, torch.tensor(0.0), atol=1e-6, rtol=1e-6)
     assert torch.isclose(total_loss, flow_loss, atol=1e-6, rtol=1e-6)
-    assert trainer.last_guard_stats == {
-        "degenerate_rollout_count": 0.0,
-        "degenerate_rollout_ratio": 0.0,
-        "degenerate_consistency_count": 0.0,
-        "degenerate_consistency_ratio": 0.0,
-    }
 
 
 def test_generated_positions_to_271d_stays_finite_for_degenerate_poses() -> None:

@@ -30,6 +30,9 @@ def create_generator():
     normalizer = create_mock_normalizer()
     config = Config()
 
+    config.encoder_hidden_dim = 256
+    config.encoder_text_proj_dim = 128
+    config.encoder_per_joint_dim = 64
     config.encoder_num_layers = 2
     config.predictor_config = FlowMatchingPredictorConfig(
         hidden_size=256,
@@ -55,8 +58,6 @@ def create_generator():
     predictor = FlowMatchingPredictor(
         feature_size=config.get_predictor_feature_size(),
         config=config.predictor_config,
-        out_channels=3,
-        use_relative_shift=True,
     )
 
     generator = HumanMotionGenerator(encoder, predictor, config)
@@ -306,12 +307,8 @@ def test_checkpoint_loading():
     # Create a generator and save checkpoint
     generator = create_generator()
 
-    # Create a config that matches the generator's configuration
-    test_config = Config()
-    test_config.encoder_num_layers = 2  # Match create_generator()
-    test_config.predictor_config.num_hidden_layers = 2  # Match create_generator()
-    test_config.predictor_config.num_attention_heads = 4
-    test_config.predictor_config.intermediate_size = 512
+    # Reuse the generator's config so checkpoint loading reconstructs the same model.
+    test_config = generator.config
 
     # Create a temporary checkpoint
     with tempfile.TemporaryDirectory() as tmpdir:

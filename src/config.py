@@ -93,8 +93,8 @@ class Config:
         default_factory=lambda: FlowMatchingPredictorConfig(
             hidden_size=96,
             intermediate_size=4 * 96,
-            num_hidden_layers=4,
-            num_attention_heads=8,
+            num_hidden_layers=3,
+            num_attention_heads=4,
             hidden_act="silu",
             rms_norm_eps=1e-6,
             attention_bias=True,
@@ -116,10 +116,9 @@ class Config:
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 5, "epochs": 100},
-            {"horizon": 10, "epochs": 200},
-            {"horizon": 20, "epochs": 400},
-            {"horizon": 40, "epochs": 800},
+            {"horizon": 10, "epochs": 100},
+            {"horizon": 20, "epochs": 200},
+            {"horizon": 40, "epochs": 400},
         ]
     )
 
@@ -133,18 +132,18 @@ class Config:
     t_sampling_mode: str = "power"  # "uniform" or "power"
     t_sampling_power: float = 2.0  # Power-law exponent k in p(t)=(k+1)t^k
     t_sampling_power_warmup_fraction: float = (
-        0.25  # Fraction of training used to ramp k from 0 to target
+        0.1  # Fraction of training used to ramp k from 0 to target
     )
 
     use_fk: bool = False  # Whether to compute FK loss during training
     # Rollout scheduling settings
-    rollout_prob_start: float = 0.0  # Rollout probability at first epoch
-    rollout_prob_end: float = 0.5  # Rollout probability at final epoch
+    rollout_prob_start: float = 0.1  # Rollout probability at first epoch
+    rollout_prob_end: float = 0.3  # Rollout probability at final epoch
     rollout_warmup_fraction: float = (
-        0.5  # Fraction of training with rollout disabled before schedule starts
+        0.4  # Fraction of training with rollout disabled before schedule starts
     )
     rollout_block_len_start: int = 1  # Rollout block length at schedule start
-    rollout_block_len_end: int = 8  # Rollout block length at schedule end
+    rollout_block_len_end: int = 4  # Rollout block length at schedule end
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )

@@ -16,7 +16,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config import Config, FlowMatchingPredictorConfig
 from models import FlowMatchingPredictor, HumanMotionGenerator, MotionHistoryEncoder
-from utils.motion_utils import FeatureNormalizer
+from utils.motion_utils import (
+    FeatureNormalizer,
+    extract_prev_frame_features,
+    subset_271d_to_72d,
+)
 from utils.train_utils import EMAModel, Trainer
 
 
@@ -80,8 +84,6 @@ def _create_models(
     predictor = FlowMatchingPredictor(
         feature_size=config.get_predictor_feature_size(),
         config=config.predictor_config,
-        out_channels=3,
-        use_relative_shift=True,
     ).to("cpu")
 
     return encoder, predictor
@@ -165,7 +167,15 @@ def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
     T = 4
     history = torch.randn(B, T, 271)
     text_emb = torch.randn(B, 512)
-    target_shift = torch.randn(B, 22, 3)
+    target_state = subset_271d_to_72d(
+        history[:, -1],
+        prev_frame=history[:, -2],
+        normalizer=normalizer,
+    )
+    current_frame_features = extract_prev_frame_features(
+        history[:, -1],
+        normalizer=normalizer,
+    )
 
     with tempfile.TemporaryDirectory() as tmpdir:
         start = time.perf_counter()
@@ -173,17 +183,17 @@ def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
         for step in range(steps):
             features = encoder(history, text_emb)
             t = torch.rand(B)
-            x0 = torch.randn_like(target_shift)
-            x_t = t.view(B, 1, 1) * target_shift + (1 - t.view(B, 1, 1)) * x0
+            x0 = torch.randn_like(target_state)
+            x_t = t.view(B, 1) * target_state + (1 - t.view(B, 1)) * x0
 
             pred, _, _ = predictor(
-                noised_tracks=x_t,
+                noisy_features=x_t,
                 timesteps=t,
                 text_embedding=text_emb,
                 track_features=features,
-                relative_shifts=target_shift,
+                current_frame_features=current_frame_features,
             )
-            target_vel = target_shift - x0
+            target_vel = target_state - x0
             loss = torch.nn.functional.mse_loss(pred, target_vel)
 
             optimizer.zero_grad(set_to_none=True)

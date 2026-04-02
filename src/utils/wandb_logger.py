@@ -185,6 +185,30 @@ class WandbLogger:
         except Exception as e:
             print(f"[WandbLogger] Failed to log model: {e}")
 
+    def log_image(
+        self,
+        key: str,
+        path: str,
+        step: Optional[int] = None,
+        caption: Optional[str] = None,
+    ) -> None:
+        """
+        Log an image file to W&B so it appears in the run media.
+
+        Args:
+            key: Metric/media key shown in W&B
+            path: Local path to the image file
+            step: Optional global step for the log entry
+            caption: Optional display caption
+        """
+        if not self.enabled or self.run is None:
+            return
+
+        try:
+            wandb.log({key: wandb.Image(path, caption=caption)}, step=step)
+        except Exception as e:
+            print(f"[WandbLogger] Failed to log image: {e}")
+
     def log_summary(self, metrics: Dict[str, Any]) -> None:
         """
         Log final summary metrics (shown in W&B run summary).

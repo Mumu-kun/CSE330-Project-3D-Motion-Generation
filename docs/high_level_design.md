@@ -203,7 +203,7 @@ For each output frame:
 2. Encode that window with the GRU history encoder.
 3. Extract current-frame causal features from the latest frame.
 4. Initialize a noisy reduced state `x_t ~ N(0, I)` in 68D.
-5. Integrate the predictor over `num_steps` Euler updates.
+5. Integrate the predictor over `num_steps` shared flow-ODE updates using the end-biased Heun solver.
 6. Denormalize the reduced state if needed.
 7. Convert it to absolute joint positions with:
    - previous root position;

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from config import Config, FlowMatchingPredictorConfig
 from models import MotionHistoryEncoder, FlowMatchingPredictor
 from utils.dataset import create_dataloader
+from utils.motion_utils import extract_prev_frame_features, subset_271d_to_72d
 from utils.train_utils import Trainer
 
 
@@ -140,6 +141,7 @@ def get_smoke_config() -> Config:
 
     config.batch_size = 4
     config.num_epochs = 1
+    config.checkpoint_interval = 1
     config.max_motion_length = 20
     config.horizon = 5
 
@@ -226,8 +228,6 @@ def _build_models(config: Config, normalizer):
     predictor = FlowMatchingPredictor(
         feature_size=config.encoder_per_joint_dim,
         config=config.predictor_config,
-        out_channels=3,
-        use_relative_shift=True,
     ).to(config.device)
 
     return encoder, predictor
@@ -261,24 +261,29 @@ def _run_forward_check(
                 f"Unexpected encoder output shape: {tuple(track_features.shape)}"
             )
 
-        last_positions = joints[:, -1]
-        prev_positions = (
-            joints[:, -2] if joints.shape[1] > 1 else torch.zeros_like(last_positions)
+        current_frame = motion_input[:, -1]
+        noisy_features = subset_271d_to_72d(
+            current_frame,
+            prev_frame=motion_input[:, -2],
+            normalizer=normalizer,
         )
-        relative_shifts = last_positions - prev_positions
+        current_frame_features = extract_prev_frame_features(
+            current_frame,
+            normalizer=normalizer,
+        )
         timesteps = torch.rand(motion.shape[0], device=device)
 
         pred_vel, _, _ = predictor(
-            noised_tracks=last_positions,
+            noisy_features=noisy_features,
             timesteps=timesteps,
             text_embedding=text_emb,
             track_features=track_features,
-            prev_relative_shifts=relative_shifts,
+            current_frame_features=current_frame_features,
             output_attentions=False,
             output_hidden_states=False,
         )
 
-    if pred_vel.shape != (motion.shape[0], config.encoder_num_joints, 3):
+    if pred_vel.shape != (motion.shape[0], predictor.flow_dim):
         raise AssertionError(
             f"Unexpected predictor output shape: {tuple(pred_vel.shape)}"
         )

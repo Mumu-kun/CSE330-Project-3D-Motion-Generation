@@ -35,7 +35,7 @@ from torch.amp.grad_scaler import GradScaler
 from tqdm import tqdm
 
 from config import Config
-from models import FlowMatchingPredictor, MotionHistoryEncoder
+from models import FlowMatchingPredictor, MotionHistoryEncoder, integrate_flow_ode
 from utils.text_encoder import CLIPEncoder
 from utils.wandb_logger import WandbLogger
 from utils.motion_utils import (
@@ -741,7 +741,7 @@ class Trainer:
 
         diagnostics = self._checkpoint_flow_diagnostics
         if diagnostics is not None:
-            write_loss_vs_t_epoch_artifacts(
+            artifacts = write_loss_vs_t_epoch_artifacts(
                 output_dir=self._loss_vs_t_checkpoint_output_dir(filename),
                 epoch=epoch,
                 global_steps=diagnostics["global_steps"],
@@ -749,6 +749,13 @@ class Trainer:
                 per_sample_flow_loss=diagnostics["per_sample_flow_loss"],
                 num_bins=LOSS_VS_T_NUM_BINS,
             )
+            if self.wandb_logger is not None:
+                self.wandb_logger.log_image(
+                    key=f"diagnostics/loss_vs_t/{Path(filename).stem}",
+                    path=str(artifacts["epoch_plot"]),
+                    step=self.training_state["global_step"],
+                    caption=f"Loss vs t at epoch {epoch} ({filename})",
+                )
 
     def incremental_flow_loss(
         self,
@@ -804,7 +811,6 @@ class Trainer:
         rollout_prob = self._compute_rollout_probability(epoch)
         rollout_block_len = self._compute_rollout_block_length(epoch)
         ode_steps = max(1, int(self.config.rollout_integration_steps))
-        dt = 1.0 / float(ode_steps)
         current_positions = hist_joints[:, 0].detach().clone()
         rollout_steps_remaining = torch.zeros(B, dtype=torch.long, device=device)
         flow_contexts: list[torch.Tensor] = []
@@ -861,29 +867,18 @@ class Trainer:
                 active_current_positions = current_positions[active_indices]
                 predictor_was_training = pred_model.training
                 pred_model.eval()
-                x_t_roll = torch.randn_like(x1[active_indices])
                 try:
                     with timer(self.timing_stats, "forward/rollout_ode"):
                         with torch.no_grad():
-                            for ode_step in range(ode_steps):
-                                with timer(
-                                    self.timing_stats, "forward/rollout_ode_step"
-                                ):
-                                    tau = torch.full(
-                                        (active_indices.numel(),),
-                                        float(ode_step) * dt,
-                                        device=device,
-                                    )
-                                    pred_roll = pred_model.forward(
-                                        track_features=active_context,
-                                        noisy_features=x_t_roll,
-                                        timesteps=tau,
-                                        current_frame_features=active_current_frame_features,
-                                        text_embedding=active_text_for_encoder,
-                                        output_attentions=False,
-                                        output_hidden_states=False,
-                                    )[0]
-                                    x_t_roll = x_t_roll + pred_roll * dt
+                            x_t_roll = integrate_flow_ode(
+                                predictor=pred_model,
+                                track_features=active_context,
+                                current_frame_features=active_current_frame_features,
+                                text_embedding=active_text_for_encoder,
+                                num_steps=ode_steps,
+                                time_schedule_power=self.config.inference_t_schedule_power,
+                                initial_state=torch.randn_like(x1[active_indices]),
+                            )
                 finally:
                     if predictor_was_training:
                         pred_model.train()
