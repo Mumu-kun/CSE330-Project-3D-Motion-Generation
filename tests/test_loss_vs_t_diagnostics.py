@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader, TensorDataset
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config import Config
+from utils.motion_utils import FeatureNormalizer, yaw_to_root_rot6d
 from utils.train_utils import (
     EMAModel,
     Trainer,
@@ -28,29 +29,31 @@ class DummyEncoder(nn.Module):
         super().__init__()
         self.anchor = nn.Parameter(torch.zeros(()))
 
-    def gru_step(
+    def forward_all(
         self,
-        frame: torch.Tensor,
+        motion_seq: torch.Tensor,
         text_embedding: torch.Tensor,
-        h: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        del text_embedding, h
-        batch_size = frame.shape[0]
+    ) -> torch.Tensor:
+        del text_embedding
+        batch_size, seq_len = motion_seq.shape[:2]
         context = torch.zeros(
             batch_size,
+            seq_len,
             22,
             4,
-            device=frame.device,
-            dtype=frame.dtype,
+            device=motion_seq.device,
+            dtype=motion_seq.dtype,
         )
-        hidden = torch.zeros(
-            1,
-            batch_size,
-            4,
-            device=frame.device,
-            dtype=frame.dtype,
-        )
-        return context + self.anchor * 0, hidden + self.anchor * 0
+        return context + self.anchor * 0
+
+    def forward(
+        self,
+        motion_seq: torch.Tensor,
+        text_embedding: torch.Tensor,
+        return_all: bool = False,
+    ) -> torch.Tensor:
+        outputs = self.forward_all(motion_seq, text_embedding)
+        return outputs if return_all else outputs[:, -1]
 
 
 class DummyPredictor(nn.Module):
@@ -81,11 +84,14 @@ class DummyPredictor(nn.Module):
         return noisy_features * 0 + self.anchor * 0, None, None
 
 
-def _make_dummy_trainer() -> Trainer:
+def _make_dummy_trainer(
+    *, normalizer: FeatureNormalizer | None = None, use_consistency_loss: bool = False
+) -> Trainer:
     config = Config(device="cpu", output_path=Path("./tests/output"))
     config.rollout_prob_start = 0.0
     config.rollout_prob_end = 0.0
     config.num_epochs = 1
+    config.use_consistency_loss = use_consistency_loss
     dataset = TensorDataset(torch.zeros(1))
     dataloader = DataLoader(dataset, batch_size=1)
     return Trainer(
@@ -93,7 +99,7 @@ def _make_dummy_trainer() -> Trainer:
         predictor=DummyPredictor(),  # type: ignore[arg-type]
         dataloader=dataloader,
         config=config,
-        normalizer=None,
+        normalizer=normalizer,
     )
 
 
@@ -123,6 +129,34 @@ def test_incremental_flow_loss_collects_per_sample_t_and_loss() -> None:
     )
     assert torch.isclose(total_loss.detach().cpu(), flow_loss.detach().cpu())
     assert consistency_loss.item() == 0.0
+
+
+def test_incremental_flow_loss_consistency_uses_prev_frame_and_joint_targets() -> None:
+    normalizer = FeatureNormalizer(torch.zeros(271), torch.ones(271))
+    trainer = _make_dummy_trainer(
+        normalizer=normalizer,
+        use_consistency_loss=True,
+    )
+    trainer.config.consistency_loss_t_threshold = -1.0
+
+    motion = torch.zeros(2, 4, 271, dtype=torch.float32)
+    motion[..., 69:75] = yaw_to_root_rot6d(torch.zeros(2, 4, dtype=torch.float32))
+    batch = {
+        "motion": motion,
+        "joints": torch.zeros(2, 4, 22, 3, dtype=torch.float32),
+        "text_clip": torch.zeros(2, 1, 512, dtype=torch.float32),
+    }
+
+    total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob = (
+        trainer.incremental_flow_loss(batch=batch, epoch=0)
+    )
+
+    assert pred_steps == 2
+    assert rollout_prob == 0.0
+    assert torch.isfinite(total_loss)
+    assert torch.isfinite(flow_loss)
+    assert torch.isfinite(consistency_loss)
+    assert consistency_loss.item() >= 0.0
 
 
 def test_aggregate_loss_vs_t_bins_uses_100_bin_indexing_and_nan_for_empty_bins() -> None:

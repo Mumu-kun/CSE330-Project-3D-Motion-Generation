@@ -30,10 +30,13 @@ def create_generator():
     normalizer = create_mock_normalizer()
     config = Config()
 
-    config.encoder_hidden_dim = 256
-    config.encoder_text_proj_dim = 128
-    config.encoder_per_joint_dim = 64
-    config.encoder_num_layers = 2
+    config.encoder_config.hidden_size = 256
+    config.encoder_config.intermediate_size = 512
+    config.encoder_config.per_joint_output_dim = 64
+    config.encoder_config.num_hidden_layers = 2
+    config.encoder_config.num_attention_heads = 4
+    config.encoder_config.dropout = 0.1
+    config.encoder_config.attention_dropout = 0.1
     config.predictor_config = FlowMatchingPredictorConfig(
         hidden_size=256,
         intermediate_size=512,
@@ -42,25 +45,14 @@ def create_generator():
         track_dimensionality=3,
     )
 
-    encoder = MotionHistoryEncoder(
-        frame_feature_dim=271,
-        text_embedding_dim=512,
-        text_proj_dim=128,
-        model_dim=256,
-        per_joint_out_dim=64,
-        num_layers=2,
-        joint_count=22,
-        text_scale=1.0,
-        dropout=0.1,
-        normalizer=normalizer,
-    )
+    encoder = MotionHistoryEncoder(config.encoder_config)
 
     predictor = FlowMatchingPredictor(
         feature_size=config.get_predictor_feature_size(),
         config=config.predictor_config,
     )
 
-    generator = HumanMotionGenerator(encoder, predictor, config)
+    generator = HumanMotionGenerator(encoder, predictor, config, normalizer=normalizer)
     generator.eval()
 
     return generator

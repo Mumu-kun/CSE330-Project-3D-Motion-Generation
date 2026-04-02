@@ -276,7 +276,7 @@ def _ensure_finite_tensor(
     )
 
 
-def _wrap_angle(angle: torch.Tensor) -> torch.Tensor:
+def wrap_angle(angle: torch.Tensor) -> torch.Tensor:
     """Wrap angles to [-pi, pi] in a differentiable way."""
     return torch.atan2(torch.sin(angle), torch.cos(angle))
 
@@ -332,7 +332,7 @@ def compute_root_delta_yaw_sin_cos(
         delta_yaw = torch.zeros_like(current_yaw)
     else:
         prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
-        delta_yaw = _wrap_angle(current_yaw - prev_yaw)
+        delta_yaw = wrap_angle(current_yaw - prev_yaw)
     return yaw_to_sin_cos(delta_yaw)
 
 
@@ -528,7 +528,7 @@ def _forward_kinematics(
 # ============================================================================
 
 
-def subset_271d_to_72d(
+def subset_271d_to_68d(
     x: torch.Tensor,
     prev_frame: Optional[torch.Tensor] = None,
     normalizer: Optional["FeatureNormalizer"] = None,
@@ -985,7 +985,7 @@ def flow_output_to_positions(
     # Integrate root yaw from the previous frame.
     prev_root_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
     delta_yaw = sin_cos_to_yaw(root_delta_yaw)
-    root_yaw = _wrap_angle(prev_root_yaw + delta_yaw)
+    root_yaw = wrap_angle(prev_root_yaw + delta_yaw)
     root_rot_6d = yaw_to_root_rot6d(root_yaw)
 
     # Convert integrated root rotation to quaternion
@@ -1180,7 +1180,7 @@ def flow_output_to_271d(
     # -------------------------------------------------
     prev_root_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
     delta_yaw = sin_cos_to_yaw(root_delta_yaw)
-    root_yaw = _wrap_angle(prev_root_yaw + delta_yaw)
+    root_yaw = wrap_angle(prev_root_yaw + delta_yaw)
     root_rot_6d = yaw_to_root_rot6d(root_yaw)
     root_quat = cont6d_to_quaternion(root_rot_6d)
     root_quat_exp = root_quat.unsqueeze(1).expand(-1, 21, -1)
@@ -1318,7 +1318,9 @@ def generated_positions_to_271d(
         prev_positions_resolved = None
 
     candidate_positions = new_positions
-    _ensure_finite_tensor(candidate_positions, "candidate_positions", new_positions.shape)
+    _ensure_finite_tensor(
+        candidate_positions, "candidate_positions", new_positions.shape
+    )
     candidate_root_pos = candidate_positions[:, 0]  # (B, 3)
 
     candidate_quaternions = _compute_ik(
@@ -1341,7 +1343,9 @@ def generated_positions_to_271d(
         canonical_positions = fk_positions
     else:
         canonical_positions = candidate_positions
-    _ensure_finite_tensor(canonical_positions, "canonical_positions", new_positions.shape)
+    _ensure_finite_tensor(
+        canonical_positions, "canonical_positions", new_positions.shape
+    )
     if fk_positions is not None:
         _ensure_finite_tensor(fk_positions, "fk_positions", new_positions.shape)
 

@@ -16,7 +16,7 @@ Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from typing import Optional, Any
 
 
@@ -38,6 +38,36 @@ class FlowMatchingPredictorConfig:
     def __post_init__(self) -> None:
         if self.head_dim is None:
             self.head_dim = self.hidden_size // self.num_attention_heads
+
+
+@dataclass
+class MotionHistoryEncoderConfig:
+    frame_feature_dim: int = 271
+    text_embedding_dim: int = 512
+    hidden_size: int = 512
+    intermediate_size: int = 2048
+    num_hidden_layers: int = 3
+    num_attention_heads: int = 8
+    hidden_act: str = "gelu"
+    layer_norm_eps: float = 1e-5
+    attention_bias: bool = True
+    attention_dropout: float = 0.1
+    mlp_bias: bool = True
+    dropout: float = 0.1
+    per_joint_output_dim: int = 64
+    joint_count: int = 22
+    max_context_length: int = 40
+    text_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.hidden_size % self.num_attention_heads != 0:
+            raise ValueError(
+                "MotionHistoryEncoderConfig.hidden_size must be divisible by "
+                f"num_attention_heads, got {self.hidden_size} and "
+                f"{self.num_attention_heads}."
+            )
+        self.max_context_length = max(1, int(self.max_context_length))
+        self.intermediate_size = max(int(self.intermediate_size), self.hidden_size)
 
 
 @dataclass
@@ -72,17 +102,28 @@ class Config:
     )
 
     # =============================================================================
-    # MotionHistoryEncoder (GRU-based) Configuration
+    # MotionHistoryEncoder Configuration
     # =============================================================================
-    encoder_motion_dim: int = 271  # Input motion feature dimension
-    encoder_text_dim: int = 512  # CLIP embedding size
-    encoder_text_proj_dim: int = 128  # Text projection dimension
-    encoder_hidden_dim: int = 512  # GRU hidden size
-    encoder_per_joint_dim: int = 64  # Output per-joint context dimension
-    encoder_num_layers: int = 3  # GRU layers
-    encoder_num_joints: int = 22  # Number of joints
-    encoder_text_scale: float = 1.0  # Text conditioning scale
-    encoder_dropout: float = 0.1  # Dropout between GRU layers
+    encoder_config: MotionHistoryEncoderConfig = field(
+        default_factory=lambda: MotionHistoryEncoderConfig(
+            frame_feature_dim=271,
+            text_embedding_dim=512,
+            hidden_size=512,
+            intermediate_size=4 * 512,
+            num_hidden_layers=3,
+            num_attention_heads=8,
+            hidden_act="gelu",
+            layer_norm_eps=1e-5,
+            attention_bias=True,
+            attention_dropout=0.1,
+            mlp_bias=True,
+            dropout=0.1,
+            per_joint_output_dim=64,
+            joint_count=22,
+            max_context_length=40,
+            text_scale=1.0,
+        )
+    )
 
     # =============================================================================
     # FlowMatchingPredictor Configuration (Spatial-Only with Flow Matching Timestep)
@@ -147,10 +188,15 @@ class Config:
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )
+
     use_consistency_loss: bool = (
         False  # Enable endpoint consistency loss after no-grad rollout
     )
-    consistency_loss_weight: float = 1.0  # Weight for consistency loss in total loss
+    consistency_loss_t_threshold: float = (
+        0.75  # Only apply consistency loss for t > threshold
+    )
+    consistency_loss_weight: float = 0.2  # Weight for consistency loss in total loss
+
     use_degenerate_pose_guard: bool = False
     degenerate_bone_ratio_threshold: float = 0.05
     degenerate_across_norm_threshold: float = 1e-4
@@ -221,10 +267,20 @@ class Config:
         For tokenized predictor inputs with shape (B, N, F), this returns F
         (the per-joint feature width), not N * F.
         """
-        return self.encoder_per_joint_dim
+        return self.encoder_config.per_joint_output_dim
 
     def to_dict(self) -> dict:
         """Export the configuration as a serializable dictionary."""
-        return {
-            k: str(v) if isinstance(v, Path) else v for k, v in self.__dict__.items()
-        }
+
+        def _convert(value: Any) -> Any:
+            if isinstance(value, Path):
+                return str(value)
+            if is_dataclass(value):
+                return {k: _convert(v) for k, v in asdict(value).items()}
+            if isinstance(value, dict):
+                return {k: _convert(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_convert(v) for v in value]
+            return value
+
+        return {k: _convert(v) for k, v in self.__dict__.items()}

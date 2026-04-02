@@ -209,14 +209,16 @@ def _run_teacher_forced_one_step(
 ) -> tuple[torch.Tensor, int, list[bool] | None]:
     positions = [joints[:, 0]]
     with torch.no_grad():
-        h_state = None
+        frame_buffer = motion_norm[:, :0]
+        cache_state = None
         for frame_idx in range(joints.shape[1] - 1):
             current_frame_norm = motion_norm[:, frame_idx]
             current_positions = joints[:, frame_idx]
-            context, h_state = generator.encoder.gru_step(
+            context, frame_buffer, cache_state = generator.encoder.step(
                 current_frame_norm,
                 text_clip[:, 0, :],
-                h_state,
+                frame_buffer=frame_buffer,
+                cache_state=cache_state,
             )
             pred_positions, _ = predict_next_positions(
                 generator=generator,
@@ -240,15 +242,17 @@ def _run_mixed_teacher_force_rollout(
     positions = [joints[:, 0]]
     teacher_force_mask: list[bool] = []
     with torch.no_grad():
-        h_state = None
+        frame_buffer = motion_norm[:, :0]
+        cache_state = None
         current_positions = joints[:, 0]
         current_frame = motion_norm[:, 0]
 
         for frame_idx in range(joints.shape[1] - 1):
-            context, h_state = generator.encoder.gru_step(
+            context, frame_buffer, cache_state = generator.encoder.step(
                 current_frame,
                 text_clip[:, 0, :],
-                h_state,
+                frame_buffer=frame_buffer,
+                cache_state=cache_state,
             )
             pred_positions, _ = predict_next_positions(
                 generator=generator,

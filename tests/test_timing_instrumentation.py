@@ -49,13 +49,12 @@ def test_timer_records_expected_forward_breakdown_keys() -> None:
         "data_load",
         "text_prep",
         "forward",
-        "forward/gru_init",
-        "forward/predictor_flow",
+        "forward/encoder_contexts",
+        "forward/predictor",
         "forward/rollout_ode",
         "forward/rollout_ode_step",
         "forward/consistency_pred",
         "forward/pos_transform",
-        "forward/gru_step",
         "backward",
         "ema_update",
         "validation",
@@ -73,9 +72,9 @@ def test_timer_records_expected_forward_breakdown_keys() -> None:
     per_step_payload = {f"time/{key}_ms": val for key, val in averages.items()}
     epoch_payload = {f"epoch_time/{key}_ms": val for key, val in averages.items()}
 
-    assert "time/forward/gru_init_ms" in per_step_payload
+    assert "time/forward/encoder_contexts_ms" in per_step_payload
     assert "time/forward/rollout_ode_step_ms" in per_step_payload
-    assert "epoch_time/forward/predictor_flow_ms" in epoch_payload
+    assert "epoch_time/forward/predictor_ms" in epoch_payload
 
     summary = str(stats)
     assert "=== Timing Summary ===" in summary

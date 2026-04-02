@@ -24,10 +24,14 @@ from utils.motion_utils import FeatureNormalizer, generated_positions_to_271d
 from utils.visualization import plot_3d_motion
 
 
-CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "best_val7.pt"
+PREDICTOR_STEPS = 5
+CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest7.pt"
 DATASET_PATH = PROJECT_ROOT / "tests" / "dataset" / "humanml3d-subset-mini"
 OUTPUT_DIR = (
-    PROJECT_ROOT / "output" / "checkpoint_visualizations" / CHECKPOINT_PATH.stem
+    PROJECT_ROOT
+    / "output"
+    / "checkpoint_visualizations"
+    / (CHECKPOINT_PATH.stem + f"_{PREDICTOR_STEPS*2}_steps")
 )
 MASKED_TEACHER_FORCE_PROB = 0.4
 
@@ -141,15 +145,17 @@ def _mixed_teacher_force_rollout(
     teacher_force_mask: list[bool] = []
 
     with torch.no_grad():
-        h_state = None
+        frame_buffer = motion_norm[:, :0]
+        cache_state = None
         current_positions = joints[:, 0]
         current_frame = motion_norm[:, 0]
 
         for frame_idx in range(joints.shape[1] - 1):
-            context, h_state = generator.encoder.gru_step(
+            context, frame_buffer, cache_state = generator.encoder.step(
                 current_frame,
                 text_clip[:, 0, :],
-                h_state,
+                frame_buffer=frame_buffer,
+                cache_state=cache_state,
             )
             pred_positions, _ = _predict_next_positions(
                 generator=generator,
@@ -214,24 +220,26 @@ def main() -> None:
     motion_norm = normalizer.normalize(motion_raw)
 
     horizon = int(config.horizon)
-    predictor_steps = 50
     inference_steps = max(
         1,
-        int(getattr(config, "num_inference_steps", predictor_steps)),
+        int(getattr(config, "num_inference_steps", PREDICTOR_STEPS)),
     )
+    inference_steps = PREDICTOR_STEPS
 
     teacher_forced_positions = [joints[:, 0]]
     teacher_forced_metrics: list[dict[str, float]] = []
     teacher_forced_flows = []
     with torch.no_grad():
-        h_state = None
+        frame_buffer = motion_norm[:, :0]
+        cache_state = None
         for frame_idx in range(sample_len - 1):
             current_frame_norm = motion_norm[:, frame_idx]
             current_positions = joints[:, frame_idx]
-            context, h_state = generator.encoder.gru_step(
+            context, frame_buffer, cache_state = generator.encoder.step(
                 current_frame_norm,
                 text_clip[:, 0, :],
-                h_state,
+                frame_buffer=frame_buffer,
+                cache_state=cache_state,
             )
             pred_positions, pred_flow_raw = _predict_next_positions(
                 generator=generator,
@@ -239,7 +247,7 @@ def main() -> None:
                 current_positions=current_positions,
                 current_frame_norm=current_frame_norm,
                 text_embedding=text_clip[:, 0, :],
-                num_steps=predictor_steps,
+                num_steps=PREDICTOR_STEPS,
             )
             teacher_forced_positions.append(pred_positions)
             teacher_forced_metrics.append(
@@ -260,7 +268,7 @@ def main() -> None:
         rollout_positions, _, _ = generator.generate_sequence(
             text=text_clip,
             num_frames=rollout_frames,
-            num_steps=predictor_steps,
+            num_steps=PREDICTOR_STEPS,
             horizon=horizon,
             input_positions=seed_positions,
             guidance_scale=1.0,
@@ -282,7 +290,7 @@ def main() -> None:
             joints=joints,
             motion_norm=motion_norm,
             text_clip=text_clip,
-            num_steps=predictor_steps,
+            num_steps=PREDICTOR_STEPS,
             teacher_force_prob=MASKED_TEACHER_FORCE_PROB,
         )
     )
@@ -343,7 +351,7 @@ def main() -> None:
         "caption": caption,
         "horizon": horizon,
         "rollout_seed_length": horizon,
-        "teacher_forced_predictor_steps": predictor_steps,
+        "teacher_forced_predictor_steps": PREDICTOR_STEPS,
         "rollout_inference_steps": inference_steps,
         "teacher_forced_avg": {
             key: float(np.mean([m[key] for m in teacher_forced_metrics]))

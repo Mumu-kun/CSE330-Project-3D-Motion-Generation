@@ -18,9 +18,10 @@ Note: Root X,Z are stored as velocities for autoregressive stability.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, cast
-from config import Config, FlowMatchingPredictorConfig
+from config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
 from transformers.activations import ACT2FN
 
 from utils.motion_utils import (
@@ -87,132 +88,179 @@ class KinematicChainEncoder(nn.Module):
         )  # (n_joints, model_dim)
 
 
+@dataclass
+class TemporalLayerCache:
+    key: Optional[torch.Tensor] = None
+    value: Optional[torch.Tensor] = None
+
+
+@dataclass
+class TemporalCacheState:
+    layers: List[TemporalLayerCache]
+
+
 class MotionHistoryEncoder(nn.Module):
-    def __init__(
-        self,
-        frame_feature_dim: int,  # e.g. 271
-        text_embedding_dim: int,  # e.g. 512
-        text_proj_dim: int,  # e.g. 128
-        model_dim: int,  # GRU hidden size H
-        per_joint_out_dim: int,  # D_joint, must match FlowMatchingPredictor model_dim
-        num_layers: int = 2,
-        joint_count: int = 22,
-        text_scale: float = 1.0,
-        dropout: float = 0.0,  # dropout between GRU layers if num_layers > 1
-        normalizer: Optional[
-            FeatureNormalizer
-        ] = None,  # Feature normalizer for normalization
-    ) -> None:
+    def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__()
+        self.config = config
+        self.frame_feature_dim = config.frame_feature_dim
+        self.text_embedding_dim = config.text_embedding_dim
+        self.model_dim = config.hidden_size
+        self.per_joint_out_dim = config.per_joint_output_dim
+        self.num_layers = config.num_hidden_layers
+        self.joint_count = config.joint_count
+        self.max_context_length = config.max_context_length
+        self.text_scale = config.text_scale
 
-        self.frame_feature_dim = frame_feature_dim
-        self.text_embedding_dim = text_embedding_dim
-        self.text_proj_dim = text_proj_dim
-        self.model_dim = model_dim
-        self.per_joint_out_dim = per_joint_out_dim
-        self.num_layers = num_layers
-        self.joint_count = joint_count
-        self.text_scale = text_scale
-        self.normalizer = normalizer
-
-        # Text → initial hidden state
-        self.text_to_hidden = nn.Linear(text_embedding_dim, model_dim)
-
-        self.text_proj = nn.Linear(text_embedding_dim, text_proj_dim)
-
-        # GRU over time, input is motion + text at each frame
-        self.gru = nn.GRU(
-            input_size=frame_feature_dim + text_proj_dim,
-            hidden_size=model_dim,
-            num_layers=num_layers,
+        self.frame_projection = nn.Linear(
+            config.frame_feature_dim, config.hidden_size, bias=True
+        )
+        self.text_projection = nn.Linear(
+            config.text_embedding_dim, config.hidden_size, bias=True
+        )
+        layer = nn.TransformerEncoderLayer(
+            d_model=config.hidden_size,
+            nhead=config.num_attention_heads,
+            dim_feedforward=config.intermediate_size,
+            dropout=config.dropout,
+            activation=ACT2FN[config.hidden_act],
+            layer_norm_eps=config.layer_norm_eps,
             batch_first=True,
-            dropout=dropout if num_layers > 1 else 0.0,
+            norm_first=True,
+            bias=config.attention_bias,
         )
-
-        # Shared MLP: global GRU hidden (B, H) → all joints (B, 22 * D_joint)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer=layer,
+            num_layers=config.num_hidden_layers,
+            norm=nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+        )
         self.global_to_joints = nn.Sequential(
-            nn.Linear(model_dim, model_dim),
-            nn.ReLU(),
-            nn.Linear(model_dim, joint_count * per_joint_out_dim),
+            nn.Linear(config.hidden_size, config.hidden_size, bias=config.mlp_bias),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(
+                config.hidden_size,
+                config.joint_count * config.per_joint_output_dim,
+                bias=config.mlp_bias,
+            ),
+        )
+        self.register_buffer(
+            "temporal_position_encoding",
+            self._build_positional_encoding(
+                config.max_context_length,
+                config.hidden_size,
+            ),
+            persistent=False,
         )
 
-    def init_hidden(self, text_emb: torch.Tensor) -> torch.Tensor:
-        """
-        text_emb: (B, text_dim)
-        Returns h0: (num_layers, B, hidden_dim)
-        """
-        h0 = self.text_to_hidden(text_emb)  # (B, H)
-        h0 = h0.unsqueeze(0).repeat(self.num_layers, 1, 1)
-        return h0  # (L, B, H)
+    @staticmethod
+    def _build_positional_encoding(length: int, dim: int) -> torch.Tensor:
+        positions = torch.arange(length, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(
+            torch.arange(0, dim, 2, dtype=torch.float32)
+            * (-torch.log(torch.tensor(10000.0)) / max(dim, 1))
+        )
+        encoding = torch.zeros(length, dim, dtype=torch.float32)
+        encoding[:, 0::2] = torch.sin(positions * div_term)
+        encoding[:, 1::2] = torch.cos(
+            positions * div_term[: encoding[:, 1::2].shape[1]]
+        )
+        return encoding
 
-    def _gru_block(
+    def _empty_cache_state(self) -> TemporalCacheState:
+        return TemporalCacheState(
+            layers=[TemporalLayerCache() for _ in range(self.num_layers)]
+        )
+
+    def forward(
         self,
-        motion_in: torch.Tensor,  # (B, T_step, motion_dim)
-        text_emb: torch.Tensor,  # (B, text_dim)
-        h: Optional[torch.Tensor],  # (L, B, H) or None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Shared core: runs GRU on motion_in with text conditioning and returns:
-          history_features: (B, 22, per_joint_dim) from the LAST timestep in this block
-          h_next: (L, B, H)
-        """
-        B, T_step, _ = motion_in.shape
+        motion_seq: torch.Tensor,
+        text_emb: torch.Tensor,
+        return_all: bool = False,
+    ) -> torch.Tensor:
+        if text_emb.ndim != 2 or text_emb.shape[-1] != self.text_embedding_dim:
+            raise ValueError(
+                "Expected text_emb shape "
+                f"(B, {self.text_embedding_dim}), got {tuple(text_emb.shape)}"
+            )
+        if text_emb.shape[0] != motion_seq.shape[0]:
+            raise ValueError(
+                "Batch size mismatch between motion_seq and text_emb: "
+                f"{tuple(motion_seq.shape)} vs {tuple(text_emb.shape)}"
+            )
 
-        if h is None:
-            h = self.init_hidden(text_emb)  # (L, B, H)
+        batch_size, seq_len, _ = motion_seq.shape
+        hidden_states = self.frame_projection(motion_seq)
+        text_tokens = self.text_projection(text_emb).unsqueeze(1)
+        positional = (
+            self.temporal_position_encoding[:seq_len]
+            .unsqueeze(0)
+            .to(
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        )
+        hidden_states = hidden_states + self.text_scale * text_tokens + positional
+        causal_mask = torch.ones(
+            seq_len,
+            seq_len,
+            device=motion_seq.device,
+            dtype=torch.bool,
+        ).triu(1)
+        hidden_states = self.transformer(hidden_states, mask=causal_mask)
+        joint_tokens = self.global_to_joints(hidden_states)
+        joint_context = joint_tokens.reshape(
+            batch_size,
+            seq_len,
+            self.joint_count,
+            self.per_joint_out_dim,
+        )
+        if return_all:
+            return joint_context
+        return joint_context[:, -1]
 
-        # Repeat scaled text over time
-        text_proj = self.text_proj(text_emb)
-        t_rep = self.text_scale * text_proj  # (B, text_proj_dim)
-        t_rep = t_rep.unsqueeze(1).expand(B, T_step, -1)  # (B, T_step, text_proj_dim)
-
-        # GRU input
-        gru_in = torch.cat([motion_in, t_rep], dim=-1)  # (B, T_step, motion+text)
-
-        # GRU forward
-        h_seq, h_next = self.gru(gru_in, h)  # h_seq: (B, T_step, H)
-        h_t = h_seq[:, -1, :]  # last timestep in this block, (B, H)
-
-        # Shared MLP to per-joint tokens
-        joint_tokens = self.global_to_joints(h_t)  # (B, 22 * D_joint)
-        history_features = joint_tokens.view(
-            B, self.joint_count, self.per_joint_out_dim
-        )  # (B, 22, D_joint)
-        # history_features = h_t.unsqueeze(1).expand(
-        #     B, self.joint_count, self.model_dim
-        # )  # (B, 22, H)
-
-        return history_features, h_next
-
-    def forward(self, motion_seq: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
-        """
-        motion_seq: (B, T, motion_dim)  full history window
-        text_emb:   (B, text_dim)       global text embedding
-        Returns:
-          history_features: (B, 22, per_joint_dim)
-        """
-        history_features, _ = self._gru_block(motion_seq, text_emb, h=None)
-        return history_features
-
-    def gru_step(
+    def step(
         self,
-        x_t: torch.Tensor,  # (B, motion_dim)  single frame features
-        text_emb: torch.Tensor,  # (B, text_dim)
-        h: Optional[torch.Tensor],  # (L, B, H) or None
-        use_normalization: bool = False,  # Whether to apply normalization to x_t
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        One-step update for AR inference.
-        Returns:
-          history_features: (B, 22, per_joint_dim)  summary up to this frame
-          h_next: (L, B, H)  next hidden state to carry forward
-        """
-        if use_normalization and self.normalizer is not None:
-            x_t = self.normalizer.normalize(x_t)
+        x_t: torch.Tensor,
+        text_emb: torch.Tensor,
+        frame_buffer: Optional[torch.Tensor],
+        cache_state: Optional[TemporalCacheState] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, TemporalCacheState]:
+        if x_t.ndim != 2 or x_t.shape[-1] != self.frame_feature_dim:
+            raise ValueError(
+                "Expected x_t shape "
+                f"(B, {self.frame_feature_dim}), got {tuple(x_t.shape)}"
+            )
 
-        motion_in = x_t.unsqueeze(1)  # (B, 1, motion_dim)
-        history_features, h_next = self._gru_block(motion_in, text_emb, h)
-        return history_features, h_next
+        if frame_buffer is None:
+            next_frame_buffer = x_t.unsqueeze(1)
+        else:
+            if (
+                frame_buffer.ndim != 3
+                or frame_buffer.shape[-1] != self.frame_feature_dim
+            ):
+                raise ValueError(
+                    "Expected frame_buffer shape "
+                    f"(B, T, {self.frame_feature_dim}), got {tuple(frame_buffer.shape)}"
+                )
+            if frame_buffer.shape[0] != x_t.shape[0]:
+                raise ValueError(
+                    "Batch size mismatch between x_t and frame_buffer: "
+                    f"{tuple(x_t.shape)} vs {tuple(frame_buffer.shape)}"
+                )
+            next_frame_buffer = torch.cat([frame_buffer, x_t.unsqueeze(1)], dim=1)
+
+        next_cache_state = cache_state or self._empty_cache_state()
+        if len(next_cache_state.layers) != self.num_layers:
+            raise ValueError(
+                "cache_state layer count mismatch: "
+                f"expected {self.num_layers}, got {len(next_cache_state.layers)}"
+            )
+        return (
+            self.forward(next_frame_buffer, text_emb),
+            next_frame_buffer,
+            next_cache_state,
+        )
 
     @property
     def output_dim(self) -> int:
@@ -677,8 +725,7 @@ def integrate_flow_ode(
     dtype = track_features.dtype
     if time_schedule_power <= 0.0:
         raise ValueError(
-            "time_schedule_power must be positive, got "
-            f"{time_schedule_power}"
+            "time_schedule_power must be positive, got " f"{time_schedule_power}"
         )
 
     if initial_state is None:
@@ -748,11 +795,12 @@ class HumanMotionGenerator:
         encoder: MotionHistoryEncoder,
         predictor: FlowMatchingPredictor,
         config: Config,
+        normalizer: Optional[FeatureNormalizer] = None,
     ) -> None:
         super().__init__()
         self.encoder = encoder
         self.predictor = predictor
-        self.normalizer = encoder.normalizer
+        self.normalizer = normalizer
         self.config = config
 
     def eval(self) -> "HumanMotionGenerator":
@@ -900,33 +948,38 @@ class HumanMotionGenerator:
                     dim=1,
                 )
 
+            text_emb = text[:, 0, :]
+            frame_buffer = feature_history[:, :-1]
+            cache_state: Optional[TemporalCacheState] = None
+
             for frame_idx in range(num_frames):
                 # ========================================
                 # Step A: Extract last frame from position history
                 # ========================================
                 current_positions = position_history[:, -1]  # (B, 22, 3)
+                current_frame = feature_history[:, -1]
 
                 # ========================================
                 # Step B: Encode context from last horizon frames
-                # Feature history is used only for context encoding.
+                # Feature history buffer is maintained outside the encoder.
                 # ========================================
-                # Slice to last horizon frames
                 if horizon is not None:
-                    horizon_frames = min(horizon, feature_history.shape[1])
-                    encoder_input = feature_history[
-                        :, -horizon_frames:, :
-                    ]  # (B, horizon, 271)
+                    buffer_len = max(horizon - 1, 0)
+                    if buffer_len == 0:
+                        frame_buffer = frame_buffer[:, :0, :]
+                    else:
+                        frame_buffer = frame_buffer[:, -buffer_len:, :]
                 else:
-                    encoder_input = feature_history
+                    frame_buffer = frame_buffer[
+                        :, -self.encoder.max_context_length :, :
+                    ]
 
-                # Strict text shape policy: (B, 1, 512) at entry, (B, 512) for encoder/predictor.
-                text_emb = text[:, 0, :]
-
-                context_cond = self.encoder(
-                    encoder_input,
+                context_cond, frame_buffer, cache_state = self.encoder.step(
+                    current_frame,
                     text_emb,
-                )  # (B, 22, per_joint_dim)
-                current_frame = feature_history[:, -1]
+                    frame_buffer=frame_buffer,
+                    cache_state=cache_state,
+                )
                 current_frame_features = extract_prev_frame_features(
                     current_frame,
                     normalizer=self.normalizer,
@@ -1023,19 +1076,7 @@ class HumanMotionGenerator:
         if "config" in checkpoint:
             config: Config = checkpoint["config"]
 
-        # Initialize Motion History Encoder (GRU-based)
-        encoder = MotionHistoryEncoder(
-            frame_feature_dim=config.encoder_motion_dim,
-            text_embedding_dim=config.encoder_text_dim,
-            text_proj_dim=config.encoder_text_proj_dim,
-            model_dim=config.encoder_hidden_dim,
-            per_joint_out_dim=config.encoder_per_joint_dim,
-            num_layers=config.encoder_num_layers,
-            joint_count=config.encoder_num_joints,
-            text_scale=config.encoder_text_scale,
-            dropout=config.encoder_dropout,
-            normalizer=normalizer,
-        ).to(device)
+        encoder = MotionHistoryEncoder(config.encoder_config).to(device)
 
         # Initialize Flow Matching Predictor with new config-based interface
         predictor_config = config.predictor_config
@@ -1044,7 +1085,6 @@ class HumanMotionGenerator:
         predictor = FlowMatchingPredictor(
             feature_size=feature_size,
             config=predictor_config,
-            normalizer=normalizer,
         ).to(device)
 
         # Load weights (Prefer EMA)
@@ -1062,4 +1102,4 @@ class HumanMotionGenerator:
         encoder.eval()
         predictor.eval()
 
-        return cls(encoder, predictor, config)
+        return cls(encoder, predictor, config, normalizer=normalizer)

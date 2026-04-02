@@ -43,7 +43,9 @@ from utils.motion_utils import (
     flow_output_to_positions,
     generated_positions_to_271d,
     extract_prev_frame_features,
-    subset_271d_to_72d,
+    sin_cos_to_yaw,
+    subset_271d_to_68d,
+    wrap_angle,
 )
 
 matplotlib.use("Agg")
@@ -286,7 +288,10 @@ def write_loss_vs_t_epoch_artifacts(
         raise ValueError(
             "Loss-vs-t artifact writing expects 1D tensors for steps, t, and loss"
         )
-    if global_steps.shape != t_values.shape or t_values.shape != per_sample_flow_loss.shape:
+    if (
+        global_steps.shape != t_values.shape
+        or t_values.shape != per_sample_flow_loss.shape
+    ):
         raise ValueError(
             "Loss-vs-t artifact writing expects matching tensor lengths, got "
             f"{tuple(global_steps.shape)}, {tuple(t_values.shape)}, "
@@ -514,18 +519,8 @@ class Trainer:
         normalizer: Optional[FeatureNormalizer] = None,
     ) -> Tuple[MotionHistoryEncoder, FlowMatchingPredictor]:
         """Create encoder and predictor from config for classmethod-based training."""
-        encoder = MotionHistoryEncoder(
-            frame_feature_dim=config.encoder_motion_dim,
-            text_embedding_dim=config.encoder_text_dim,
-            text_proj_dim=config.encoder_text_proj_dim,
-            model_dim=config.encoder_hidden_dim,
-            per_joint_out_dim=config.encoder_per_joint_dim,
-            num_layers=config.encoder_num_layers,
-            joint_count=config.encoder_num_joints,
-            text_scale=config.encoder_text_scale,
-            dropout=config.encoder_dropout,
-            normalizer=normalizer,
-        )
+        del normalizer
+        encoder = MotionHistoryEncoder(config.encoder_config)
         predictor = FlowMatchingPredictor(
             feature_size=config.get_predictor_feature_size(),
             config=config.predictor_config,
@@ -563,7 +558,7 @@ class Trainer:
             wandb_project=wandb_project,
             wandb_run_name=wandb_run_name,
             resume_from=resume_from,
-            normalizer=normalizer if normalizer is not None else encoder.normalizer,
+            normalizer=normalizer,
             val_dataloader=val_dataloader,
         )
         return trainer._run_training()
@@ -789,7 +784,10 @@ class Trainer:
             and torch.rand(1, device=device).item() <= self.config.cfg_dropout
         ):
             text_for_encoder = torch.zeros(
-                B, self.config.encoder_text_dim, device=device, dtype=text.dtype
+                B,
+                self.config.encoder_config.text_embedding_dim,
+                device=device,
+                dtype=text.dtype,
             )
         else:
             text_for_encoder = text[:, 0, :]
@@ -799,148 +797,50 @@ class Trainer:
         j_len = joints.shape[1]
 
         pred_steps = j_len - 1
+        if pred_steps <= 0:
+            raise ValueError(
+                f"Expected at least 2 post-seed frames, got motion length {j_len}."
+            )
         hist = motion[:, :-1]
-        hist_joints = joints[:, :-1]
         target_motion = motion[:, 1:]
-        target_joints = joints[:, 1:]
-        current_frame = hist[:, 0].detach().clone()
+        # rollout_prob = self._compute_rollout_probability(epoch)
+        # if rollout_prob > 0.0:
+        #     raise NotImplementedError(
+        #         "Training rollout for parallel processing contexts is intentionally "
+        #         "deferred for now. Set rollout_prob_start and rollout_prob_end to 0.0."
+        #     )
 
-        with timer(self.timing_stats, "forward/gru_init"):
-            context, h_state = enc.gru_step(hist[:, 0], text_for_encoder, h=None)
+        with timer(self.timing_stats, "forward/encoder_contexts"):
+            contexts_stacked = enc(hist, text_for_encoder, return_all=True)
 
-        rollout_prob = self._compute_rollout_probability(epoch)
-        rollout_block_len = self._compute_rollout_block_length(epoch)
-        ode_steps = max(1, int(self.config.rollout_integration_steps))
-        current_positions = hist_joints[:, 0].detach().clone()
-        rollout_steps_remaining = torch.zeros(B, dtype=torch.long, device=device)
-        flow_contexts: list[torch.Tensor] = []
-        flow_current_frame_features: list[torch.Tensor] = []
-        flow_x0: list[torch.Tensor] = []
-        flow_x1: list[torch.Tensor] = []
-        flow_xt: list[torch.Tensor] = []
-        flow_t: list[torch.Tensor] = []
+        hist_flat = hist.flatten(0, 1)
+        target_motion_flat = target_motion.flatten(0, 1)
+        current_frame_features_reshaped = extract_prev_frame_features(
+            hist_flat,
+            normalizer=self.normalizer,
+            normalize_output=self.normalizer is not None,
+        )
+        x1 = subset_271d_to_68d(
+            target_motion_flat,
+            prev_frame=hist_flat,
+            normalizer=self.normalizer,
+        )
+        x0 = torch.randn_like(x1)
+        t = self._sample_training_timesteps(
+            batch_size=B * pred_steps,
+            device=device,
+            dtype=x1.dtype,
+            epoch=epoch,
+        )
+        xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
 
-        for step_idx in range(pred_steps):
-            current_frame_features = extract_prev_frame_features(
-                current_frame,
-                normalizer=self.normalizer,
-                normalize_output=self.normalizer is not None,
-            )
-            x1 = subset_271d_to_72d(
-                target_motion[:, step_idx],
-                prev_frame=current_frame,
-                normalizer=self.normalizer,
-            )
-            x0 = torch.randn_like(x1)
-            t = self._sample_training_timesteps(
-                batch_size=B,
-                device=device,
-                dtype=x1.dtype,
-                epoch=epoch,
-            )
-            t_ = t.view(B, 1)
-            xt = t_ * x1 + (1 - t_) * x0
-            flow_contexts.append(context)
-            flow_current_frame_features.append(current_frame_features)
-            flow_x0.append(x0)
-            flow_x1.append(x1)
-            flow_xt.append(xt)
-            flow_t.append(t)
-
-            p = float(max(0.0, min(1.0, rollout_prob)))
-            active_rollout_mask = rollout_steps_remaining > 0
-            eligible_mask = ~active_rollout_mask
-            if p > 0.0 and eligible_mask.any():
-                if p >= 1.0:
-                    start_mask = eligible_mask
-                else:
-                    start_mask = eligible_mask & (torch.rand(B, device=device) < p)
-                if start_mask.any():
-                    rollout_steps_remaining[start_mask] = rollout_block_len
-            rollout_mask = rollout_steps_remaining > 0
-
-            next_input = target_motion[:, step_idx].clone()
-            if rollout_mask.any():
-                active_indices = rollout_mask.nonzero(as_tuple=False).squeeze(-1)
-                active_context = context[active_indices]
-                active_current_frame_features = current_frame_features[active_indices]
-                active_text_for_encoder = text_for_encoder[active_indices]
-                active_current_positions = current_positions[active_indices]
-                predictor_was_training = pred_model.training
-                pred_model.eval()
-                try:
-                    with timer(self.timing_stats, "forward/rollout_ode"):
-                        with torch.no_grad():
-                            x_t_roll = integrate_flow_ode(
-                                predictor=pred_model,
-                                track_features=active_context,
-                                current_frame_features=active_current_frame_features,
-                                text_embedding=active_text_for_encoder,
-                                num_steps=ode_steps,
-                                time_schedule_power=self.config.inference_t_schedule_power,
-                                initial_state=torch.randn_like(x1[active_indices]),
-                            )
-                finally:
-                    if predictor_was_training:
-                        pred_model.train()
-
-                with timer(self.timing_stats, "forward/pos_transform"):
-                    x_t_roll_raw = (
-                        self.normalizer.denormalize_flow_output(x_t_roll)
-                        if self.normalizer is not None
-                        else x_t_roll
-                    )
-                    current_frame_active = current_frame[active_indices]
-                    current_frame_raw = (
-                        self.normalizer.denormalize(current_frame_active)
-                        if self.normalizer is not None
-                        else current_frame_active
-                    )
-                    pred_positions_roll = flow_output_to_positions(
-                        x_t_roll_raw,
-                        prev_root_pos=active_current_positions[:, 0],
-                        prev_root_rot_6d=current_frame_raw[:, 69:75],
-                    )
-                    rollout_frame, _, _ = generated_positions_to_271d(
-                        new_positions=pred_positions_roll,
-                        prev_positions=active_current_positions,
-                        dataset_type="t2m",
-                        normalizer=self.normalizer,
-                    )
-
-                next_input[active_indices] = rollout_frame
-
-                next_positions = target_joints[:, step_idx].clone()
-                next_positions[active_indices] = pred_positions_roll
-                current_positions = next_positions.detach()
-            else:
-                current_positions = target_joints[:, step_idx].detach()
-
-            rollout_steps_remaining[rollout_mask] -= 1
-
-            current_frame = next_input.detach()
-
-            with timer(self.timing_stats, "forward/gru_step"):
-                context, h_state = enc.gru_step(
-                    next_input.detach(), text_for_encoder, h_state
-                )
-
-        contexts_stacked = torch.stack(flow_contexts, dim=1)
-        current_frame_features_stacked = torch.stack(flow_current_frame_features, dim=1)
-        x0_stacked = torch.stack(flow_x0, dim=1)
-        x1_stacked = torch.stack(flow_x1, dim=1)
-        xt_stacked = torch.stack(flow_xt, dim=1)
-        t_stacked = torch.stack(flow_t, dim=1)
         contexts_reshaped = contexts_stacked.flatten(0, 1)
-        current_frame_features_reshaped = current_frame_features_stacked.flatten(0, 1)
         text_batched = (
             text_for_encoder.unsqueeze(1)
             .expand(-1, pred_steps, -1)
             .reshape(B * pred_steps, -1)
         )
-        target_flow = (x1_stacked - x0_stacked).flatten(0, 1)
-        xt = xt_stacked.flatten(0, 1)
-        t = t_stacked.reshape(B * pred_steps)
+        target_flow = x1 - x0
 
         with timer(self.timing_stats, "forward/predictor"):
             pred, _, _ = pred_model.forward(
@@ -955,15 +855,50 @@ class Trainer:
             per_sample_flow_loss = compute_per_sample_flow_loss(pred, target_flow)
             flow_loss = F.mse_loss(pred, target_flow)
 
+        consistency_loss = flow_loss.new_zeros(())
+
+        if self.config.use_consistency_loss:
+            t_thresh_mask = t > self.config.consistency_loss_t_threshold
+            if t_thresh_mask.any():
+                with timer(self.timing_stats, "forward/consistency_loss"):
+                    pred_x1 = xt[t_thresh_mask] + pred[t_thresh_mask] * (
+                        1 - t.unsqueeze(1)[t_thresh_mask]
+                    )
+                    flow_output_raw = (
+                        self.normalizer.denormalize_flow_output(pred_x1)
+                        if self.normalizer is not None
+                        else pred_x1
+                    )
+                    x1_raw = (
+                        self.normalizer.denormalize_flow_output(x1[t_thresh_mask])
+                        if self.normalizer is not None
+                        else x1[t_thresh_mask]
+                    )
+
+                    root_loss = F.mse_loss(
+                        flow_output_raw[:, :3],
+                        x1_raw[:, :3],
+                    )
+
+                    x1_dyaw = sin_cos_to_yaw(x1_raw[:, 3:5])
+                    pred_dyaw = sin_cos_to_yaw(flow_output_raw[:, 3:5])
+                    yaw_error = wrap_angle(pred_dyaw - x1_dyaw)
+                    yaw_loss = yaw_error.pow(2).mean()
+
+                    ric_loss = F.mse_loss(
+                        flow_output_raw[:, pred_model.root_state_dim :],
+                        x1_raw[:, pred_model.root_state_dim :],
+                    )
+
+                    consistency_loss = ric_loss + root_loss + yaw_loss
+
         self._latest_flow_diagnostics = {
             "t": t.detach().cpu(),
             "per_sample_flow_loss": per_sample_flow_loss.detach().cpu(),
         }
 
-        consistency_loss = flow_loss.new_zeros(())
-
-        total_loss = flow_loss
-        return total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob
+        total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
+        return total_loss, flow_loss, consistency_loss, pred_steps, 0.0
 
     def validate(
         self,

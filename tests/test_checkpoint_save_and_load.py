@@ -19,7 +19,7 @@ from models import FlowMatchingPredictor, HumanMotionGenerator, MotionHistoryEnc
 from utils.motion_utils import (
     FeatureNormalizer,
     extract_prev_frame_features,
-    subset_271d_to_72d,
+    subset_271d_to_68d,
 )
 from utils.train_utils import EMAModel, Trainer
 
@@ -46,11 +46,13 @@ def _create_mock_normalizer() -> FeatureNormalizer:
 
 def _create_test_config() -> Config:
     config = Config(device="cpu")
-    config.encoder_num_layers = 2
-    config.encoder_hidden_dim = 128
-    config.encoder_text_proj_dim = 64
-    config.encoder_per_joint_dim = 32
-    config.encoder_dropout = 0.0
+    config.encoder_config.num_hidden_layers = 2
+    config.encoder_config.hidden_size = 128
+    config.encoder_config.intermediate_size = 256
+    config.encoder_config.per_joint_output_dim = 32
+    config.encoder_config.dropout = 0.0
+    config.encoder_config.attention_dropout = 0.0
+    config.encoder_config.max_context_length = 8
     config.predictor_config = FlowMatchingPredictorConfig(
         hidden_size=128,
         intermediate_size=256,
@@ -58,7 +60,7 @@ def _create_test_config() -> Config:
         num_attention_heads=4,
         attention_dropout=0.0,
         track_dimensionality=3,
-        global_cond_dim=config.encoder_text_dim,
+        global_cond_dim=config.encoder_config.text_embedding_dim,
         head_dim=None,
     )
     return config
@@ -68,18 +70,8 @@ def _create_models(
     config: Config,
     normalizer: FeatureNormalizer,
 ) -> tuple[MotionHistoryEncoder, FlowMatchingPredictor]:
-    encoder = MotionHistoryEncoder(
-        frame_feature_dim=config.encoder_motion_dim,
-        text_embedding_dim=config.encoder_text_dim,
-        text_proj_dim=config.encoder_text_proj_dim,
-        model_dim=config.encoder_hidden_dim,
-        per_joint_out_dim=config.encoder_per_joint_dim,
-        num_layers=config.encoder_num_layers,
-        joint_count=config.encoder_num_joints,
-        text_scale=config.encoder_text_scale,
-        dropout=config.encoder_dropout,
-        normalizer=normalizer,
-    ).to("cpu")
+    del normalizer
+    encoder = MotionHistoryEncoder(config.encoder_config).to("cpu")
 
     predictor = FlowMatchingPredictor(
         feature_size=config.get_predictor_feature_size(),
@@ -136,6 +128,26 @@ def _build_training_state() -> tuple[dict, dict]:
     return curriculum_state, training_state
 
 
+def _prime_trainer_checkpoint_state(
+    trainer: Trainer,
+    *,
+    checkpoint_dir: str,
+    encoder_ema: EMAModel[MotionHistoryEncoder],
+    predictor_ema: EMAModel[FlowMatchingPredictor],
+    optimizer: torch.optim.Optimizer,
+    scaler: GradScaler,
+    curriculum_state: dict,
+    training_state: dict,
+) -> None:
+    trainer.checkpoint_dir = checkpoint_dir
+    trainer.encoder_ema = encoder_ema
+    trainer.predictor_ema = predictor_ema
+    trainer.optimizer = optimizer
+    trainer.scaler = scaler
+    trainer.curriculum_state = dict(curriculum_state)
+    trainer.training_state = dict(training_state)
+
+
 def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
     _seed_all(7)
     config = _create_test_config()
@@ -167,7 +179,7 @@ def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
     T = 4
     history = torch.randn(B, T, 271)
     text_emb = torch.randn(B, 512)
-    target_state = subset_271d_to_72d(
+    target_state = subset_271d_to_68d(
         history[:, -1],
         prev_frame=history[:, -2],
         normalizer=normalizer,
@@ -178,6 +190,16 @@ def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        _prime_trainer_checkpoint_state(
+            trainer,
+            checkpoint_dir=tmpdir,
+            encoder_ema=encoder_ema,
+            predictor_ema=predictor_ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            curriculum_state=curriculum_state,
+            training_state=training_state,
+        )
         start = time.perf_counter()
 
         for step in range(steps):
@@ -204,18 +226,11 @@ def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
 
             if with_checkpoint_saves:
                 for save_idx in range(2):
+                    trainer.training_state["global_step"] = step
                     trainer.save_training_checkpoint(
-                        save_dir=tmpdir,
                         filename=f"step_{step}_{save_idx}.pt",
-                        encoder_ema=encoder_ema,
-                        predictor_ema=predictor_ema,
-                        optimizer=optimizer,
-                        scaler=scaler,
                         epoch=step,
-                        global_step=step,
                         loss=float(loss.item()),
-                        curriculum_state=curriculum_state,
-                        training_state=training_state,
                     )
 
         return time.perf_counter() - start
@@ -243,20 +258,23 @@ def test_checkpoint_save_latency_metrics() -> None:
 
     save_durations = []
     with tempfile.TemporaryDirectory() as tmpdir:
+        _prime_trainer_checkpoint_state(
+            trainer,
+            checkpoint_dir=tmpdir,
+            encoder_ema=encoder_ema,
+            predictor_ema=predictor_ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            curriculum_state=curriculum_state,
+            training_state=training_state,
+        )
         for idx in range(5):
             t0 = time.perf_counter()
+            trainer.training_state["global_step"] = idx
             trainer.save_training_checkpoint(
-                save_dir=tmpdir,
                 filename=f"latency_{idx}.pt",
-                encoder_ema=encoder_ema,
-                predictor_ema=predictor_ema,
-                optimizer=optimizer,
-                scaler=scaler,
                 epoch=idx,
-                global_step=idx,
                 loss=1.0,
-                curriculum_state=curriculum_state,
-                training_state=training_state,
             )
             save_durations.append(time.perf_counter() - t0)
 
@@ -374,7 +392,7 @@ def test_load_from_checkpoint_uses_embedded_config() -> None:
         )
 
         different_passed_config = Config(device="cpu")
-        different_passed_config.encoder_num_layers = 4
+        different_passed_config.encoder_config.num_hidden_layers = 4
         different_passed_config.predictor_config.num_hidden_layers = 4
 
         loaded = HumanMotionGenerator.load_from_checkpoint(
@@ -384,7 +402,10 @@ def test_load_from_checkpoint_uses_embedded_config() -> None:
             normalizer=normalizer,
         )
 
-    assert loaded.config.encoder_num_layers == config_in_ckpt.encoder_num_layers
+    assert (
+        loaded.config.encoder_config.num_hidden_layers
+        == config_in_ckpt.encoder_config.num_hidden_layers
+    )
     assert (
         loaded.config.predictor_config.num_hidden_layers
         == config_in_ckpt.predictor_config.num_hidden_layers
@@ -440,18 +461,21 @@ def test_load_from_full_training_checkpoint_payload() -> None:
     )
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        trainer.save_training_checkpoint(
-            save_dir=tmpdir,
-            filename="full_training.pt",
+        _prime_trainer_checkpoint_state(
+            trainer,
+            checkpoint_dir=tmpdir,
             encoder_ema=encoder_ema,
             predictor_ema=predictor_ema,
             optimizer=optimizer,
             scaler=scaler,
-            epoch=0,
-            global_step=3,
-            loss=0.123,
             curriculum_state=curriculum_state,
             training_state=training_state,
+        )
+        trainer.training_state["global_step"] = 3
+        trainer.save_training_checkpoint(
+            filename="full_training.pt",
+            epoch=0,
+            loss=0.123,
         )
 
         loaded = HumanMotionGenerator.load_from_checkpoint(

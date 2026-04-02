@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from config import Config, FlowMatchingPredictorConfig
 from models import MotionHistoryEncoder, FlowMatchingPredictor
 from utils.dataset import create_dataloader
-from utils.motion_utils import extract_prev_frame_features, subset_271d_to_72d
+from utils.motion_utils import extract_prev_frame_features, subset_271d_to_68d
 from utils.train_utils import Trainer
 
 
@@ -145,14 +145,17 @@ def get_smoke_config() -> Config:
     config.max_motion_length = 20
     config.horizon = 5
 
-    config.encoder_motion_dim = 271
-    config.encoder_text_dim = 512
-    config.encoder_text_proj_dim = 32
-    config.encoder_hidden_dim = 64
-    config.encoder_per_joint_dim = 64
-    config.encoder_num_layers = 1
-    config.encoder_text_scale = 1.0
-    config.encoder_dropout = 0.0
+    config.encoder_config.frame_feature_dim = 271
+    config.encoder_config.text_embedding_dim = 512
+    config.encoder_config.hidden_size = 64
+    config.encoder_config.intermediate_size = 128
+    config.encoder_config.per_joint_output_dim = 64
+    config.encoder_config.num_hidden_layers = 1
+    config.encoder_config.num_attention_heads = 4
+    config.encoder_config.text_scale = 1.0
+    config.encoder_config.dropout = 0.0
+    config.encoder_config.attention_dropout = 0.0
+    config.encoder_config.max_context_length = config.horizon
 
     config.predictor_config = FlowMatchingPredictorConfig(
         hidden_size=64,
@@ -165,7 +168,7 @@ def get_smoke_config() -> Config:
         attention_dropout=0.0,
         mlp_bias=True,
         track_dimensionality=3,
-        global_cond_dim=config.encoder_text_dim,
+        global_cond_dim=config.encoder_config.text_embedding_dim,
         head_dim=None,
     )
 
@@ -212,21 +215,11 @@ def _print_batch_summary(config: Config, batch: dict) -> None:
 
 
 def _build_models(config: Config, normalizer):
-    encoder = MotionHistoryEncoder(
-        frame_feature_dim=config.encoder_motion_dim,
-        text_embedding_dim=config.encoder_text_dim,
-        text_proj_dim=config.encoder_text_proj_dim,
-        model_dim=config.encoder_hidden_dim,
-        per_joint_out_dim=config.encoder_per_joint_dim,
-        num_layers=config.encoder_num_layers,
-        joint_count=config.encoder_num_joints,
-        text_scale=config.encoder_text_scale,
-        dropout=config.encoder_dropout,
-        normalizer=normalizer,
-    ).to(config.device)
+    del normalizer
+    encoder = MotionHistoryEncoder(config.encoder_config).to(config.device)
 
     predictor = FlowMatchingPredictor(
-        feature_size=config.encoder_per_joint_dim,
+        feature_size=config.encoder_config.per_joint_output_dim,
         config=config.predictor_config,
     ).to(config.device)
 
@@ -238,13 +231,13 @@ def _run_forward_check(
     encoder: MotionHistoryEncoder,
     predictor: FlowMatchingPredictor,
     batch: dict,
+    normalizer,
 ) -> None:
     device = torch.device(config.device)
     motion = batch["motion"].to(device)
     joints = batch["joints"].to(device)
     text_emb = _ensure_text_embedding(batch["text_clip"].to(device))
 
-    normalizer = encoder.normalizer
     motion_input = normalizer.normalize(motion) if normalizer is not None else motion
 
     encoder.eval()
@@ -254,15 +247,15 @@ def _run_forward_check(
         track_features = encoder(motion_input, text_emb)
         if track_features.shape != (
             motion.shape[0],
-            config.encoder_num_joints,
-            config.encoder_per_joint_dim,
+            config.encoder_config.joint_count,
+            config.encoder_config.per_joint_output_dim,
         ):
             raise AssertionError(
                 f"Unexpected encoder output shape: {tuple(track_features.shape)}"
             )
 
         current_frame = motion_input[:, -1]
-        noisy_features = subset_271d_to_72d(
+        noisy_features = subset_271d_to_68d(
             current_frame,
             prev_frame=motion_input[:, -2],
             normalizer=normalizer,
@@ -309,8 +302,8 @@ def run_e2e_test() -> bool:
     print(f"  Batch size: {config.batch_size}")
     print(f"  Epochs: {config.num_epochs}")
     print(f"  Horizon: {config.horizon}")
-    print(f"  Encoder hidden dim: {config.encoder_hidden_dim}")
-    print(f"  Encoder per-joint dim: {config.encoder_per_joint_dim}")
+    print(f"  Encoder hidden dim: {config.encoder_config.hidden_size}")
+    print(f"  Encoder per-joint dim: {config.encoder_config.per_joint_output_dim}")
     print(f"  Predictor hidden size: {config.predictor_config.hidden_size}")
 
     try:
@@ -338,7 +331,7 @@ def run_e2e_test() -> bool:
         print("\n" + "=" * 60)
         print("FORWARD CHECK")
         print("=" * 60)
-        _run_forward_check(config, encoder, predictor, batch)
+        _run_forward_check(config, encoder, predictor, batch, normalizer)
 
         print("\n" + "=" * 60)
         print("TRAIN")
