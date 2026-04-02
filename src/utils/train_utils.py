@@ -824,6 +824,7 @@ class Trainer:
             current_frame_features = extract_prev_frame_features(
                 current_frame,
                 normalizer=self.normalizer,
+                normalize_output=self.normalizer is not None,
             )
             x1 = subset_271d_to_72d(
                 target_motion[:, step_idx],

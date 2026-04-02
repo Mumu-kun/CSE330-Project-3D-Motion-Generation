@@ -720,6 +720,59 @@ class FeatureNormalizer:
         )
         return (flow_output - mean_68d) / std_68d
 
+    def normalize_current_frame_features(
+        self, current_frame_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Normalize the 257D current-frame conditioning vector for the predictor.
+
+        Layout:
+            [0:5]     Root: height(1) + vel(2) + sin(yaw), cos(yaw)
+            [5:257]   Joints: 21 x 12D (RIC + rot + vel)
+
+        The copied 271D slices reuse their matching dataset statistics, while the
+        yaw sin/cos slots stay in their natural [-1, 1] range.
+        """
+        if current_frame_features.shape[-1] != 257:
+            raise ValueError(
+                "Expected current_frame_features to have shape (..., 257), got "
+                f"{current_frame_features.shape}"
+            )
+
+        if current_frame_features.device != self.mean.device:
+            self.mean = self.mean.to(current_frame_features.device)
+            self.std = self.std.to(current_frame_features.device)
+
+        mean_257d = torch.cat(
+            [
+                self.mean[0:3],
+                torch.zeros(
+                    2,
+                    device=current_frame_features.device,
+                    dtype=current_frame_features.dtype,
+                ),
+                self.mean[6:69],
+                self.mean[75:201],
+                self.mean[204:267],
+            ],
+            dim=0,
+        )
+        std_257d = torch.cat(
+            [
+                self.std[0:3],
+                torch.ones(
+                    2,
+                    device=current_frame_features.device,
+                    dtype=current_frame_features.dtype,
+                ),
+                self.std[6:69],
+                self.std[75:201],
+                self.std[204:267],
+            ],
+            dim=0,
+        )
+        return (current_frame_features - mean_257d) / std_257d
+
 
 def sequence_joints_to_features(
     positions: torch.Tensor,
@@ -1000,6 +1053,7 @@ def flow_output_to_displacements(
 def extract_prev_frame_features(
     frame: torch.Tensor,
     normalizer: Optional["FeatureNormalizer"] = None,
+    normalize_output: bool = False,
 ) -> torch.Tensor:
     """
     Extract the 257D causal conditioning features from a 271D frame.
@@ -1009,10 +1063,14 @@ def extract_prev_frame_features(
         [5:257]   Joints: 21 x 12D (RIC + rot + vel) = 252D
 
     Args:
-        frame: (B, 271) single frame in raw or normalized feature space.
+        frame: (B, 271) single frame. When `normalizer` is provided, this is
+            expected to already be in normalized 271D feature space.
         normalizer: Optional canonical feature normalizer. When provided, root yaw
             is recovered from the denormalized root 6D rotation while the other
-            slices preserve the input feature scale.
+            slices preserve the requested predictor-input scale.
+        normalize_output: If True, normalize the copied predictor-conditioning
+            slices before returning them. The derived yaw sin/cos slots remain
+            in their natural scale.
 
     Returns:
         features: (B, 257)
@@ -1021,10 +1079,11 @@ def extract_prev_frame_features(
         raise ValueError(f"Expected frame shape (B, 271), got {tuple(frame.shape)}")
 
     raw_frame = normalizer.denormalize(frame) if normalizer is not None else frame
+    source_frame = raw_frame if normalize_output else frame
 
     # Root features (5D): height + velocity + yaw sin/cos
-    root_height = frame[:, 0:1]
-    root_vel = frame[:, 1:3]
+    root_height = source_frame[:, 0:1]
+    root_vel = source_frame[:, 1:3]
     root_yaw = root_rot6d_to_yaw_sin_cos(raw_frame[:, 69:75])
     root_features = torch.cat([root_height, root_vel, root_yaw], dim=-1)  # (B, 5)
 
@@ -1032,13 +1091,19 @@ def extract_prev_frame_features(
     # RIC: [6:69] = 63D for 21 joints
     # Rotations: [75:201] = 126D for 21 joints
     # Velocities: [204:267] = 63D for 21 joints
-    joint_ric = frame[:, 6:69]  # (B, 63)
-    joint_rot = frame[:, 75:201]  # (B, 126)
-    joint_vel = frame[:, 204:267]  # (B, 63)
+    joint_ric = source_frame[:, 6:69]  # (B, 63)
+    joint_rot = source_frame[:, 75:201]  # (B, 126)
+    joint_vel = source_frame[:, 204:267]  # (B, 63)
 
     joint_features = torch.cat([joint_ric, joint_rot, joint_vel], dim=-1)  # (B, 252)
 
-    return torch.cat([root_features, joint_features], dim=-1)  # (B, 257)
+    current_frame_features = torch.cat([root_features, joint_features], dim=-1)
+    if normalize_output and normalizer is not None:
+        current_frame_features = normalizer.normalize_current_frame_features(
+            current_frame_features
+        )
+
+    return current_frame_features  # (B, 257)
 
 
 def flow_output_to_271d(

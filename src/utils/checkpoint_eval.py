@@ -327,6 +327,7 @@ def predict_next_positions(
     current_frame_features = extract_prev_frame_features(
         current_frame_norm,
         normalizer=generator.normalizer,
+        normalize_output=generator.normalizer is not None,
     )
 
     x_t = integrate_flow_ode(

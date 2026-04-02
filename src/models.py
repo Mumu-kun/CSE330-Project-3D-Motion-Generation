@@ -930,6 +930,7 @@ class HumanMotionGenerator:
                 current_frame_features = extract_prev_frame_features(
                     current_frame,
                     normalizer=self.normalizer,
+                    normalize_output=self.normalizer is not None,
                 )
 
                 # ========================================
