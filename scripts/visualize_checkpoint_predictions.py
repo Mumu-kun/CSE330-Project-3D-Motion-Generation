@@ -24,10 +24,14 @@ from utils.motion_utils import FeatureNormalizer, generated_positions_to_271d
 from utils.visualization import plot_3d_motion
 
 
-CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "best_val7.pt"
+CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest8.pt"
 DATASET_PATH = PROJECT_ROOT / "tests" / "dataset" / "humanml3d-subset-mini"
+PREDICTOR_STEPS = 10
 OUTPUT_DIR = (
-    PROJECT_ROOT / "output" / "checkpoint_visualizations" / CHECKPOINT_PATH.stem
+    PROJECT_ROOT
+    / "output"
+    / "checkpoint_visualizations"
+    / f"{CHECKPOINT_PATH.stem}_{PREDICTOR_STEPS*2}_steps"
 )
 MASKED_TEACHER_FORCE_PROB = 0.4
 
@@ -214,11 +218,11 @@ def main() -> None:
     motion_norm = normalizer.normalize(motion_raw)
 
     horizon = int(config.horizon)
-    predictor_steps = 50
     inference_steps = max(
         1,
-        int(getattr(config, "num_inference_steps", predictor_steps)),
+        int(getattr(config, "num_inference_steps", PREDICTOR_STEPS)),
     )
+    inference_steps = PREDICTOR_STEPS
 
     teacher_forced_positions = [joints[:, 0]]
     teacher_forced_metrics: list[dict[str, float]] = []
@@ -239,7 +243,7 @@ def main() -> None:
                 current_positions=current_positions,
                 current_frame_norm=current_frame_norm,
                 text_embedding=text_clip[:, 0, :],
-                num_steps=predictor_steps,
+                num_steps=PREDICTOR_STEPS,
             )
             teacher_forced_positions.append(pred_positions)
             teacher_forced_metrics.append(
@@ -260,7 +264,7 @@ def main() -> None:
         rollout_positions, _, _ = generator.generate_sequence(
             text=text_clip,
             num_frames=rollout_frames,
-            num_steps=predictor_steps,
+            num_steps=PREDICTOR_STEPS,
             horizon=horizon,
             input_positions=seed_positions,
             guidance_scale=1.0,
@@ -282,7 +286,7 @@ def main() -> None:
             joints=joints,
             motion_norm=motion_norm,
             text_clip=text_clip,
-            num_steps=predictor_steps,
+            num_steps=PREDICTOR_STEPS,
             teacher_force_prob=MASKED_TEACHER_FORCE_PROB,
         )
     )
@@ -343,7 +347,7 @@ def main() -> None:
         "caption": caption,
         "horizon": horizon,
         "rollout_seed_length": horizon,
-        "teacher_forced_predictor_steps": predictor_steps,
+        "teacher_forced_PREDICTOR_STEPS": PREDICTOR_STEPS,
         "rollout_inference_steps": inference_steps,
         "teacher_forced_avg": {
             key: float(np.mean([m[key] for m in teacher_forced_metrics]))
