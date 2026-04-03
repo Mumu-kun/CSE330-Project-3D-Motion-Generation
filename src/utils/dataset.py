@@ -308,7 +308,7 @@ class Text2MotionDataset(Dataset):
             return
         assert length <= self.max_motion_length
         self.pointer = np.searchsorted(self.length_arr, length)
-        print("Pointer Pointing at %d" % self.pointer)
+        # print("Pointer Pointing at %d" % self.pointer)
 
     def set_horizon(self, horizon: int | None = None):
         """

@@ -403,6 +403,7 @@ class Trainer:
         self.device: Union[str, torch.device] = config.device
         self.checkpoint_dir = str(config.checkpoint_dir)
         self.wandb_logger: Optional[WandbLogger] = None
+        self.wandb_resume_id: Optional[str] = None
         self.encoder_ema: Optional[EMAModel[MotionHistoryEncoder]] = None
         self.predictor_ema: Optional[EMAModel[FlowMatchingPredictor]] = None
         self.optimizer: Optional[Optimizer] = None
@@ -412,9 +413,28 @@ class Trainer:
         self._latest_flow_diagnostics: Optional[Dict[str, torch.Tensor]] = None
         self._checkpoint_flow_diagnostics: Optional[Dict[str, torch.Tensor]] = None
         self.start_epoch = 0
+        self.current_epoch = 0
+        self.total_epochs = int(config.num_epochs)
         self.device_str = str(config.device)
         self.use_amp = False
         self.amp_dtype = torch.float32
+
+    def _resolve_total_epochs_from_checkpoint(self, checkpoint: Dict[str, Any]) -> int:
+        """Restore the original total epoch budget saved with a checkpoint."""
+        total_epochs = checkpoint.get("total_epochs")
+        if total_epochs is None:
+            checkpoint_config = checkpoint.get("config")
+            if isinstance(checkpoint_config, Config):
+                total_epochs = checkpoint_config.num_epochs
+            else:
+                total_epochs = self.config.num_epochs
+        return max(0, int(total_epochs))
+
+    def _build_epoch_progress(self) -> tuple[range, int, int]:
+        """Return the resumed epoch range plus tqdm initial/total values."""
+        total_epochs = max(0, int(self.total_epochs))
+        initial_epoch = max(0, min(int(self.start_epoch), total_epochs))
+        return range(initial_epoch, total_epochs), initial_epoch, total_epochs
 
     def _compute_post_warmup_progress(self, epoch: int) -> float | None:
         """Return rollout-schedule progress after warmup, or None during warmup."""
@@ -844,31 +864,11 @@ class Trainer:
         horizon = self.config.horizon
         curriculum = self.config.curriculum
         cfg_dropout = self.config.cfg_dropout
-        num_epochs = self.config.num_epochs
+        num_epochs = int(self.config.num_epochs)
 
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         self.encoder.to(device)
         self.predictor.to(device)
-
-        self.wandb_logger = None
-        if self.wandb_project:
-            wandb_config = {
-                "lr": lr,
-                "weight_decay": weight_decay,
-                "ema_decay": ema_decay,
-                "num_epochs": num_epochs,
-                "horizon": horizon,
-                "cfg_dropout": cfg_dropout,
-                "batch_size": self.dataloader.batch_size,
-                "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
-                "predictor_params": sum(p.numel() for p in self.predictor.parameters()),
-                "curriculum": curriculum,
-            }
-            self.wandb_logger = WandbLogger(
-                project=self.wandb_project,
-                name=self.wandb_run_name,
-                config=wandb_config,
-            )
 
         self.encoder_ema = EMAModel(self.encoder, decay=ema_decay).to(device)
         self.predictor_ema = EMAModel(self.predictor, decay=ema_decay).to(device)
@@ -894,6 +894,9 @@ class Trainer:
             "best_val_epoch": -1,
         }
         self.start_epoch = 0
+        self.current_epoch = 0
+        self.total_epochs = num_epochs
+        self.wandb_resume_id = None
 
         if self.resume_from is not None and os.path.exists(self.resume_from):
             print(f"Resuming from checkpoint: {self.resume_from}")
@@ -911,6 +914,11 @@ class Trainer:
             if self.scaler is not None:
                 self.scaler.load_state_dict(checkpoint["scaler"])
             self.start_epoch = checkpoint.get("epoch", 0) + 1
+            self.current_epoch = self.start_epoch
+            self.total_epochs = self._resolve_total_epochs_from_checkpoint(checkpoint)
+            if self.total_epochs < self.start_epoch:
+                self.total_epochs = self.start_epoch
+            self.config.num_epochs = self.total_epochs
             self.training_state["global_step"] = checkpoint.get("global_step", 0)
             self.training_state["best_loss"] = checkpoint.get("best_loss", float("inf"))
             self.training_state["best_epoch"] = checkpoint.get("best_epoch", -1)
@@ -920,10 +928,42 @@ class Trainer:
             self.training_state["best_val_epoch"] = checkpoint.get("best_val_epoch", -1)
             if "current_horizon" in checkpoint:
                 self.training_state["current_horizon"] = checkpoint["current_horizon"]
+            checkpoint_wandb_run_id = checkpoint.get("wandb_run_id")
+            if checkpoint_wandb_run_id is not None:
+                self.wandb_resume_id = str(checkpoint_wandb_run_id)
+            checkpoint_wandb_run_name = checkpoint.get("wandb_run_name")
+            if self.wandb_run_name is None and checkpoint_wandb_run_name is not None:
+                self.wandb_run_name = str(checkpoint_wandb_run_name)
             print(
-                f"Resumed from epoch {self.start_epoch}, "
+                f"Resumed from epoch {self.start_epoch}/{self.total_epochs}, "
                 f"step {self.training_state['global_step']}"
             )
+
+        num_epochs = int(self.config.num_epochs)
+        self.wandb_logger = None
+        if self.wandb_project:
+            wandb_config = {
+                "lr": lr,
+                "weight_decay": weight_decay,
+                "ema_decay": ema_decay,
+                "num_epochs": num_epochs,
+                "horizon": horizon,
+                "cfg_dropout": cfg_dropout,
+                "batch_size": self.dataloader.batch_size,
+                "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
+                "predictor_params": sum(p.numel() for p in self.predictor.parameters()),
+                "curriculum": curriculum,
+            }
+            self.wandb_logger = WandbLogger(
+                project=self.wandb_project,
+                name=self.wandb_run_name,
+                config=wandb_config,
+                resume_id=self.wandb_resume_id,
+                resume="allow" if self.wandb_resume_id else None,
+            )
+            if self.wandb_logger.run is not None:
+                self.wandb_resume_id = str(self.wandb_logger.run.id)
+                self.wandb_run_name = str(self.wandb_logger.run.name)
 
         if curriculum is not None and len(curriculum) > 0:
             print(f"Training for {num_epochs} epochs with curriculum: {curriculum}")
@@ -993,6 +1033,7 @@ class Trainer:
             "optimizer": optimizer.state_dict(),
             "scaler": scaler.state_dict(),
             "epoch": epoch,
+            "total_epochs": int(self.total_epochs),
             "global_step": self.training_state["global_step"],
             "loss": loss,
             "horizon": self.curriculum_state["max_horizon"],
@@ -1003,6 +1044,15 @@ class Trainer:
             "best_val_loss": self.training_state["best_val_loss"],
             "best_val_epoch": self.training_state["best_val_epoch"],
         }
+        wandb_run = self.wandb_logger.run if self.wandb_logger is not None else None
+        if wandb_run is not None:
+            checkpoint["wandb_run_id"] = str(wandb_run.id)
+            checkpoint["wandb_run_name"] = str(wandb_run.name)
+            checkpoint["wandb_run_url"] = str(wandb_run.url)
+        elif self.wandb_resume_id is not None:
+            checkpoint["wandb_run_id"] = str(self.wandb_resume_id)
+            if self.wandb_run_name is not None:
+                checkpoint["wandb_run_name"] = str(self.wandb_run_name)
         checkpoint["config"] = self.config
         torch.save(checkpoint, path)
         print(f"Saved checkpoint: {path}")
@@ -1256,7 +1306,7 @@ class Trainer:
         ):
             raise RuntimeError("Training environment is not initialized.")
 
-        num_epochs = self.config.num_epochs
+        epoch_range, initial_epoch, num_epochs = self._build_epoch_progress()
         lr = self.config.learning_rate
         max_grad_norm = self.config.gradient_clip
         val_interval = self.config.val_interval
@@ -1264,12 +1314,17 @@ class Trainer:
         val_use_ema = self.config.val_use_ema
         wandb_logger = self.wandb_logger
 
-        epoch = self.start_epoch - 1
+        epoch = initial_epoch - 1
         epoch_pbar = tqdm(
-            range(self.start_epoch, num_epochs), desc="Training", unit="epoch"
+            epoch_range,
+            total=num_epochs,
+            initial=initial_epoch,
+            desc="Training",
+            unit="epoch",
         )
         try:
             for epoch in epoch_pbar:
+                self.current_epoch = epoch
                 prev_horizon = self.curriculum_state["current_horizon"]
                 if self.curriculum_state["use_curriculum"] and self.config.curriculum:
                     for level in reversed(self.config.curriculum):

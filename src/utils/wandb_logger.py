@@ -83,6 +83,8 @@ class WandbLogger:
         project: str,
         name: Optional[str] = None,
         config: Optional[Dict[str, Any]] = None,
+        resume_id: Optional[str] = None,
+        resume: Optional[str] = None,
         kaggle_secret_name: str = "WANDB_API_KEY",
         enabled: bool = True,
     ):
@@ -90,6 +92,8 @@ class WandbLogger:
         self.config = config or {}
         self.enabled = enabled and WANDB_AVAILABLE
         self.run = None
+        self.resume_id = resume_id
+        self.resume = resume
 
         # Auto-generate run name from datetime if not provided
         if name is None:
@@ -112,7 +116,10 @@ class WandbLogger:
             self.run = wandb.init(
                 project=project,
                 entity="motion-generation-buet",
+                name=self.name,
                 config=config,
+                id=self.resume_id,
+                resume=self.resume,
                 reinit=True,
             )
             print(f"[WandbLogger] Initialized run: {self.run.name}")

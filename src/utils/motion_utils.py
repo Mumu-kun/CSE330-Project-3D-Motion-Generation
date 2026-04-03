@@ -803,7 +803,7 @@ def sequence_joints_to_features(
         Feature vectors (N, 271) or (B, N, 271)
     """
     config = get_dataset_config(dataset_type)
-    raw_offsets = config["raw_offsets"]
+    raw_offsets = config["raw_offsets"].to(device=positions.device, dtype=positions.dtype)
     kinematic_chain = config["kinematic_chain"]
     face_joint_indx = config["face_joint_indx"]
     fid_r = config["fid_r"]

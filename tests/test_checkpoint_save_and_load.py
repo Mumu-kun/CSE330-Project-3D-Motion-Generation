@@ -4,6 +4,7 @@ import os
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 from typing import Dict
 
 import numpy as np
@@ -16,9 +17,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from config import Config, FlowMatchingPredictorConfig
 from models import FlowMatchingPredictor, HumanMotionGenerator, MotionHistoryEncoder
+from utils import motion_utils, train_utils as train_utils_module
 from utils.motion_utils import (
     FeatureNormalizer,
     extract_prev_frame_features,
+    sequence_joints_to_features,
     subset_271d_to_68d,
 )
 from utils.train_utils import EMAModel, Trainer
@@ -233,6 +236,38 @@ def _run_tiny_train_loop(with_checkpoint_saves: bool, steps: int = 4) -> float:
                     )
 
         return time.perf_counter() - start
+
+
+def test_sequence_joints_to_features_aligns_raw_offsets_device_and_dtype(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, torch.Tensor] = {}
+
+    def fake_compute_ik(
+        positions: torch.Tensor,
+        raw_offsets: torch.Tensor,
+        kinematic_chain: list[list[int]],
+        face_joint_indx: list[int],
+    ) -> torch.Tensor:
+        del kinematic_chain, face_joint_indx
+        captured["positions"] = positions
+        captured["raw_offsets"] = raw_offsets
+        quaternions = torch.zeros(
+            positions.shape[:-2] + (22, 4),
+            device=positions.device,
+            dtype=positions.dtype,
+        )
+        quaternions[..., 0] = 1.0
+        return quaternions
+
+    monkeypatch.setattr(motion_utils, "_compute_ik", fake_compute_ik)
+
+    positions = torch.randn(3, 22, 3, dtype=torch.float64)
+    features = sequence_joints_to_features(positions)
+
+    assert captured["raw_offsets"].device == captured["positions"].device
+    assert captured["raw_offsets"].dtype == captured["positions"].dtype
+    assert features.shape == (3, 271)
 
 
 def test_checkpoint_save_latency_metrics() -> None:
@@ -497,3 +532,135 @@ def test_load_from_full_training_checkpoint_payload() -> None:
     assert positions.shape == (1, 5, 22, 3)
     assert features.shape == (1, 5, 271)
     assert rel_shifts.shape == (1, 5, 22, 3)
+
+
+def test_resume_restores_total_epochs_and_wandb_run_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _seed_all(16)
+    saved_config = _create_test_config()
+    saved_config.curriculum = None
+    saved_config.num_epochs = 12
+    normalizer = _create_mock_normalizer()
+    encoder, predictor = _create_models(saved_config, normalizer)
+
+    optimizer = torch.optim.AdamW(
+        list(encoder.parameters()) + list(predictor.parameters()),
+        lr=1e-4,
+        weight_decay=1e-5,
+    )
+    scaler = GradScaler("cuda", enabled=False)
+    encoder_ema = EMAModel(encoder, decay=0.999)
+    predictor_ema = EMAModel(predictor, decay=0.999)
+    curriculum_state, training_state = _build_training_state()
+    trainer = Trainer(
+        encoder=encoder,
+        predictor=predictor,
+        dataloader=_empty_dataloader(),
+        config=saved_config,
+        normalizer=normalizer,
+    )
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        checkpoint_path = os.path.join(tmpdir, "resume.pt")
+        _prime_trainer_checkpoint_state(
+            trainer,
+            checkpoint_dir=tmpdir,
+            encoder_ema=encoder_ema,
+            predictor_ema=predictor_ema,
+            optimizer=optimizer,
+            scaler=scaler,
+            curriculum_state=curriculum_state,
+            training_state=training_state,
+        )
+        trainer.wandb_logger = SimpleNamespace(
+            run=SimpleNamespace(
+                id="wandb-run-123",
+                name="motion-generation-buet",
+                url="https://wandb.test/runs/wandb-run-123",
+            )
+        )
+        trainer.training_state["global_step"] = 21
+        trainer.save_training_checkpoint(
+            filename="resume.pt",
+            epoch=3,
+            loss=0.123,
+        )
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        assert checkpoint["total_epochs"] == 12
+        assert checkpoint["wandb_run_id"] == "wandb-run-123"
+        assert checkpoint["wandb_run_name"] == "motion-generation-buet"
+
+        # Simulate an older checkpoint created before total_epochs was persisted.
+        checkpoint.pop("total_epochs")
+        torch.save(checkpoint, checkpoint_path)
+
+        captured: dict[str, object] = {}
+
+        class FakeWandbLogger:
+            def __init__(
+                self,
+                project: str,
+                name: str | None = None,
+                config: dict | None = None,
+                resume_id: str | None = None,
+                resume: str | None = None,
+                **_: object,
+            ) -> None:
+                captured["project"] = project
+                captured["name"] = name
+                captured["config"] = config
+                captured["resume_id"] = resume_id
+                captured["resume"] = resume
+                self.run = SimpleNamespace(
+                    id=resume_id or "new-run-id",
+                    name=name or "motion-generation-buet",
+                    url="https://wandb.test/runs/resumed",
+                )
+
+            def log(self, metrics: dict, step: int | None = None) -> None:
+                del metrics, step
+
+            def log_image(
+                self,
+                key: str,
+                path: str,
+                step: int | None = None,
+                caption: str | None = None,
+            ) -> None:
+                del key, path, step, caption
+
+            def log_summary(self, metrics: dict) -> None:
+                del metrics
+
+            def finish(self) -> None:
+                return None
+
+        monkeypatch.setattr(train_utils_module, "WandbLogger", FakeWandbLogger)
+
+        resume_config = _create_test_config()
+        resume_config.curriculum = None
+        resume_config.num_epochs = 5
+        resume_encoder, resume_predictor = _create_models(resume_config, normalizer)
+        resume_trainer = Trainer(
+            encoder=resume_encoder,
+            predictor=resume_predictor,
+            dataloader=_empty_dataloader(),
+            config=resume_config,
+            normalizer=normalizer,
+            wandb_project="motion-generation",
+            resume_from=checkpoint_path,
+        )
+        resume_trainer.setup_training_environment()
+
+    assert resume_trainer.start_epoch == 4
+    assert resume_trainer.current_epoch == 4
+    assert resume_trainer.total_epochs == 12
+    assert resume_trainer.config.num_epochs == 12
+    assert captured["project"] == "motion-generation"
+    assert captured["name"] == "motion-generation-buet"
+    assert captured["resume_id"] == "wandb-run-123"
+    assert captured["resume"] == "allow"
+    assert isinstance(captured["config"], dict)
+    assert captured["config"]["num_epochs"] == 12

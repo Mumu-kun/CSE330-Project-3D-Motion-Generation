@@ -185,12 +185,12 @@ class Config:
     rollout_prob_start: float = 0.1  # Rollout probability at first epoch
     rollout_prob_end: float = 0.3  # Rollout probability at final epoch
     rollout_warmup_fraction: float = (
-        0.25  # Fraction of training with rollout disabled before schedule starts
+        0.15  # Fraction of training with rollout disabled before schedule starts
     )
     rollout_block_len_start: int = 1  # Rollout block length at schedule start
     rollout_block_len_end: int = 4  # Rollout block length at schedule end
     rollout_integration_steps: int = (
-        5  # Number of ODE integration steps for rollout branch
+        3  # Number of ODE integration steps for rollout branch
     )
     rollout_subset_fraction: float = 0.25  # Fraction of batch for rollout branch
     rollout_loss_weight: float = 1.0  # Weight of rollout-conditioned loss branch
@@ -226,7 +226,7 @@ class Config:
     # Profiling settings
     enable_profiling: bool = False  # Enable timing instrumentation
     timing_log_interval: int = 100  # Log timings every N batches
-    tqdm_log_per_batch: bool = True  # Show per-batch tqdm progress during training
+    tqdm_log_per_batch: bool = False  # Show per-batch tqdm progress during training
 
     unit_length = 5
 
