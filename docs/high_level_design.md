@@ -1,6 +1,6 @@
 # High-Level Architecture Design: Human Motion Generation
 
-This document summarizes the architecture that is actually implemented in `src/`. The project is a text-conditioned autoregressive motion generator built around a GRU history encoder, a flow-matching spatial transformer, and a frame-by-frame conversion pipeline between absolute positions and compact motion features.
+This document summarizes the architecture that is actually implemented in `src/`. The project is a text-conditioned autoregressive motion generator built around a causal temporal history encoder, a flow-matching spatial transformer, and a frame-by-frame conversion loop between absolute positions and compact motion features.
 
 ## 1. System Summary
 
@@ -12,8 +12,8 @@ At a high level, each generated frame is produced in four stages:
 4. Convert the new positions back into a 271D frame and append them to history.
 
 The recurrent state is therefore not a latent-only state. It is a pair of concrete, interpretable histories:
-- absolute joint positions;
-- derived 271D feature frames.
+- absolute joint positions
+- derived 271D feature frames
 
 ## 2. Main Components
 
@@ -22,44 +22,48 @@ The recurrent state is therefore not a latent-only state. It is a pair of concre
 Implemented in `src/models.py` as `MotionHistoryEncoder`.
 
 Role:
-- reads a variable-length motion window `(B, T, 271)`;
-- conditions each timestep on pooled CLIP text `(B, 512)`;
-- emits one context token per joint `(B, 22, D_joint)`.
+- reads a variable-length motion window `(B, T, 271)`
+- conditions each timestep on pooled CLIP text `(B, 512)`
+- emits one context token per joint `(B, 22, D_joint)` or one context tensor per timestep when `return_all=True`
 
 Current data path:
 
 ```text
 motion history (B, T, 271)
 text embedding (B, 512)
-    -> text_to_hidden(text) for GRU initial state
-    -> text_proj(text) repeated across T
-    -> concat(motion, repeated_text)
-    -> GRU over time
-    -> last hidden state
-    -> MLP
-    -> reshape to (B, 22, per_joint_out_dim)
+    -> frame_projection(motion)
+    -> text_projection(text) -> shift, scale
+    -> FiLM-style modulation of every timestep
+    -> causal temporal self-attention with RoPE
+    -> gated MLP blocks
+    -> final norm
+    -> per-timestep projection to 22 joint tokens
 ```
 
 Why it exists:
-- The GRU supplies temporal memory cheaply.
-- The predictor can then operate over joints at a single frame rather than running a full spatiotemporal transformer over the whole sequence.
+- It gives the predictor a temporally informed summary without forcing the predictor itself to model full spatiotemporal attention.
+- The encoder is causal, so each context only depends on current and past frames.
+
+Important implementation note:
+- `step(...)` exists for generation, but it currently recomputes over the explicit `frame_buffer`.
+- `TemporalCacheState` is part of the interface, but there is no real KV-cache acceleration yet.
 
 ### B. Flow Matching Predictor
 
 Implemented in `src/models.py` as `FlowMatchingPredictor`.
 
 Role:
-- predicts flow in a reduced next-frame state space;
-- reasons jointly over root and non-root joints using attention across 22 tokens.
+- predicts flow in a reduced next-frame state space
+- reasons jointly over root and non-root joints using attention across 22 tokens
 
 Current tokenization:
-- token 0: root
-- tokens 1-21: non-root joints
+- token `0`: root
+- tokens `1..21`: non-root joints
 
 Per-token inputs are assembled from three sources:
-- noisy reduced-state features;
-- per-joint history features from the GRU encoder;
-- current-frame causal features extracted from the latest 271D frame.
+- noisy reduced-state features
+- per-joint history features from the temporal encoder
+- current-frame causal features extracted from the latest 271D frame
 
 Conditioning path:
 
@@ -71,46 +75,47 @@ time embedding + text projection -> AdaLN conditioning
 
 Structure prior:
 - A `KinematicChainEncoder` provides a fixed embedding per joint based on chain id and depth.
-- Each transformer layer adds this prior through a learned scalar gate, initialized as a no-op.
+- Each transformer layer adds this prior through a learned bounded scalar gate.
 
 ### C. Frame Conversion Layer
 
 Implemented primarily in `src/utils/motion_utils.py`.
 
-This layer is what keeps training and inference grounded in explicit motion geometry.
+This layer keeps training and inference grounded in explicit motion geometry.
 
 Key responsibilities:
-- convert full 271D frames to the 68D predictor target;
-- reconstruct absolute positions from predicted reduced states;
-- derive fresh 271D features from generated positions;
-- optionally canonicalize generated positions with FK-consistent offsets.
+- convert full 271D frames to the 68D predictor target
+- reconstruct absolute positions from predicted reduced states
+- derive fresh 271D features from generated positions
+- optionally canonicalize generated positions with FK-consistent offsets
 
-This conversion layer is the bridge between:
-- the model-friendly reduced state used by flow matching;
-- the motion-friendly 271D representation used by the encoder and dataset.
+This conversion layer bridges:
+- the model-friendly reduced state used by flow matching
+- the motion-friendly 271D representation used by the encoder and dataset
 
 ### D. Human Motion Generator
 
 Implemented in `src/models.py` as `HumanMotionGenerator`.
 
 Role:
-- orchestrates encoder, predictor, and conversion utilities for autoregressive generation.
+- orchestrates encoder, predictor, and conversion utilities for autoregressive generation
 
-Important implementation choice:
-- the generator keeps **absolute positions** as the primary autoregressive state;
-- 271D features are re-derived every step instead of treating the predictor output as a complete persistent feature frame.
+Important implementation choices:
+- the generator keeps absolute positions as the primary autoregressive state
+- 271D features are re-derived every step instead of treating the predictor output as a persistent full feature frame
+- history length is controlled externally by `horizon` or, if omitted, by `config.horizon`
 
-That makes the generation loop easier to reason about and avoids accumulating drift from repeated feature-only updates.
+That keeps context management explicit and avoids a hidden encoder-owned context limit.
 
 ## 3. Current Data Representations
 
 ### 271D frame representation
 
 Used by:
-- dataset loading;
-- GRU history encoding;
-- feature normalization;
-- frame-by-frame reconstruction after generation.
+- dataset loading
+- temporal history encoding
+- feature normalization
+- frame-by-frame reconstruction after generation
 
 Layout:
 
@@ -125,8 +130,8 @@ Layout:
 ### 68D reduced predictor state
 
 Used by:
-- flow-matching target construction;
-- ODE integration at inference time.
+- flow-matching target construction
+- ODE integration at inference time
 
 Layout:
 
@@ -134,10 +139,6 @@ Layout:
 [0:5]   root height, root vel x/z, sin(dyaw), cos(dyaw)
 [5:68]  21 non-root joints x 3D RIC positions
 ```
-
-Important note:
-- the helper that builds this state is still named `subset_271d_to_72d(...)`;
-- that name is legacy, but the implemented state is 68D.
 
 ### 257D current-frame conditioning
 
@@ -160,36 +161,40 @@ For each batch:
 
 1. Load raw motion and joints from the dataloader.
 2. Normalize 271D motion if a `FeatureNormalizer` is configured.
-3. Walk through the sequence one frame at a time with `encoder.gru_step(...)`.
-4. For each prediction step:
-   - extract current-frame conditioning from the latest frame;
-   - build the target reduced next-frame state;
-   - sample Gaussian noise `x0`;
-   - sample a random noise level `t`;
-   - interpolate `xt = t*x1 + (1-t)*x0`;
-   - predict the flow target `x1 - x0`.
-5. Accumulate MSE across all flattened frame-level samples.
+3. Remove the first frame so each prediction has a previous frame.
+4. Form:
+   - `hist = motion[:, :-1]`
+   - `target_motion = motion[:, 1:]`
+5. Run `encoder(hist, text_for_encoder, return_all=True)` to get one context per valid history prefix.
+6. Flatten batch and time dimensions.
+7. Build:
+   - 257D current-frame conditioning from `hist`
+   - 68D target reduced state from `target_motion`
+8. Sample Gaussian noise `x0` and a timestep `t`.
+9. Interpolate `xt = t*x1 + (1-t)*x0`.
+10. Predict flow and train against `x1 - x0`.
+11. Optionally add consistency loss on high-`t` samples.
 
-### Optional rollout during training
+This is a parallel loss construction over all prediction steps in the cropped sequence window.
 
-The training loop can partially replace teacher-forced next inputs with model-generated rollouts.
+### Rollout status
 
-Current behavior:
-- rollout probability is linearly scheduled from `rollout_prob_start` to `rollout_prob_end`;
-- rollout generation runs a short ODE loop in reduced-state space;
-- the rolled state is converted to positions, then back to a 271D frame before being fed into the GRU on the next step.
+The config still contains rollout scheduling fields, but the active loss path does not currently replace teacher-forced history with model rollouts. The relevant rollout code is commented out.
 
-This gives the encoder some exposure to its own generated history without abandoning stable teacher-forced supervision.
+So today:
+- rollout scheduling metadata exists
+- rollout execution in `incremental_flow_loss(...)` is inactive
+- returned rollout probability is effectively `0.0`
 
 ### Validation and EMA
 
-Validation uses the same incremental loss machinery with optional EMA models.
+Validation reuses the same loss builder without CFG dropout and can run on the EMA copies of the models.
 
 Implemented support includes:
-- EMA copies of encoder and predictor;
-- best-train and best-validation checkpoints;
-- loss-vs-t diagnostic CSV/plot artifacts;
-- optional timing instrumentation for forward/backward and rollout hotspots.
+- EMA copies of encoder and predictor
+- best-train and best-validation checkpoints
+- loss-vs-t diagnostic CSV and plot artifacts
+- optional timing instrumentation
 
 ## 5. Inference Architecture
 
@@ -199,15 +204,13 @@ Inference is implemented in `HumanMotionGenerator.generate_sequence(...)`.
 
 For each output frame:
 
-1. Take the latest history window of 271D frames.
-2. Encode that window with the GRU history encoder.
-3. Extract current-frame causal features from the latest frame.
-4. Initialize a noisy reduced state `x_t ~ N(0, I)` in 68D.
-5. Integrate the predictor over `num_steps` shared flow-ODE updates using the end-biased Heun solver.
-6. Denormalize the reduced state if needed.
-7. Convert it to absolute joint positions with:
-   - previous root position;
-   - previous root rotation.
+1. Take the latest history window of normalized 271D frames.
+2. Trim that window according to `horizon` or `config.horizon`.
+3. Encode that window with the temporal history encoder.
+4. Extract current-frame causal features from the latest frame.
+5. Initialize a noisy reduced state `x_t ~ N(0, I)` in 68D.
+6. Integrate the predictor over `num_steps` using the end-biased Heun ODE solver.
+7. Convert the integrated reduced state to absolute positions using the previous root position and root rotation.
 8. Convert the new positions back into a 271D frame.
 9. Append positions, features, and relative shifts to history.
 
@@ -215,18 +218,18 @@ For each output frame:
 
 One of the most important current design choices is that inference is position-first:
 
-- new positions are the canonical generated artifact;
-- 271D features are derived from those positions after generation;
-- relative shifts are derived outputs, not the primary recurrent state.
+- new positions are the canonical generated artifact
+- 271D features are derived from those positions after generation
+- relative shifts are derived outputs, not the primary recurrent state
 
-This keeps the loop aligned with geometric utilities such as IK, FK, root-motion integration, and foot-contact recomputation.
+This keeps the loop aligned with geometry-aware utilities such as IK, FK, root-motion integration, and foot-contact recomputation.
 
 ### FK-consistent option
 
 When `use_fk=True`, the generator:
-- computes FK offsets from the seed history;
-- allows `generated_positions_to_271d(...)` to produce FK-consistent positions;
-- replaces raw predicted positions with those FK-consistent positions when available.
+- computes FK offsets from the seed history
+- allows `generated_positions_to_271d(...)` to produce FK-consistent positions
+- replaces raw predicted positions with those FK-consistent positions when available
 
 That path aims to keep bone structure more stable during long rollouts.
 
@@ -234,21 +237,21 @@ That path aims to keep bone structure more stable during long rollouts.
 
 The current design separates concerns cleanly:
 
-- The GRU handles temporal accumulation over history.
-- The transformer handles spatial coupling across joints for the next frame.
+- The temporal encoder handles causal accumulation over history.
+- The predictor handles spatial coupling across joints for the next frame.
 - The motion utilities keep the model anchored to explicit geometry.
 
-That split is especially useful here because the predictor does not need to model full-sequence attention. It only needs to solve a well-conditioned next-frame denoising problem with rich contextual inputs.
+That split is useful because the predictor does not need to solve a full-sequence spatiotemporal problem. It only needs to solve a conditioned next-frame denoising problem with strong temporal context already provided.
 
 ## 7. Practical Notes
 
 ### What is no longer true
 
 Older project notes may still mention:
-- a 72D predictor target;
-- track-space relative-shift prediction as the main runtime state;
-- a 261D previous-frame representation;
-- CLIP long-text chunk averaging.
+- a GRU-based history encoder
+- an encoder-owned max context length
+- track-space relative-shift prediction as the main runtime state
+- long-text CLIP chunk averaging as active behavior
 
 Those do not describe the current implementation accurately.
 

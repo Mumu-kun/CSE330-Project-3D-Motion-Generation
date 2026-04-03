@@ -99,6 +99,158 @@ class TemporalCacheState:
     layers: List[TemporalLayerCache]
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x_even = x[..., 0::2]
+    x_odd = x[..., 1::2]
+    return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
+
+
+class TemporalRoPEAttention(nn.Module):
+    def __init__(self, config: MotionHistoryEncoderConfig) -> None:
+        super().__init__()
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        if self.head_dim % 2 != 0:
+            raise ValueError(
+                "TemporalRoPEAttention requires an even per-head dimension, "
+                f"got head_dim={self.head_dim}."
+            )
+
+        self.q_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
+        self.out_proj = nn.Linear(
+            config.hidden_size, config.hidden_size, bias=config.attention_bias
+        )
+        self.attention_dropout = config.attention_dropout
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(
+            1, 2
+        )
+
+    def _build_rope(
+        self,
+        seq_len: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
+        inv_freq = torch.exp(
+            torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32)
+            * (-torch.log(torch.tensor(10000.0, device=device)) / self.head_dim)
+        )
+        freqs = positions[:, None] * inv_freq[None, :]
+        cos = freqs.cos().repeat_interleave(2, dim=-1).to(dtype=dtype)
+        sin = freqs.sin().repeat_interleave(2, dim=-1).to(dtype=dtype)
+        return cos.view(1, 1, seq_len, self.head_dim), sin.view(
+            1, 1, seq_len, self.head_dim
+        )
+
+    def _apply_rope(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+    ) -> torch.Tensor:
+        return (x * cos) + (_rotate_half(x) * sin)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        query = self._reshape_heads(self.q_proj(hidden_states))
+        key = self._reshape_heads(self.k_proj(hidden_states))
+        value = self._reshape_heads(self.v_proj(hidden_states))
+
+        cos, sin = self._build_rope(
+            seq_len=seq_len,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        query = self._apply_rope(query, cos, sin)
+        key = self._apply_rope(key, cos, sin)
+
+        attn_output = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=True,
+        )
+        attn_output = (
+            attn_output.transpose(1, 2)
+            .contiguous()
+            .view(batch_size, seq_len, self.hidden_size)
+        )
+        return self.out_proj(attn_output)
+
+
+class GatedMLP(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        bias: bool,
+        activation: str,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+        self.act_fn = ACT2FN[activation]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        hidden_states = self.dropout(hidden_states)
+        hidden_states = self.down_proj(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        return hidden_states
+
+
+class MotionHistoryTemporalMLP(GatedMLP):
+    def __init__(self, config: MotionHistoryEncoderConfig) -> None:
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=config.mlp_bias,
+            activation=config.hidden_act,
+            dropout=config.dropout,
+        )
+
+
+class MotionHistoryTemporalLayer(nn.Module):
+    def __init__(self, config: MotionHistoryEncoderConfig) -> None:
+        super().__init__()
+        self.input_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
+        self.post_attention_layernorm = nn.LayerNorm(
+            config.hidden_size, eps=config.layer_norm_eps
+        )
+        self.self_attn = TemporalRoPEAttention(config)
+        self.mlp = MotionHistoryTemporalMLP(config)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = residual + self.self_attn(hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        return residual + self.mlp(hidden_states)
+
+
 class MotionHistoryEncoder(nn.Module):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__()
@@ -109,31 +261,20 @@ class MotionHistoryEncoder(nn.Module):
         self.per_joint_out_dim = config.per_joint_output_dim
         self.num_layers = config.num_hidden_layers
         self.joint_count = config.joint_count
-        self.max_context_length = config.max_context_length
-        self.text_scale = config.text_scale
 
         self.frame_projection = nn.Linear(
             config.frame_feature_dim, config.hidden_size, bias=True
         )
         self.text_projection = nn.Linear(
-            config.text_embedding_dim, config.hidden_size, bias=True
+            config.text_embedding_dim, 2 * config.hidden_size, bias=True
         )
-        layer = nn.TransformerEncoderLayer(
-            d_model=config.hidden_size,
-            nhead=config.num_attention_heads,
-            dim_feedforward=config.intermediate_size,
-            dropout=config.dropout,
-            activation=ACT2FN[config.hidden_act],
-            layer_norm_eps=config.layer_norm_eps,
-            batch_first=True,
-            norm_first=True,
-            bias=config.attention_bias,
+        self.layers = nn.ModuleList(
+            [
+                MotionHistoryTemporalLayer(config)
+                for _ in range(config.num_hidden_layers)
+            ]
         )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer=layer,
-            num_layers=config.num_hidden_layers,
-            norm=nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
-        )
+        self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.global_to_joints = nn.Sequential(
             nn.Linear(config.hidden_size, config.hidden_size, bias=config.mlp_bias),
             nn.GELU(),
@@ -144,28 +285,6 @@ class MotionHistoryEncoder(nn.Module):
                 bias=config.mlp_bias,
             ),
         )
-        self.register_buffer(
-            "temporal_position_encoding",
-            self._build_positional_encoding(
-                config.max_context_length,
-                config.hidden_size,
-            ),
-            persistent=False,
-        )
-
-    @staticmethod
-    def _build_positional_encoding(length: int, dim: int) -> torch.Tensor:
-        positions = torch.arange(length, dtype=torch.float32).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, dim, 2, dtype=torch.float32)
-            * (-torch.log(torch.tensor(10000.0)) / max(dim, 1))
-        )
-        encoding = torch.zeros(length, dim, dtype=torch.float32)
-        encoding[:, 0::2] = torch.sin(positions * div_term)
-        encoding[:, 1::2] = torch.cos(
-            positions * div_term[: encoding[:, 1::2].shape[1]]
-        )
-        return encoding
 
     def _empty_cache_state(self) -> TemporalCacheState:
         return TemporalCacheState(
@@ -178,6 +297,11 @@ class MotionHistoryEncoder(nn.Module):
         text_emb: torch.Tensor,
         return_all: bool = False,
     ) -> torch.Tensor:
+        if motion_seq.ndim != 3 or motion_seq.shape[-1] != self.frame_feature_dim:
+            raise ValueError(
+                "Expected motion_seq shape "
+                f"(B, T, {self.frame_feature_dim}), got {tuple(motion_seq.shape)}"
+            )
         if text_emb.ndim != 2 or text_emb.shape[-1] != self.text_embedding_dim:
             raise ValueError(
                 "Expected text_emb shape "
@@ -190,24 +314,17 @@ class MotionHistoryEncoder(nn.Module):
             )
 
         batch_size, seq_len, _ = motion_seq.shape
+        if seq_len == 0:
+            raise ValueError("Expected motion_seq with at least one timestep.")
+
         hidden_states = self.frame_projection(motion_seq)
-        text_tokens = self.text_projection(text_emb).unsqueeze(1)
-        positional = (
-            self.temporal_position_encoding[:seq_len]
-            .unsqueeze(0)
-            .to(
-                device=hidden_states.device,
-                dtype=hidden_states.dtype,
-            )
-        )
-        hidden_states = hidden_states + self.text_scale * text_tokens + positional
-        causal_mask = torch.ones(
-            seq_len,
-            seq_len,
-            device=motion_seq.device,
-            dtype=torch.bool,
-        ).triu(1)
-        hidden_states = self.transformer(hidden_states, mask=causal_mask)
+        shift, scale = self.text_projection(text_emb).chunk(2, dim=-1)
+        hidden_states = hidden_states * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
+
+        for layer in self.layers:
+            hidden_states = layer(hidden_states)
+
+        hidden_states = self.final_norm(hidden_states)
         joint_tokens = self.global_to_joints(hidden_states)
         joint_context = joint_tokens.reshape(
             batch_size,
@@ -310,24 +427,15 @@ class SinusoidalEmbedder(nn.Module):
         return out
 
 
-class SpatialTrackMLP(nn.Module):
+class SpatialTrackMLP(GatedMLP):
     def __init__(self, config: FlowMatchingPredictorConfig):
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.gate_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.intermediate_size,
+            bias=config.mlp_bias,
+            activation="silu",
+            dropout=0.0,
         )
-        self.up_proj = nn.Linear(
-            self.hidden_size, self.intermediate_size, bias=config.mlp_bias
-        )
-        self.down_proj = nn.Linear(
-            self.intermediate_size, self.hidden_size, bias=config.mlp_bias
-        )
-        self.act_fn = ACT2FN["silu"]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
 
 class SpatialTrackLayer(nn.Module):
@@ -949,7 +1057,9 @@ class HumanMotionGenerator:
                 )
 
             text_emb = text[:, 0, :]
-            frame_buffer = feature_history[:, :-1]
+            frame_buffer = (
+                feature_history[:, :-1] if feature_history.shape[1] > 1 else None
+            )
             cache_state: Optional[TemporalCacheState] = None
 
             for frame_idx in range(num_frames):
@@ -963,16 +1073,9 @@ class HumanMotionGenerator:
                 # Step B: Encode context from last horizon frames
                 # Feature history buffer is maintained outside the encoder.
                 # ========================================
-                if horizon is not None:
-                    buffer_len = max(horizon - 1, 0)
-                    if buffer_len == 0:
-                        frame_buffer = frame_buffer[:, :0, :]
-                    else:
-                        frame_buffer = frame_buffer[:, -buffer_len:, :]
-                else:
-                    frame_buffer = frame_buffer[
-                        :, -self.encoder.max_context_length :, :
-                    ]
+                if frame_buffer is not None:
+                    if horizon is not None:
+                        frame_buffer = frame_buffer[:, -horizon - 1 :]
 
                 context_cond, frame_buffer, cache_state = self.encoder.step(
                     current_frame,

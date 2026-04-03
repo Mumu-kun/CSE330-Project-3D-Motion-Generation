@@ -21,7 +21,6 @@ def _make_encoder() -> MotionHistoryEncoder:
         attention_dropout=0.0,
         per_joint_output_dim=8,
         joint_count=22,
-        max_context_length=4,
     )
     return MotionHistoryEncoder(config).eval()
 
@@ -32,15 +31,15 @@ def test_forward_output_shape_and_forward_all_last_match() -> None:
     text = torch.randn(2, 512)
 
     with torch.no_grad():
-        all_contexts = encoder.forward_all(motion, text)
+        all_contexts = encoder(motion, text, return_all=True)
         latest_context = encoder(motion, text)
 
-    assert all_contexts.shape == (2, 4, 22, 8)
+    assert all_contexts.shape == (2, 6, 22, 8)
     assert latest_context.shape == (2, 22, 8)
     assert torch.allclose(all_contexts[:, -1], latest_context, atol=1e-6, rtol=1e-6)
 
 
-def test_step_matches_forward_for_each_prefix_and_crops_buffer() -> None:
+def test_step_matches_forward_for_each_prefix_and_grows_buffer() -> None:
     encoder = _make_encoder()
     motion = torch.randn(2, 6, 271)
     text = torch.randn(2, 512)
@@ -64,7 +63,7 @@ def test_step_matches_forward_for_each_prefix_and_crops_buffer() -> None:
             assert frame_buffer is not None
             assert frame_buffer.shape == (
                 motion.shape[0],
-                min(prefix_len, encoder.max_context_length),
+                prefix_len,
                 motion.shape[-1],
             )
 

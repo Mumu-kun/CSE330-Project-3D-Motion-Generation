@@ -52,7 +52,6 @@ def _create_test_config() -> Config:
     config.encoder_config.per_joint_output_dim = 32
     config.encoder_config.dropout = 0.0
     config.encoder_config.attention_dropout = 0.0
-    config.encoder_config.max_context_length = 8
     config.predictor_config = FlowMatchingPredictorConfig(
         hidden_size=128,
         intermediate_size=256,

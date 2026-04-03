@@ -890,7 +890,17 @@ class Trainer:
                         x1_raw[:, pred_model.root_state_dim :],
                     )
 
-                    consistency_loss = ric_loss + root_loss + yaw_loss
+                consistency_loss = ric_loss + root_loss + yaw_loss
+
+                if self.wandb_logger is not None:
+                    self.wandb_logger.log(
+                        {
+                            "train/root_loss": root_loss.item(),
+                            "train/yaw_loss": yaw_loss.item(),
+                            "train/ric_loss": ric_loss.item(),
+                        },
+                        step=self.training_state["global_step"],
+                    )
 
         self._latest_flow_diagnostics = {
             "t": t.detach().cpu(),

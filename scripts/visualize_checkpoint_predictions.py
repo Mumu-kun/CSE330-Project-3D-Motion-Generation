@@ -24,8 +24,8 @@ from utils.motion_utils import FeatureNormalizer, generated_positions_to_271d
 from utils.visualization import plot_3d_motion
 
 
-PREDICTOR_STEPS = 5
-CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest7.pt"
+PREDICTOR_STEPS = 25
+CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest9.pt"
 DATASET_PATH = PROJECT_ROOT / "tests" / "dataset" / "humanml3d-subset-mini"
 OUTPUT_DIR = (
     PROJECT_ROOT

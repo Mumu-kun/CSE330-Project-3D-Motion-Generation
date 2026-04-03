@@ -155,7 +155,6 @@ def get_smoke_config() -> Config:
     config.encoder_config.text_scale = 1.0
     config.encoder_config.dropout = 0.0
     config.encoder_config.attention_dropout = 0.0
-    config.encoder_config.max_context_length = config.horizon
 
     config.predictor_config = FlowMatchingPredictorConfig(
         hidden_size=64,

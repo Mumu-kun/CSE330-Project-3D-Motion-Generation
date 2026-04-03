@@ -44,9 +44,9 @@ class FlowMatchingPredictorConfig:
 class MotionHistoryEncoderConfig:
     frame_feature_dim: int = 271
     text_embedding_dim: int = 512
-    hidden_size: int = 512
-    intermediate_size: int = 2048
-    num_hidden_layers: int = 3
+    hidden_size: int = 256
+    intermediate_size: int = 512
+    num_hidden_layers: int = 4
     num_attention_heads: int = 8
     hidden_act: str = "gelu"
     layer_norm_eps: float = 1e-5
@@ -56,7 +56,6 @@ class MotionHistoryEncoderConfig:
     dropout: float = 0.1
     per_joint_output_dim: int = 64
     joint_count: int = 22
-    max_context_length: int = 40
     text_scale: float = 1.0
 
     def __post_init__(self) -> None:
@@ -66,7 +65,13 @@ class MotionHistoryEncoderConfig:
                 f"num_attention_heads, got {self.hidden_size} and "
                 f"{self.num_attention_heads}."
             )
-        self.max_context_length = max(1, int(self.max_context_length))
+        head_dim = self.hidden_size // self.num_attention_heads
+        if head_dim % 2 != 0:
+            raise ValueError(
+                "MotionHistoryEncoderConfig requires an even per-head dimension "
+                f"for RoPE, got hidden_size={self.hidden_size}, "
+                f"num_attention_heads={self.num_attention_heads}, head_dim={head_dim}."
+            )
         self.intermediate_size = max(int(self.intermediate_size), self.hidden_size)
 
 
@@ -108,9 +113,9 @@ class Config:
         default_factory=lambda: MotionHistoryEncoderConfig(
             frame_feature_dim=271,
             text_embedding_dim=512,
-            hidden_size=512,
-            intermediate_size=4 * 512,
-            num_hidden_layers=3,
+            hidden_size=256,
+            intermediate_size=4 * 256,
+            num_hidden_layers=4,
             num_attention_heads=8,
             hidden_act="gelu",
             layer_norm_eps=1e-5,
@@ -120,7 +125,6 @@ class Config:
             dropout=0.1,
             per_joint_output_dim=64,
             joint_count=22,
-            max_context_length=40,
             text_scale=1.0,
         )
     )
@@ -157,9 +161,9 @@ class Config:
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 10, "epochs": 100},
-            {"horizon": 20, "epochs": 200},
-            {"horizon": 40, "epochs": 400},
+            {"horizon": 10, "epochs": 200},
+            {"horizon": 20, "epochs": 400},
+            {"horizon": 40, "epochs": 800},
         ]
     )
 
@@ -171,7 +175,7 @@ class Config:
 
     # Training-time timestep sampling
     t_sampling_mode: str = "power"  # "uniform" or "power"
-    t_sampling_power: float = 2.0  # Power-law exponent k in p(t)=(k+1)t^k
+    t_sampling_power: float = 4.0  # Power-law exponent k in p(t)=(k+1)t^k
     t_sampling_power_warmup_fraction: float = (
         0.1  # Fraction of training used to ramp k from 0 to target
     )
@@ -181,21 +185,21 @@ class Config:
     rollout_prob_start: float = 0.1  # Rollout probability at first epoch
     rollout_prob_end: float = 0.3  # Rollout probability at final epoch
     rollout_warmup_fraction: float = (
-        0.4  # Fraction of training with rollout disabled before schedule starts
+        0.2  # Fraction of training with rollout disabled before schedule starts
     )
     rollout_block_len_start: int = 1  # Rollout block length at schedule start
-    rollout_block_len_end: int = 4  # Rollout block length at schedule end
+    rollout_block_len_end: int = 2  # Rollout block length at schedule end
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
     )
 
     use_consistency_loss: bool = (
-        False  # Enable endpoint consistency loss after no-grad rollout
+        True  # Enable endpoint consistency loss after no-grad rollout
     )
     consistency_loss_t_threshold: float = (
-        0.75  # Only apply consistency loss for t > threshold
+        0.5  # Only apply consistency loss for t > threshold
     )
-    consistency_loss_weight: float = 0.2  # Weight for consistency loss in total loss
+    consistency_loss_weight: float = 1  # Weight for consistency loss in total loss
 
     use_degenerate_pose_guard: bool = False
     degenerate_bone_ratio_threshold: float = 0.05
