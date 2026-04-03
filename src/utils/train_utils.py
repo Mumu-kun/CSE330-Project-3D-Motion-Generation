@@ -512,6 +512,279 @@ class Trainer:
         # Inverse CDF for p(t) = (k + 1) * t^k on [0, 1].
         return u.pow(1.0 / (power + 1.0))
 
+    def _compute_flow_branch_losses(
+        self,
+        *,
+        pred_model: FlowMatchingPredictor,
+        contexts_stacked: torch.Tensor,
+        current_frames: torch.Tensor,
+        target_motion: torch.Tensor,
+        text_for_encoder: torch.Tensor,
+        epoch: int,
+        collect_diagnostics: bool = False,
+        consistency_log_prefix: Optional[str] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+        """Compute flow and consistency losses for one branch."""
+        if current_frames.shape != target_motion.shape:
+            raise ValueError(
+                "Expected current_frames and target_motion to match, got "
+                f"{tuple(current_frames.shape)} and {tuple(target_motion.shape)}"
+            )
+        if contexts_stacked.shape[:2] != current_frames.shape[:2]:
+            raise ValueError(
+                "Expected contexts_stacked leading dimensions to match current_frames, got "
+                f"{tuple(contexts_stacked.shape[:2])} and {tuple(current_frames.shape[:2])}"
+            )
+
+        batch_size, pred_steps = current_frames.shape[:2]
+        current_frames_flat = current_frames.flatten(0, 1)
+        target_motion_flat = target_motion.flatten(0, 1)
+        current_frame_features = extract_prev_frame_features(
+            current_frames_flat,
+            normalizer=self.normalizer,
+            normalize_output=self.normalizer is not None,
+        )
+        x1 = subset_271d_to_68d(
+            target_motion_flat,
+            prev_frame=current_frames_flat,
+            normalizer=self.normalizer,
+        )
+        x0 = torch.randn_like(x1)
+        t = self._sample_training_timesteps(
+            batch_size=batch_size * pred_steps,
+            device=current_frames.device,
+            dtype=x1.dtype,
+            epoch=epoch,
+        )
+        xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
+
+        contexts_flat = contexts_stacked.flatten(0, 1)
+        text_batched = (
+            text_for_encoder.unsqueeze(1)
+            .expand(-1, pred_steps, -1)
+            .reshape(batch_size * pred_steps, -1)
+        )
+        target_flow = x1 - x0
+
+        with timer(self.timing_stats, "forward/predictor"):
+            pred, _, _ = pred_model.forward(
+                track_features=contexts_flat,
+                noisy_features=xt,
+                timesteps=t,
+                current_frame_features=current_frame_features,
+                text_embedding=text_batched,
+                output_attentions=False,
+                output_hidden_states=False,
+            )
+            per_sample_flow_loss = compute_per_sample_flow_loss(pred, target_flow)
+            flow_loss = F.mse_loss(pred, target_flow)
+
+        consistency_loss = pred.new_zeros(())
+        if self.config.use_consistency_loss:
+            t_thresh_mask = t > self.config.consistency_loss_t_threshold
+            if t_thresh_mask.any():
+                with timer(self.timing_stats, "forward/consistency_loss"):
+                    pred_x1 = xt[t_thresh_mask] + pred[t_thresh_mask] * (
+                        1 - t.unsqueeze(1)[t_thresh_mask]
+                    )
+                    flow_output_raw = (
+                        self.normalizer.denormalize_flow_output(pred_x1)
+                        if self.normalizer is not None
+                        else pred_x1
+                    )
+                    x1_raw = (
+                        self.normalizer.denormalize_flow_output(x1[t_thresh_mask])
+                        if self.normalizer is not None
+                        else x1[t_thresh_mask]
+                    )
+
+                    root_loss = F.mse_loss(
+                        flow_output_raw[:, :3],
+                        x1_raw[:, :3],
+                    )
+
+                    x1_dyaw = sin_cos_to_yaw(x1_raw[:, 3:5])
+                    pred_dyaw = sin_cos_to_yaw(flow_output_raw[:, 3:5])
+                    yaw_error = wrap_angle(pred_dyaw - x1_dyaw)
+                    yaw_loss = yaw_error.pow(2).mean()
+
+                    ric_loss = F.mse_loss(
+                        flow_output_raw[:, pred_model.root_state_dim :],
+                        x1_raw[:, pred_model.root_state_dim :],
+                    )
+
+                consistency_loss = ric_loss + root_loss + yaw_loss
+
+                if self.wandb_logger is not None and consistency_log_prefix is not None:
+                    self.wandb_logger.log(
+                        {
+                            f"{consistency_log_prefix}/root_loss": root_loss.item(),
+                            f"{consistency_log_prefix}/yaw_loss": yaw_loss.item(),
+                            f"{consistency_log_prefix}/ric_loss": ric_loss.item(),
+                            f"{consistency_log_prefix}/total_loss": consistency_loss.item(),
+                        },
+                        step=self.training_state.get("global_step", 0),
+                    )
+
+        diagnostics: Optional[Dict[str, torch.Tensor]] = None
+        if collect_diagnostics:
+            diagnostics = {
+                "t": t.detach().cpu(),
+                "per_sample_flow_loss": per_sample_flow_loss.detach().cpu(),
+            }
+
+        total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
+        return total_loss, flow_loss, consistency_loss, diagnostics
+
+    def _build_rollout_branch_inputs(
+        self,
+        *,
+        enc: MotionHistoryEncoder,
+        pred_model: FlowMatchingPredictor,
+        hist: torch.Tensor,
+        joints: torch.Tensor,
+        text_for_encoder: torch.Tensor,
+        rollout_prob: float,
+        rollout_max_block_len: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Build rollout-conditioned contexts and current frames for one subset."""
+        subset_size, pred_steps = hist.shape[:2]
+        if subset_size == 0:
+            raise ValueError("Rollout branch requires a non-empty subset.")
+        if pred_steps == 0:
+            raise ValueError("Rollout branch requires at least one prediction step.")
+
+        device = hist.device
+        dtype = hist.dtype
+
+        def sample_rollout_block_length(max_block_len: int) -> int:
+            if max_block_len <= 1:
+                return max(1, int(max_block_len))
+
+            u = torch.rand((), device=device, dtype=dtype)
+            scaled = float(max_block_len) * u.pow(
+                1.0 / float(self.config.rollout_block_len_bias_power)
+            )
+            sampled = int(torch.ceil(scaled).item())
+            return max(1, min(max_block_len, sampled))
+
+        rollout_schedule: Dict[int, int] = {}
+        if rollout_prob > 0.0 and rollout_max_block_len > 0:
+            schedule_step = 0
+            while schedule_step < pred_steps:
+                if torch.rand((), device=device, dtype=dtype).item() < rollout_prob:
+                    remaining = pred_steps - schedule_step
+                    rollout_schedule[schedule_step] = sample_rollout_block_length(
+                        min(rollout_max_block_len, remaining)
+                    )
+                    schedule_step += rollout_schedule[schedule_step]
+                else:
+                    schedule_step += 1
+
+        def generate_rollout_frame(
+            *,
+            context: torch.Tensor,
+            current_frame_local: torch.Tensor,
+            current_positions_local: torch.Tensor,
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            with torch.no_grad():
+                current_frame_features = extract_prev_frame_features(
+                    current_frame_local,
+                    normalizer=self.normalizer,
+                    normalize_output=self.normalizer is not None,
+                )
+                x_t = integrate_flow_ode(
+                    predictor=pred_model,
+                    track_features=context,
+                    current_frame_features=current_frame_features,
+                    text_embedding=text_for_encoder,
+                    num_steps=self.config.rollout_integration_steps,
+                    time_schedule_power=self.config.inference_t_schedule_power,
+                )
+
+                pred_flow_raw = (
+                    self.normalizer.denormalize_flow_output(x_t)
+                    if self.normalizer is not None
+                    else x_t
+                )
+                current_frame_raw = (
+                    self.normalizer.denormalize(current_frame_local)
+                    if self.normalizer is not None
+                    else current_frame_local
+                )
+                next_positions_local = flow_output_to_positions(
+                    pred_flow_raw,
+                    prev_root_pos=current_positions_local[:, 0],
+                    prev_root_rot_6d=current_frame_raw[:, 69:75],
+                )
+                next_frame_local, _, fk_positions = generated_positions_to_271d(
+                    new_positions=next_positions_local,
+                    prev_positions=current_positions_local,
+                    normalizer=self.normalizer,
+                )
+
+                if fk_positions is not None:
+                    next_positions_local = fk_positions
+
+            return next_frame_local.detach(), next_positions_local.detach()
+
+        contexts: list[torch.Tensor] = []
+        current_frames: list[torch.Tensor] = []
+        frame_buffer: Optional[torch.Tensor] = None
+        current_frame = hist[:, 0]
+        current_positions = joints[:, 0]
+        cache_state = None
+        step_idx = 0
+
+        while step_idx < pred_steps:
+            context, frame_buffer, cache_state = enc.step(
+                current_frame,
+                text_for_encoder,
+                frame_buffer=frame_buffer,
+                cache_state=cache_state,
+            )
+            contexts.append(context)
+            current_frames.append(current_frame)
+
+            block_len = rollout_schedule.get(step_idx, 0)
+            if block_len > 0:
+                next_frame, next_positions = generate_rollout_frame(
+                    context=context,
+                    current_frame_local=current_frame,
+                    current_positions_local=current_positions,
+                )
+
+                for offset in range(1, block_len):
+                    current_frame = next_frame
+                    current_positions = next_positions
+                    context, frame_buffer, cache_state = enc.step(
+                        current_frame,
+                        text_for_encoder,
+                        frame_buffer=frame_buffer,
+                        cache_state=cache_state,
+                    )
+                    contexts.append(context)
+                    current_frames.append(current_frame)
+                    if offset < block_len - 1:
+                        next_frame, next_positions = generate_rollout_frame(
+                            context=context,
+                            current_frame_local=current_frame,
+                            current_positions_local=current_positions,
+                        )
+
+                step_idx += block_len
+                if step_idx < pred_steps:
+                    current_frame = hist[:, step_idx]
+                    current_positions = joints[:, step_idx]
+                continue
+
+            step_idx += 1
+            if step_idx < pred_steps:
+                current_frame = hist[:, step_idx]
+                current_positions = joints[:, step_idx]
+
+        return torch.stack(contexts, dim=1), torch.stack(current_frames, dim=1)
+
     @classmethod
     def _build_models_from_config(
         cls,
@@ -763,7 +1036,6 @@ class Trainer:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float]:
         enc = encoder if encoder is not None else self.encoder
         pred_model = predictor if predictor is not None else self.predictor
-        del stochastic_rollout
         device = self.device
         self._latest_flow_diagnostics = None
 
@@ -803,112 +1075,108 @@ class Trainer:
             )
         hist = motion[:, :-1]
         target_motion = motion[:, 1:]
-        # rollout_prob = self._compute_rollout_probability(epoch)
-        # if rollout_prob > 0.0:
-        #     raise NotImplementedError(
-        #         "Training rollout for parallel processing contexts is intentionally "
-        #         "deferred for now. Set rollout_prob_start and rollout_prob_end to 0.0."
-        #     )
+        rollout_prob = (
+            self._compute_rollout_probability(epoch) if stochastic_rollout else 0.0
+        )
+        rollout_max_block_len = (
+            min(pred_steps, self._compute_rollout_block_length(epoch))
+            if stochastic_rollout
+            else 0
+        )
 
         with timer(self.timing_stats, "forward/encoder_contexts"):
             contexts_stacked = enc(hist, text_for_encoder, return_all=True)
 
-        hist_flat = hist.flatten(0, 1)
-        target_motion_flat = target_motion.flatten(0, 1)
-        current_frame_features_reshaped = extract_prev_frame_features(
-            hist_flat,
-            normalizer=self.normalizer,
-            normalize_output=self.normalizer is not None,
-        )
-        x1 = subset_271d_to_68d(
-            target_motion_flat,
-            prev_frame=hist_flat,
-            normalizer=self.normalizer,
-        )
-        x0 = torch.randn_like(x1)
-        t = self._sample_training_timesteps(
-            batch_size=B * pred_steps,
-            device=device,
-            dtype=x1.dtype,
+        (
+            base_total_loss,
+            base_flow_loss,
+            base_consistency_loss,
+            diagnostics,
+        ) = self._compute_flow_branch_losses(
+            pred_model=pred_model,
+            contexts_stacked=contexts_stacked,
+            current_frames=hist,
+            target_motion=target_motion,
+            text_for_encoder=text_for_encoder,
             epoch=epoch,
+            collect_diagnostics=True,
+            consistency_log_prefix="consistency",
         )
-        xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
+        if diagnostics is not None:
+            self._latest_flow_diagnostics = diagnostics
 
-        contexts_reshaped = contexts_stacked.flatten(0, 1)
-        text_batched = (
-            text_for_encoder.unsqueeze(1)
-            .expand(-1, pred_steps, -1)
-            .reshape(B * pred_steps, -1)
+        rollout_total_loss = base_total_loss.new_zeros(())
+        rollout_flow_loss = base_flow_loss.new_zeros(())
+        rollout_consistency_loss = base_consistency_loss.new_zeros(())
+        rollout_subset_fraction_effective = 0.0
+
+        rollout_enabled = (
+            stochastic_rollout
+            and rollout_prob > 0.0
+            and rollout_max_block_len > 0
+            and self.config.rollout_loss_weight > 0.0
+            and self.config.rollout_subset_fraction > 0.0
         )
-        target_flow = x1 - x0
+        if rollout_enabled:
+            subset_size = max(1, int(round(B * float(self.config.rollout_subset_fraction))))
+            subset_size = min(B, subset_size)
+            subset_indices = torch.randperm(B, device=device)[:subset_size].sort().values
+            if subset_indices.numel() > 0:
+                rollout_subset_fraction_effective = subset_indices.numel() / max(1, B)
+                hist_subset = hist.index_select(0, subset_indices)
+                target_motion_subset = target_motion.index_select(0, subset_indices)
+                joints_subset = joints.index_select(0, subset_indices)
+                text_subset = text_for_encoder.index_select(0, subset_indices)
 
-        with timer(self.timing_stats, "forward/predictor"):
-            pred, _, _ = pred_model.forward(
-                track_features=contexts_reshaped,
-                noisy_features=xt,
-                timesteps=t,
-                current_frame_features=current_frame_features_reshaped,
-                text_embedding=text_batched,
-                output_attentions=False,
-                output_hidden_states=False,
+                with timer(self.timing_stats, "forward/rollout_contexts"):
+                    rollout_contexts, rollout_current_frames = (
+                        self._build_rollout_branch_inputs(
+                            enc=enc,
+                            pred_model=pred_model,
+                            hist=hist_subset,
+                            joints=joints_subset,
+                            text_for_encoder=text_subset,
+                            rollout_prob=rollout_prob,
+                            rollout_max_block_len=rollout_max_block_len,
+                        )
+                    )
+
+                (
+                    rollout_total_loss,
+                    rollout_flow_loss,
+                    rollout_consistency_loss,
+                    _,
+                ) = self._compute_flow_branch_losses(
+                    pred_model=pred_model,
+                    contexts_stacked=rollout_contexts,
+                    current_frames=rollout_current_frames,
+                    target_motion=target_motion_subset,
+                    text_for_encoder=text_subset,
+                    epoch=epoch,
+                    collect_diagnostics=False,
+                    consistency_log_prefix="rollout_consistency",
+                )
+
+        total_loss = base_total_loss + self.config.rollout_loss_weight * rollout_total_loss
+        flow_loss = base_flow_loss + self.config.rollout_loss_weight * rollout_flow_loss
+        consistency_loss = (
+            base_consistency_loss
+            + self.config.rollout_loss_weight * rollout_consistency_loss
+        )
+
+        if self.wandb_logger is not None and rollout_enabled:
+            self.wandb_logger.log(
+                {
+                    "rollout/subset_fraction_effective": rollout_subset_fraction_effective,
+                    "rollout/max_block_len": float(rollout_max_block_len),
+                    "rollout/loss_total": rollout_total_loss.item(),
+                    "rollout/loss_flow": rollout_flow_loss.item(),
+                    "rollout/loss_consistency": rollout_consistency_loss.item(),
+                },
+                step=self.training_state.get("global_step", 0),
             )
-            per_sample_flow_loss = compute_per_sample_flow_loss(pred, target_flow)
-            flow_loss = F.mse_loss(pred, target_flow)
 
-        consistency_loss = flow_loss.new_zeros(())
-
-        if self.config.use_consistency_loss:
-            t_thresh_mask = t > self.config.consistency_loss_t_threshold
-            if t_thresh_mask.any():
-                with timer(self.timing_stats, "forward/consistency_loss"):
-                    pred_x1 = xt[t_thresh_mask] + pred[t_thresh_mask] * (
-                        1 - t.unsqueeze(1)[t_thresh_mask]
-                    )
-                    flow_output_raw = (
-                        self.normalizer.denormalize_flow_output(pred_x1)
-                        if self.normalizer is not None
-                        else pred_x1
-                    )
-                    x1_raw = (
-                        self.normalizer.denormalize_flow_output(x1[t_thresh_mask])
-                        if self.normalizer is not None
-                        else x1[t_thresh_mask]
-                    )
-
-                    root_loss = F.mse_loss(
-                        flow_output_raw[:, :3],
-                        x1_raw[:, :3],
-                    )
-
-                    x1_dyaw = sin_cos_to_yaw(x1_raw[:, 3:5])
-                    pred_dyaw = sin_cos_to_yaw(flow_output_raw[:, 3:5])
-                    yaw_error = wrap_angle(pred_dyaw - x1_dyaw)
-                    yaw_loss = yaw_error.pow(2).mean()
-
-                    ric_loss = F.mse_loss(
-                        flow_output_raw[:, pred_model.root_state_dim :],
-                        x1_raw[:, pred_model.root_state_dim :],
-                    )
-
-                consistency_loss = ric_loss + root_loss + yaw_loss
-
-                if self.wandb_logger is not None:
-                    self.wandb_logger.log(
-                        {
-                            "train/root_loss": root_loss.item(),
-                            "train/yaw_loss": yaw_loss.item(),
-                            "train/ric_loss": ric_loss.item(),
-                        },
-                        step=self.training_state["global_step"],
-                    )
-
-        self._latest_flow_diagnostics = {
-            "t": t.detach().cpu(),
-            "per_sample_flow_loss": per_sample_flow_loss.detach().cpu(),
-        }
-
-        total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
-        return total_loss, flow_loss, consistency_loss, pred_steps, 0.0
+        return total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob
 
     def validate(
         self,
@@ -997,10 +1265,11 @@ class Trainer:
         wandb_logger = self.wandb_logger
 
         epoch = self.start_epoch - 1
+        epoch_pbar = tqdm(
+            range(self.start_epoch, num_epochs), desc="Training", unit="epoch"
+        )
         try:
-            for epoch in tqdm(
-                range(self.start_epoch, num_epochs), desc="Training", unit="epoch"
-            ):
+            for epoch in epoch_pbar:
                 prev_horizon = self.curriculum_state["current_horizon"]
                 if self.curriculum_state["use_curriculum"] and self.config.curriculum:
                     for level in reversed(self.config.curriculum):
@@ -1026,13 +1295,21 @@ class Trainer:
                     1 + self.curriculum_state["current_horizon"] + pred_horizon
                 )
 
-                pbar = tqdm(
-                    self.dataloader, desc=f"Epoch {epoch}", leave=False, unit="batch"
-                )
+                show_batch_progress = self.config.tqdm_log_per_batch
+                pbar = None
+                batch_iterator = self.dataloader
+                if show_batch_progress:
+                    pbar = tqdm(
+                        self.dataloader,
+                        desc=f"Epoch {epoch}",
+                        leave=False,
+                        unit="batch",
+                    )
+                    batch_iterator = pbar
                 batch_start_time = time.time()
                 timing_log_interval = max(1, int(self.config.timing_log_interval))
 
-                for batch in pbar:
+                for batch in batch_iterator:
                     batch_size = batch["motion"].shape[0]
                     effective_horizon = self.curriculum_state["current_horizon"]
                     step_before_update = self.training_state["global_step"]
@@ -1078,7 +1355,8 @@ class Trainer:
                                 {"train/skipped_nonfinite_batch": 1},
                                 step=self.training_state["global_step"],
                             )
-                        pbar.set_postfix({"skip": ",".join(nonfinite_losses)})
+                        if pbar is not None:
+                            pbar.set_postfix({"skip": ",".join(nonfinite_losses)})
                         optimizer.zero_grad(set_to_none=True)
                         self.training_state["global_step"] += 1
                         continue
@@ -1106,10 +1384,15 @@ class Trainer:
                         scaler.scale(loss).backward()
 
                         scaler.unscale_(optimizer)
-                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                        raw_grad_norm = torch.nn.utils.clip_grad_norm_(
                             list(self.encoder.parameters())
                             + list(self.predictor.parameters()),
                             max_grad_norm,
+                        )
+
+                        clipped_grad_norm = min(raw_grad_norm.item(), max_grad_norm)
+                        clip_coef = min(
+                            1.0, max_grad_norm / (raw_grad_norm.item() + 1e-12)
                         )
 
                         scaler.step(optimizer)
@@ -1122,26 +1405,25 @@ class Trainer:
                     batch_time = time.time() - batch_start_time
                     batch_start_time = time.time()
 
-                    pbar.set_postfix(
-                        {
-                            "loss": f"{loss.item():.4f}",
-                            "L_flow": f"{flow_loss.item():.4f}",
-                            "L_cons": f"{consistency_loss.item():.4f}",
-                            "p_roll": f"{rollout_prob:.2f}",
-                            "lr": f"{lr:.2e}",
-                        }
-                    )
+                    if pbar is not None:
+                        pbar.set_postfix(
+                            {
+                                "loss": f"{loss.item():.4f}",
+                                "L_flow": f"{flow_loss.item():.4f}",
+                                "L_cons": f"{consistency_loss.item():.4f}",
+                                "p_roll": f"{rollout_prob:.2f}",
+                                "lr": f"{lr:.2e}",
+                            }
+                        )
 
                     if wandb_logger is not None:
                         log_dict = {
                             "train/loss": loss.item(),
                             "train/lr": lr,
                             "train/epoch": epoch,
-                            "train/grad_norm": (
-                                grad_norm.item()
-                                if hasattr(grad_norm, "item")
-                                else grad_norm
-                            ),
+                            "grad/raw_norm": raw_grad_norm,
+                            "grad/clipped_norm": clipped_grad_norm,
+                            "grad/clip_coef": clip_coef,
                             "train/batch_time": batch_time,
                             "train/samples_per_sec": (
                                 batch_size / batch_time if batch_time > 0 else 0
@@ -1149,8 +1431,6 @@ class Trainer:
                             "train/current_horizon": self.curriculum_state[
                                 "current_horizon"
                             ],
-                            "train/effective_horizon": effective_horizon,
-                            "train/num_pred_frames": pred_horizon,
                             "train/loss_L_total": loss.item(),
                             "train/loss_L_flow": flow_loss.item(),
                             "train/loss_L_consistency": consistency_loss.item(),
@@ -1189,7 +1469,8 @@ class Trainer:
                     num_batches += 1
                     self.training_state["global_step"] += 1
 
-                pbar.close()
+                if pbar is not None:
+                    pbar.close()
                 avg_epoch_loss = epoch_loss / max(1, num_batches)
                 if epoch_diag_t and epoch_diag_loss and epoch_diag_steps:
                     self._checkpoint_flow_diagnostics = {
@@ -1246,9 +1527,17 @@ class Trainer:
                     if val_metrics and "val_loss" in val_metrics:
                         epoch_log["epoch/val_loss"] = val_metrics["val_loss"]
                     wandb_logger.log(
-                        epoch_log,
-                        step=self.training_state["global_step"],
-                    )
+                    epoch_log,
+                    step=self.training_state["global_step"],
+                )
+
+                epoch_postfix = {
+                    "loss": f"{avg_epoch_loss:.4f}",
+                    "h": self.curriculum_state["current_horizon"],
+                }
+                if val_metrics and "val_loss" in val_metrics:
+                    epoch_postfix["val"] = f"{val_metrics['val_loss']:.4f}"
+                epoch_pbar.set_postfix(epoch_postfix)
 
                 with timer(self.timing_stats, "checkpoint"):
                     if (

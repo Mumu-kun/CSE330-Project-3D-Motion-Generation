@@ -163,7 +163,7 @@ class Config:
         default_factory=lambda: [
             {"horizon": 10, "epochs": 200},
             {"horizon": 20, "epochs": 400},
-            {"horizon": 40, "epochs": 800},
+            {"horizon": 40, "epochs": 2000},
         ]
     )
 
@@ -185,12 +185,17 @@ class Config:
     rollout_prob_start: float = 0.1  # Rollout probability at first epoch
     rollout_prob_end: float = 0.3  # Rollout probability at final epoch
     rollout_warmup_fraction: float = (
-        0.2  # Fraction of training with rollout disabled before schedule starts
+        0.25  # Fraction of training with rollout disabled before schedule starts
     )
     rollout_block_len_start: int = 1  # Rollout block length at schedule start
-    rollout_block_len_end: int = 2  # Rollout block length at schedule end
+    rollout_block_len_end: int = 4  # Rollout block length at schedule end
     rollout_integration_steps: int = (
         5  # Number of ODE integration steps for rollout branch
+    )
+    rollout_subset_fraction: float = 0.25  # Fraction of batch for rollout branch
+    rollout_loss_weight: float = 1.0  # Weight of rollout-conditioned loss branch
+    rollout_block_len_bias_power: float = (
+        2.0  # Power > 1 biases sampled rollout lengths toward the scheduled max
     )
 
     use_consistency_loss: bool = (
@@ -200,12 +205,6 @@ class Config:
         0.5  # Only apply consistency loss for t > threshold
     )
     consistency_loss_weight: float = 1  # Weight for consistency loss in total loss
-
-    use_degenerate_pose_guard: bool = False
-    degenerate_bone_ratio_threshold: float = 0.05
-    degenerate_across_norm_threshold: float = 1e-4
-    degenerate_step_multiplier: float = 5.0
-    degenerate_min_valid_samples_for_consistency: int = 1
 
     # Data loading
     num_workers: int = 4
@@ -227,6 +226,7 @@ class Config:
     # Profiling settings
     enable_profiling: bool = False  # Enable timing instrumentation
     timing_log_interval: int = 100  # Log timings every N batches
+    tqdm_log_per_batch: bool = True  # Show per-batch tqdm progress during training
 
     unit_length = 5
 
@@ -242,6 +242,7 @@ class Config:
             max(float(self.t_sampling_power_warmup_fraction), 0.0),
             1.0,
         )
+        self.tqdm_log_per_batch = bool(self.tqdm_log_per_batch)
         self.rollout_warmup_fraction = min(
             max(float(self.rollout_warmup_fraction), 0.0),
             1.0 - 1e-6,
@@ -251,6 +252,17 @@ class Config:
             self.rollout_block_len_start,
             int(self.rollout_block_len_end),
         )
+        self.rollout_subset_fraction = min(
+            max(float(self.rollout_subset_fraction), 0.0),
+            1.0,
+        )
+        self.rollout_loss_weight = max(float(self.rollout_loss_weight), 0.0)
+        self.rollout_block_len_bias_power = float(self.rollout_block_len_bias_power)
+        if self.rollout_block_len_bias_power <= 1.0:
+            raise ValueError(
+                "rollout_block_len_bias_power must be greater than 1, got "
+                f"{self.rollout_block_len_bias_power}"
+            )
         self.inference_t_schedule_power = float(self.inference_t_schedule_power)
         if self.inference_t_schedule_power <= 0.0:
             raise ValueError(
