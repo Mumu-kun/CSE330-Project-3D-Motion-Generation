@@ -56,6 +56,7 @@ T = TypeVar("T", bound=nn.Module)
 
 LOSS_VS_T_NUM_BINS = 100
 LOSS_VS_T_SCATTER_MAX_POINTS = 5000
+CONTEXT_DROPOUT_PROB = 0.00
 
 # =============================================================================
 # EMA Model Wrapper
@@ -543,7 +544,9 @@ class Trainer:
         epoch: int,
         collect_diagnostics: bool = False,
         consistency_log_prefix: Optional[str] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
+    ) -> Tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, Optional[Dict[str, torch.Tensor]]
+    ]:
         """Compute flow and consistency losses for one branch."""
         if current_frames.shape != target_motion.shape:
             raise ValueError(
@@ -579,6 +582,7 @@ class Trainer:
         xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
 
         contexts_flat = contexts_stacked.flatten(0, 1)
+
         text_batched = (
             text_for_encoder.unsqueeze(1)
             .expand(-1, pred_steps, -1)
@@ -633,7 +637,7 @@ class Trainer:
                         x1_raw[:, pred_model.root_state_dim :],
                     )
 
-                consistency_loss = ric_loss + root_loss + yaw_loss
+                consistency_loss = ric_loss * 3 + root_loss * 20 + yaw_loss * 10
 
                 if self.wandb_logger is not None and consistency_log_prefix is not None:
                     self.wandb_logger.log(
@@ -1081,6 +1085,9 @@ class Trainer:
         epoch: int,
         stochastic_rollout: bool = True,
         use_cfg_dropout: bool = False,
+        use_context_dropout: bool = False,
+        rollout_prob_override: Optional[float] = None,
+        rollout_max_block_len_override: Optional[int] = None,
         encoder: Optional[MotionHistoryEncoder] = None,
         predictor: Optional[FlowMatchingPredictor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float]:
@@ -1125,17 +1132,32 @@ class Trainer:
             )
         hist = motion[:, :-1]
         target_motion = motion[:, 1:]
-        rollout_prob = (
-            self._compute_rollout_probability(epoch) if stochastic_rollout else 0.0
-        )
-        rollout_max_block_len = (
-            min(pred_steps, self._compute_rollout_block_length(epoch))
-            if stochastic_rollout
-            else 0
-        )
+        if rollout_prob_override is not None:
+            rollout_prob = min(max(float(rollout_prob_override), 0.0), 1.0)
+        else:
+            rollout_prob = (
+                self._compute_rollout_probability(epoch) if stochastic_rollout else 0.0
+            )
+        if rollout_max_block_len_override is not None:
+            rollout_max_block_len = min(
+                pred_steps,
+                max(0, int(rollout_max_block_len_override)),
+            )
+        else:
+            rollout_max_block_len = (
+                min(pred_steps, self._compute_rollout_block_length(epoch))
+                if stochastic_rollout
+                else 0
+            )
 
         with timer(self.timing_stats, "forward/encoder_contexts"):
             contexts_stacked = enc(hist, text_for_encoder, return_all=True)
+        if use_context_dropout and pred_model.training:
+            keep_prob = 1.0 - CONTEXT_DROPOUT_PROB
+            context_keep_mask = (torch.rand_like(contexts_stacked) < keep_prob).to(
+                dtype=contexts_stacked.dtype
+            )
+            contexts_stacked = contexts_stacked * context_keep_mask / keep_prob
 
         (
             base_total_loss,
@@ -1161,16 +1183,19 @@ class Trainer:
         rollout_subset_fraction_effective = 0.0
 
         rollout_enabled = (
-            stochastic_rollout
-            and rollout_prob > 0.0
+            rollout_prob > 0.0
             and rollout_max_block_len > 0
             and self.config.rollout_loss_weight > 0.0
             and self.config.rollout_subset_fraction > 0.0
         )
         if rollout_enabled:
-            subset_size = max(1, int(round(B * float(self.config.rollout_subset_fraction))))
+            subset_size = max(
+                1, int(round(B * float(self.config.rollout_subset_fraction)))
+            )
             subset_size = min(B, subset_size)
-            subset_indices = torch.randperm(B, device=device)[:subset_size].sort().values
+            subset_indices = (
+                torch.randperm(B, device=device)[:subset_size].sort().values
+            )
             if subset_indices.numel() > 0:
                 rollout_subset_fraction_effective = subset_indices.numel() / max(1, B)
                 hist_subset = hist.index_select(0, subset_indices)
@@ -1207,7 +1232,9 @@ class Trainer:
                     consistency_log_prefix="rollout_consistency",
                 )
 
-        total_loss = base_total_loss + self.config.rollout_loss_weight * rollout_total_loss
+        total_loss = (
+            base_total_loss + self.config.rollout_loss_weight * rollout_total_loss
+        )
         flow_loss = base_flow_loss + self.config.rollout_loss_weight * rollout_flow_loss
         consistency_loss = (
             base_consistency_loss
@@ -1268,8 +1295,11 @@ class Trainer:
                     self.incremental_flow_loss(
                         batch=batch,
                         epoch=epoch,
-                        stochastic_rollout=True,
+                        stochastic_rollout=False,
                         use_cfg_dropout=False,
+                        use_context_dropout=False,
+                        rollout_prob_override=self.config.rollout_prob_end,
+                        rollout_max_block_len_override=self.config.rollout_block_len_end,
                         encoder=enc,
                         predictor=pred,
                     )
@@ -1386,8 +1416,9 @@ class Trainer:
                             ) = self.incremental_flow_loss(
                                 batch=batch,
                                 epoch=epoch,
-                                stochastic_rollout=True,
+                                stochastic_rollout=False,
                                 use_cfg_dropout=True,
+                                use_context_dropout=True,
                             )
 
                     nonfinite_losses = [
@@ -1582,9 +1613,9 @@ class Trainer:
                     if val_metrics and "val_loss" in val_metrics:
                         epoch_log["epoch/val_loss"] = val_metrics["val_loss"]
                     wandb_logger.log(
-                    epoch_log,
-                    step=self.training_state["global_step"],
-                )
+                        epoch_log,
+                        step=self.training_state["global_step"],
+                    )
 
                 epoch_postfix = {
                     "loss": f"{avg_epoch_loss:.4f}",

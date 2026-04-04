@@ -325,16 +325,26 @@ class MotionHistoryEncoder(nn.Module):
             hidden_states = layer(hidden_states)
 
         hidden_states = self.final_norm(hidden_states)
-        joint_tokens = self.global_to_joints(hidden_states)
-        joint_context = joint_tokens.reshape(
-            batch_size,
-            seq_len,
-            self.joint_count,
-            self.per_joint_out_dim,
-        )
-        if return_all:
+
+        if not return_all:
+            hidden_states = hidden_states[:, -1]
+
+            joint_tokens = self.global_to_joints(hidden_states)
+            joint_context = joint_tokens.reshape(
+                batch_size,
+                self.joint_count,
+                self.per_joint_out_dim,
+            )
             return joint_context
-        return joint_context[:, -1]
+        else:
+            joint_tokens = self.global_to_joints(hidden_states)
+            joint_context = joint_tokens.reshape(
+                batch_size,
+                seq_len,
+                self.joint_count,
+                self.per_joint_out_dim,
+            )
+            return joint_context
 
     def step(
         self,
@@ -824,6 +834,9 @@ def integrate_flow_ode(
     num_steps: int,
     time_schedule_power: float = 2.0,
     initial_state: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
+    unconditional_text_embedding: Optional[torch.Tensor] = None,
+    unconditional_track_features: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Integrate the inference-time flow ODE using an end-biased power grid and Heun.
@@ -857,33 +870,83 @@ def integrate_flow_ode(
         dtype=dtype,
     )
 
+    use_cfg = float(guidance_scale) != 1.0 and (
+        unconditional_text_embedding is not None
+        or unconditional_track_features is not None
+    )
+    if unconditional_text_embedding is not None:
+        if unconditional_text_embedding.shape != text_embedding.shape:
+            raise ValueError(
+                "Expected unconditional_text_embedding shape "
+                f"{tuple(text_embedding.shape)}, got "
+                f"{tuple(unconditional_text_embedding.shape)}"
+            )
+        unconditional_text_embedding = unconditional_text_embedding.to(
+            device=device,
+            dtype=text_embedding.dtype,
+        )
+    if unconditional_track_features is not None:
+        if unconditional_track_features.shape != track_features.shape:
+            raise ValueError(
+                "Expected unconditional_track_features shape "
+                f"{tuple(track_features.shape)}, got "
+                f"{tuple(unconditional_track_features.shape)}"
+            )
+        unconditional_track_features = unconditional_track_features.to(
+            device=device,
+            dtype=track_features.dtype,
+        )
+
+    def _predict_velocity(
+        noisy_features: torch.Tensor,
+        timesteps_batch: torch.Tensor,
+    ) -> torch.Tensor:
+        cond_velocity = predictor(
+            track_features=track_features,
+            noisy_features=noisy_features,
+            timesteps=timesteps_batch,
+            current_frame_features=current_frame_features,
+            text_embedding=text_embedding,
+            output_attentions=False,
+            output_hidden_states=False,
+        )[0]
+        if not use_cfg:
+            return cond_velocity
+
+        cfg_text_embedding = (
+            unconditional_text_embedding
+            if unconditional_text_embedding is not None
+            else text_embedding
+        )
+        cfg_track_features = (
+            unconditional_track_features
+            if unconditional_track_features is not None
+            else track_features
+        )
+        uncond_velocity = predictor(
+            track_features=cfg_track_features,
+            noisy_features=noisy_features,
+            timesteps=timesteps_batch,
+            current_frame_features=current_frame_features,
+            text_embedding=cfg_text_embedding,
+            output_attentions=False,
+            output_hidden_states=False,
+        )[0]
+        return uncond_velocity + float(guidance_scale) * (
+            cond_velocity - uncond_velocity
+        )
+
     for step in range(tau.shape[0] - 1):
         t_start = tau[step]
         t_end = tau[step + 1]
         dt = t_end - t_start
 
         t_start_batch = t_start.expand(batch_size)
-        k1 = predictor(
-            track_features=track_features,
-            noisy_features=x_t,
-            timesteps=t_start_batch,
-            current_frame_features=current_frame_features,
-            text_embedding=text_embedding,
-            output_attentions=False,
-            output_hidden_states=False,
-        )[0]
+        k1 = _predict_velocity(x_t, t_start_batch)
 
         x_euler = x_t + dt * k1
         t_end_batch = t_end.expand(batch_size)
-        k2 = predictor(
-            track_features=track_features,
-            noisy_features=x_euler,
-            timesteps=t_end_batch,
-            current_frame_features=current_frame_features,
-            text_embedding=text_embedding,
-            output_attentions=False,
-            output_hidden_states=False,
-        )[0]
+        k2 = _predict_velocity(x_euler, t_end_batch)
 
         x_t = x_t + 0.5 * dt * (k1 + k2)
 
@@ -945,6 +1008,8 @@ class HumanMotionGenerator:
         input_positions: Optional[torch.Tensor] = None,
         total_duration: Optional[torch.Tensor] = None,
         guidance_scale: float = 1.0,
+        guidance_drop_text: bool = True,
+        guidance_drop_context: bool = False,
         dataset_type: str = "t2m",
         use_fk=True,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -962,6 +1027,9 @@ class HumanMotionGenerator:
             horizon: Number of recent frames to use for context encoding
             input_positions: Optional initial global positions (B, N, 22, 3) or (B, 22, 3)
             total_duration: Optional duration tensor (not used)
+            guidance_scale: CFG strength used during inference
+            guidance_drop_text: Zero the predictor text embedding in the CFG branch
+            guidance_drop_context: Zero the encoder context in the CFG branch
             dataset_type: Dataset type for feature extraction
             use_fk: Whether to use FK positions for relative shift computation
         Returns:
@@ -1054,9 +1122,18 @@ class HumanMotionGenerator:
                         position_history[:, 1:] - position_history[:, :-1],
                     ],
                     dim=1,
-                )
+            )
 
             text_emb = text[:, 0, :]
+            use_cfg = float(guidance_scale) != 1.0
+            if use_cfg and not (guidance_drop_text or guidance_drop_context):
+                raise ValueError(
+                    "guidance_scale requires at least one unconditional branch input; "
+                    "set guidance_drop_text and/or guidance_drop_context."
+                )
+            predictor_uncond_text_emb = (
+                torch.zeros_like(text_emb) if use_cfg and guidance_drop_text else None
+            )
             frame_buffer = (
                 feature_history[:, :-1] if feature_history.shape[1] > 1 else None
             )
@@ -1083,6 +1160,11 @@ class HumanMotionGenerator:
                     frame_buffer=frame_buffer,
                     cache_state=cache_state,
                 )
+                predictor_uncond_context = (
+                    torch.zeros_like(context_cond)
+                    if use_cfg and guidance_drop_context
+                    else None
+                )
                 current_frame_features = extract_prev_frame_features(
                     current_frame,
                     normalizer=self.normalizer,
@@ -1100,6 +1182,9 @@ class HumanMotionGenerator:
                     text_embedding=text_emb,
                     num_steps=num_steps,
                     time_schedule_power=self.config.inference_t_schedule_power,
+                    guidance_scale=guidance_scale,
+                    unconditional_text_embedding=predictor_uncond_text_emb,
+                    unconditional_track_features=predictor_uncond_context,
                 )
 
                 # ========================================

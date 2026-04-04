@@ -115,7 +115,7 @@ class Config:
             text_embedding_dim=512,
             hidden_size=256,
             intermediate_size=4 * 256,
-            num_hidden_layers=4,
+            num_hidden_layers=5,
             num_attention_heads=8,
             hidden_act="gelu",
             layer_norm_eps=1e-5,
@@ -136,8 +136,8 @@ class Config:
     # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
     predictor_config: FlowMatchingPredictorConfig = field(
         default_factory=lambda: FlowMatchingPredictorConfig(
-            hidden_size=96,
-            intermediate_size=4 * 96,
+            hidden_size=128,
+            intermediate_size=4 * 128,
             num_hidden_layers=3,
             num_attention_heads=4,
             hidden_act="silu",
@@ -151,19 +151,22 @@ class Config:
     )
 
     # Training settings
-    batch_size: int = 200
-    learning_rate: float = 1e-4
+    batch_size: int = 300
+    learning_rate: float = 0.5e-4
     weight_decay: float = 1e-5
-    gradient_clip: float = 1.0
+    gradient_clip: float = 10.0
     ema_decay: float = 0.999
 
     # Curriculum learning settings
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
+            {"horizon": 5, "epochs": 100},
             {"horizon": 10, "epochs": 200},
             {"horizon": 20, "epochs": 400},
-            {"horizon": 40, "epochs": 2000},
+            {"horizon": 40, "epochs": 1200},
+            {"horizon": 60, "epochs": 2000},
+            {"horizon": 80, "epochs": 3000},
         ]
     )
 
@@ -171,13 +174,13 @@ class Config:
     _num_epochs: int = 200
 
     # CFG (Classifier-Free Guidance) settings
-    cfg_dropout: float = 0  # Dropout probability for CFG
+    cfg_dropout: float = 0.1  # Dropout probability for CFG
 
     # Training-time timestep sampling
     t_sampling_mode: str = "power"  # "uniform" or "power"
-    t_sampling_power: float = 4.0  # Power-law exponent k in p(t)=(k+1)t^k
+    t_sampling_power: float = 3.0  # Power-law exponent k in p(t)=(k+1)t^k
     t_sampling_power_warmup_fraction: float = (
-        0.1  # Fraction of training used to ramp k from 0 to target
+        0.2  # Fraction of training used to ramp k from 0 to target
     )
 
     use_fk: bool = False  # Whether to compute FK loss during training
@@ -193,7 +196,7 @@ class Config:
         3  # Number of ODE integration steps for rollout branch
     )
     rollout_subset_fraction: float = 0.25  # Fraction of batch for rollout branch
-    rollout_loss_weight: float = 1.0  # Weight of rollout-conditioned loss branch
+    rollout_loss_weight: float = 0.25  # Weight of rollout-conditioned loss branch
     rollout_block_len_bias_power: float = (
         2.0  # Power > 1 biases sampled rollout lengths toward the scheduled max
     )
@@ -204,7 +207,7 @@ class Config:
     consistency_loss_t_threshold: float = (
         0.5  # Only apply consistency loss for t > threshold
     )
-    consistency_loss_weight: float = 1  # Weight for consistency loss in total loss
+    consistency_loss_weight: float = 10  # Weight for consistency loss in total loss
 
     # Data loading
     num_workers: int = 4

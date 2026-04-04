@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from models import HumanMotionGenerator
 from utils.checkpoint_eval import (
     aggregate_position_metrics,
+    joint_name,
     load_feature_normalizer as shared_load_feature_normalizer,
     load_generator_from_checkpoint as shared_load_generator_from_checkpoint,
     predict_next_positions as shared_predict_next_positions,
@@ -24,8 +25,8 @@ from utils.motion_utils import FeatureNormalizer, generated_positions_to_271d
 from utils.visualization import plot_3d_motion
 
 
-PREDICTOR_STEPS = 25
-CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "latest9.pt"
+PREDICTOR_STEPS = 5
+CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "best_val_noss_fullset.pt"
 DATASET_PATH = PROJECT_ROOT / "tests" / "dataset" / "humanml3d-subset-mini"
 OUTPUT_DIR = (
     PROJECT_ROOT
@@ -116,6 +117,102 @@ def _joint_metrics(
     target_positions: torch.Tensor,
 ) -> dict[str, float]:
     return aggregate_position_metrics(pred_positions, target_positions)
+
+
+def _distribution_stats(values: np.ndarray) -> dict[str, float]:
+    flat = values.astype(np.float64, copy=False).reshape(-1)
+    return {
+        "mean": float(flat.mean()),
+        "std": float(flat.std()),
+        "abs_mean": float(np.abs(flat).mean()),
+        "rms": float(np.sqrt(np.mean(np.square(flat)))),
+        "min": float(flat.min()),
+        "p10": float(np.quantile(flat, 0.10)),
+        "median": float(np.quantile(flat, 0.50)),
+        "p90": float(np.quantile(flat, 0.90)),
+        "max": float(flat.max()),
+    }
+
+
+def _noise_candidates(base_std: float) -> dict[str, float]:
+    return {
+        "0.5pct": float(base_std * 0.005),
+        "1pct": float(base_std * 0.01),
+        "2pct": float(base_std * 0.02),
+        "5pct": float(base_std * 0.05),
+    }
+
+
+def _summarize_history_contexts(
+    history_contexts: torch.Tensor,
+) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+    if history_contexts.ndim != 4:
+        raise ValueError(
+            "Expected history contexts shape (B, T, J, D), "
+            f"got {tuple(history_contexts.shape)}."
+        )
+
+    contexts_np = history_contexts.detach().cpu().float().numpy()
+    temporal_std_per_joint_dim = contexts_np.std(axis=1, dtype=np.float64)
+    per_frame_value_std = contexts_np.std(axis=(2, 3), dtype=np.float64)
+    per_joint_temporal_std_mean = temporal_std_per_joint_dim.mean(axis=-1)
+    mean_joint_std = per_joint_temporal_std_mean.mean(axis=0)
+    top_joint_indices = np.argsort(mean_joint_std)[::-1][:5]
+
+    value_std = float(contexts_np.std(dtype=np.float64))
+    temporal_std_mean = float(temporal_std_per_joint_dim.mean())
+
+    arrays = {
+        "history_contexts": (
+            np.squeeze(contexts_np, axis=0)
+            if contexts_np.shape[0] == 1
+            else contexts_np
+        ),
+        "temporal_std_per_joint_dim": (
+            np.squeeze(temporal_std_per_joint_dim, axis=0)
+            if temporal_std_per_joint_dim.shape[0] == 1
+            else temporal_std_per_joint_dim
+        ),
+        "per_frame_value_std": (
+            np.squeeze(per_frame_value_std, axis=0)
+            if per_frame_value_std.shape[0] == 1
+            else per_frame_value_std
+        ),
+        "per_joint_temporal_std_mean": (
+            np.squeeze(per_joint_temporal_std_mean, axis=0)
+            if per_joint_temporal_std_mean.shape[0] == 1
+            else per_joint_temporal_std_mean
+        ),
+    }
+
+    summary: dict[str, object] = {
+        "shape": list(history_contexts.shape),
+        "value_distribution": _distribution_stats(contexts_np),
+        "per_frame_value_std_distribution": _distribution_stats(per_frame_value_std),
+        "temporal_std_per_joint_dim_distribution": _distribution_stats(
+            temporal_std_per_joint_dim
+        ),
+        "per_joint_temporal_std_mean_distribution": _distribution_stats(
+            per_joint_temporal_std_mean
+        ),
+        "per_joint_temporal_std_mean": {
+            joint_name(int(joint_idx)): float(joint_std)
+            for joint_idx, joint_std in enumerate(mean_joint_std.tolist())
+        },
+        "top_temporal_std_joints": [
+            {
+                "joint_index": int(joint_idx),
+                "joint_name": joint_name(int(joint_idx)),
+                "mean_temporal_std": float(mean_joint_std[joint_idx]),
+            }
+            for joint_idx in top_joint_indices.tolist()
+        ],
+        "small_gaussian_noise_heuristics": {
+            "based_on_value_std": _noise_candidates(value_std),
+            "based_on_temporal_std_mean": _noise_candidates(temporal_std_mean),
+        },
+    }
+    return summary, arrays
 
 
 def _save_motion_video(
@@ -219,6 +316,16 @@ def main() -> None:
     text_clip = batch["text_clip"].to(config.device)
     motion_norm = normalizer.normalize(motion_raw)
 
+    with torch.no_grad():
+        history_contexts = generator.encoder(
+            motion_norm[:, :-1],
+            text_clip[:, 0, :],
+            return_all=True,
+        )
+    history_context_summary, history_context_arrays = _summarize_history_contexts(
+        history_contexts
+    )
+
     horizon = int(config.horizon)
     inference_steps = max(
         1,
@@ -316,6 +423,24 @@ def main() -> None:
         OUTPUT_DIR / "masked_teacher_force_rollout_mask.npy",
         np.asarray(masked_teacher_force_mask, dtype=np.bool_),
     )
+    np.save(
+        OUTPUT_DIR / "teacher_forced_encoder_history_contexts.npy",
+        history_context_arrays["history_contexts"],
+    )
+    np.save(
+        OUTPUT_DIR
+        / "teacher_forced_encoder_history_context_temporal_std_per_joint_dim.npy",
+        history_context_arrays["temporal_std_per_joint_dim"],
+    )
+    np.save(
+        OUTPUT_DIR / "teacher_forced_encoder_history_context_per_frame_value_std.npy",
+        history_context_arrays["per_frame_value_std"],
+    )
+    np.save(
+        OUTPUT_DIR
+        / "teacher_forced_encoder_history_context_per_joint_temporal_std_mean.npy",
+        history_context_arrays["per_joint_temporal_std_mean"],
+    )
 
     fps = float(getattr(config, "fps", 20))
     _save_motion_video(
@@ -353,6 +478,7 @@ def main() -> None:
         "rollout_seed_length": horizon,
         "teacher_forced_predictor_steps": PREDICTOR_STEPS,
         "rollout_inference_steps": inference_steps,
+        "teacher_forced_encoder_history_context": history_context_summary,
         "teacher_forced_avg": {
             key: float(np.mean([m[key] for m in teacher_forced_metrics]))
             for key in teacher_forced_metrics[0]
@@ -380,6 +506,7 @@ def main() -> None:
         json.dump(metrics, handle, indent=2)
 
     print(f"Saved visualizations to {OUTPUT_DIR}")
+    print(json.dumps(metrics["teacher_forced_encoder_history_context"], indent=2))
     print(json.dumps(metrics["teacher_forced_avg"], indent=2))
     print(json.dumps(metrics["rollout_avg"], indent=2))
 
