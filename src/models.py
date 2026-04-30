@@ -252,6 +252,41 @@ class MotionHistoryTemporalLayer(nn.Module):
 
 
 class MotionHistoryEncoder(nn.Module):
+    class GlobalToJointMapper(nn.Module):
+        def __init__(self, config: MotionHistoryEncoderConfig) -> None:
+            super().__init__()
+            self.config = config
+            self.global_to_joints = GatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                bias=config.mlp_bias,
+                activation=config.hidden_act,
+                dropout=config.dropout,
+            )
+            self.joint_output_projection = nn.Linear(
+                config.hidden_size, config.per_joint_output_dim, bias=True
+            )
+            self.kinematic_encoder = KinematicChainEncoder(config.hidden_size)
+
+        def forward(self, global_context: torch.Tensor) -> torch.Tensor:
+            """
+            Maps global context to per-joint features.
+            Args:
+                global_context: (B, seq_len, hidden_size) - Global context vector
+            Returns:
+                joint_context: (B, seq_len, joint_count, per_joint_output_dim) - Per-joint features for the last frame
+            """
+            context_expanded = global_context.unsqueeze(2).expand(
+                -1, -1, self.config.joint_count, -1
+            )
+            kinematic_embeddings = self.kinematic_encoder(
+                torch.arange(self.config.joint_count, device=global_context.device)
+            )  # (joint_count, hidden_size)
+            context_expanded = context_expanded + kinematic_embeddings[None, None, :, :]
+            joint_tokens = self.global_to_joints(context_expanded)
+            joint_tokens = self.joint_output_projection(joint_tokens)
+            return joint_tokens
+
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__()
         self.config = config
@@ -275,16 +310,7 @@ class MotionHistoryEncoder(nn.Module):
             ]
         )
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.global_to_joints = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size, bias=config.mlp_bias),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(
-                config.hidden_size,
-                config.joint_count * config.per_joint_output_dim,
-                bias=config.mlp_bias,
-            ),
-        )
+        self.global_to_joints = self.GlobalToJointMapper(config)
 
     def _empty_cache_state(self) -> TemporalCacheState:
         return TemporalCacheState(
@@ -327,24 +353,13 @@ class MotionHistoryEncoder(nn.Module):
         hidden_states = self.final_norm(hidden_states)
 
         if not return_all:
-            hidden_states = hidden_states[:, -1]
+            hidden_states = hidden_states[:, -1:]
 
             joint_tokens = self.global_to_joints(hidden_states)
-            joint_context = joint_tokens.reshape(
-                batch_size,
-                self.joint_count,
-                self.per_joint_out_dim,
-            )
-            return joint_context
+            return joint_tokens[:, 0]  # (B, joint_count, per_joint_out_dim)
         else:
             joint_tokens = self.global_to_joints(hidden_states)
-            joint_context = joint_tokens.reshape(
-                batch_size,
-                seq_len,
-                self.joint_count,
-                self.per_joint_out_dim,
-            )
-            return joint_context
+            return joint_tokens  # (B, seq_len, joint_count, per_joint_out_dim)
 
     def step(
         self,
@@ -583,8 +598,12 @@ class FlowMatchingPredictor(nn.Module):
             config.hidden_size,
         )
 
-        self.global_cond_projection = nn.Linear(
+        self.global_adaln_projection = nn.Linear(
             config.global_cond_dim, config.hidden_size
+        )
+
+        self.global_film_projection = nn.Linear(
+            config.global_cond_dim, 2 * config.hidden_size, bias=True
         )
 
         # Time embedding for denoising timestep
@@ -763,7 +782,12 @@ class FlowMatchingPredictor(nn.Module):
             timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps
         )  # (B, H)
 
-        global_cond_proj = self.global_cond_projection(text_embedding)  # (B, H)
+        global_cond_proj = self.global_adaln_projection(text_embedding)  # (B, H)
+        global_film = self.global_film_projection(text_embedding)  # (B, 2H)
+        global_film_shift, global_film_scale = global_film.chunk(2, dim=-1)
+        hidden_states = hidden_states * (
+            1 + global_film_scale.unsqueeze(1)
+        ) + global_film_shift.unsqueeze(1)
 
         # Combine required global conditioning with time embedding.
         adaln_conditioning = time_cond + global_cond_proj  # (B, H)
@@ -1122,7 +1146,7 @@ class HumanMotionGenerator:
                         position_history[:, 1:] - position_history[:, :-1],
                     ],
                     dim=1,
-            )
+                )
 
             text_emb = text[:, 0, :]
             use_cfg = float(guidance_scale) != 1.0
