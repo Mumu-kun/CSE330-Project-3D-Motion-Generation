@@ -114,8 +114,8 @@ class Config:
             frame_feature_dim=271,
             text_embedding_dim=512,
             hidden_size=128,
-            intermediate_size=4 * 128,
-            num_hidden_layers=3,
+            intermediate_size=2 * 128,
+            num_hidden_layers=4,
             num_attention_heads=8,
             hidden_act="gelu",
             layer_norm_eps=1e-5,
@@ -136,9 +136,9 @@ class Config:
     # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
     predictor_config: FlowMatchingPredictorConfig = field(
         default_factory=lambda: FlowMatchingPredictorConfig(
-            hidden_size=64,
-            intermediate_size=4 * 64,
-            num_hidden_layers=3,
+            hidden_size=128,
+            intermediate_size=2 * 128,
+            num_hidden_layers=2,
             num_attention_heads=4,
             hidden_act="silu",
             rms_norm_eps=1e-6,
@@ -161,10 +161,10 @@ class Config:
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 5, "epochs": 100},
-            {"horizon": 10, "epochs": 200},
-            {"horizon": 20, "epochs": 400},
-            {"horizon": 40, "epochs": 2000},
+            {"horizon": 5, "epochs": 50},
+            {"horizon": 10, "epochs": 100},
+            {"horizon": 20, "epochs": 200},
+            {"horizon": 40, "epochs": 500},
         ]
     )
 

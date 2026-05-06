@@ -24,9 +24,15 @@ from utils.dataset import Text2MotionDataset, text2motion_collate_fn
 from utils.motion_utils import FeatureNormalizer, generated_positions_to_271d
 from utils.visualization import plot_3d_motion
 
-
 PREDICTOR_STEPS = 5
-CHECKPOINT_PATH = PROJECT_ROOT / "tests" / "checkpoints" / "best_val_noss_fullset.pt"
+CHECKPOINT_PATH = (
+    PROJECT_ROOT
+    / "tests"
+    / "checkpoints"
+    / "latest.pt"
+    # / "before_submit"
+    # / "best_val_noss_fullset.pt"
+)
 DATASET_PATH = PROJECT_ROOT / "tests" / "dataset" / "humanml3d-subset-mini"
 OUTPUT_DIR = (
     PROJECT_ROOT

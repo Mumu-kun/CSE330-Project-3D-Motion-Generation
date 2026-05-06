@@ -7,9 +7,10 @@ This document summarizes the architecture that is actually implemented in `src/`
 At a high level, each generated frame is produced in four stages:
 
 1. Encode recent 271D motion history with text conditioning.
-2. Predict a denoised next-frame state in a reduced 68D representation.
-3. Convert that reduced state into absolute global joint positions.
-4. Convert the new positions back into a 271D frame and append them to history.
+2. Assemble predictor inputs by concatenating noisy reduced-state features, per-joint history features, and current-frame causal features.
+3. Predict a denoised next-frame state in a reduced 68D representation.
+4. Convert that reduced state into absolute global joint positions.
+5. Convert the new positions back into a 271D frame and append them to history.
 
 The recurrent state is therefore not a latent-only state. It is a pair of concrete, interpretable histories:
 - absolute joint positions
@@ -40,6 +41,11 @@ text embedding (B, 512)
     -> per-timestep projection to 22 joint tokens
 ```
 
+Tensor flow details:
+- `frame_projection` and `text_projection` act on each timestep independently, then the text branch applies FiLM-style shift and scale by addition and multiplication, not concatenation.
+- `step(...)` appends the newest 271D frame to the explicit `frame_buffer` and recomputes the encoder over the buffered sequence.
+- The encoder output is a per-joint context tensor, so the predictor receives joint-aligned history rather than a pooled latent.
+
 Why it exists:
 - It gives the predictor a temporally informed summary without forcing the predictor itself to model full spatiotemporal attention.
 - The encoder is causal, so each context only depends on current and past frames.
@@ -56,14 +62,21 @@ Role:
 - predicts flow in a reduced next-frame state space
 - reasons jointly over root and non-root joints using attention across 22 tokens
 
-Current tokenization:
-- token `0`: root
-- tokens `1..21`: non-root joints
+Prediction tokenization:
+- after the temporary text/global token is removed, token `0` is the root and tokens `1..21` are the non-root joints
+- the temporary text token exists only to carry global conditioning through the shared transformer stream
 
 Per-token inputs are assembled from three sources:
 - noisy reduced-state features
 - per-joint history features from the temporal encoder
 - current-frame causal features extracted from the latest 271D frame
+
+The input assembly is explicit concatenation:
+- root token input = `root_state + root_history + root_current_frame`
+- joint token input = `joint_state + joint_history + joint_current_frame`
+- text conditioning is added after projection as a global FiLM branch, not concatenated into every token feature vector
+
+The current implementation also prepends a dedicated text/global token before the joint tokens, then prepends a zero kinematic token so the structural prior can align with that sequence layout.
 
 Conditioning path:
 
@@ -75,7 +88,8 @@ time embedding + text projection -> AdaLN conditioning
 
 Structure prior:
 - A `KinematicChainEncoder` provides a fixed embedding per joint based on chain id and depth.
-- Each transformer layer adds this prior through a learned bounded scalar gate.
+- The prior is injected by gated addition into the token stream, layer by layer.
+- This is not a concatenation path; the joint sequence remains width-stable while the gate modulates how strongly the prior is added.
 
 ### C. Frame Conversion Layer
 
@@ -103,6 +117,7 @@ Role:
 Important implementation choices:
 - the generator keeps absolute positions as the primary autoregressive state
 - 271D features are re-derived every step instead of treating the predictor output as a persistent full feature frame
+- the current frame is converted to 257D predictor conditioning with feature packing, then the predictor integrates 68D noise toward the next reduced state
 - history length is controlled externally by `horizon` or, if omitted, by `config.horizon`
 
 That keeps context management explicit and avoids a hidden encoder-owned context limit.
@@ -207,9 +222,9 @@ For each output frame:
 1. Take the latest history window of normalized 271D frames.
 2. Trim that window according to `horizon` or `config.horizon`.
 3. Encode that window with the temporal history encoder.
-4. Extract current-frame causal features from the latest frame.
+4. Extract current-frame causal features from the latest frame and keep them as a separate conditioning vector.
 5. Initialize a noisy reduced state `x_t ~ N(0, I)` in 68D.
-6. Integrate the predictor over `num_steps` using the end-biased Heun ODE solver.
+6. Concatenate the reduced-state, history, and current-frame branches inside the predictor, then integrate the predictor over `num_steps` using the end-biased Heun ODE solver.
 7. Convert the integrated reduced state to absolute positions using the previous root position and root rotation.
 8. Convert the new positions back into a 271D frame.
 9. Append positions, features, and relative shifts to history.
@@ -223,6 +238,8 @@ One of the most important current design choices is that inference is position-f
 - relative shifts are derived outputs, not the primary recurrent state
 
 This keeps the loop aligned with geometry-aware utilities such as IK, FK, root-motion integration, and foot-contact recomputation.
+
+The important distinction is that concatenation is used for token assembly, while addition and gating are used for conditioning and structural bias. That separation keeps the geometry path explicit and the model path easy to inspect.
 
 ### FK-consistent option
 

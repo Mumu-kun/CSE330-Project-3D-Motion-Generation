@@ -252,41 +252,6 @@ class MotionHistoryTemporalLayer(nn.Module):
 
 
 class MotionHistoryEncoder(nn.Module):
-    class GlobalToJointMapper(nn.Module):
-        def __init__(self, config: MotionHistoryEncoderConfig) -> None:
-            super().__init__()
-            self.config = config
-            self.global_to_joints = GatedMLP(
-                hidden_size=config.hidden_size,
-                intermediate_size=config.intermediate_size,
-                bias=config.mlp_bias,
-                activation=config.hidden_act,
-                dropout=config.dropout,
-            )
-            self.joint_output_projection = nn.Linear(
-                config.hidden_size, config.per_joint_output_dim, bias=True
-            )
-            self.kinematic_encoder = KinematicChainEncoder(config.hidden_size)
-
-        def forward(self, global_context: torch.Tensor) -> torch.Tensor:
-            """
-            Maps global context to per-joint features.
-            Args:
-                global_context: (B, seq_len, hidden_size) - Global context vector
-            Returns:
-                joint_context: (B, seq_len, joint_count, per_joint_output_dim) - Per-joint features for the last frame
-            """
-            context_expanded = global_context.unsqueeze(2).expand(
-                -1, -1, self.config.joint_count, -1
-            )
-            kinematic_embeddings = self.kinematic_encoder(
-                torch.arange(self.config.joint_count, device=global_context.device)
-            )  # (joint_count, hidden_size)
-            context_expanded = context_expanded + kinematic_embeddings[None, None, :, :]
-            joint_tokens = self.global_to_joints(context_expanded)
-            joint_tokens = self.joint_output_projection(joint_tokens)
-            return joint_tokens
-
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__()
         self.config = config
@@ -300,17 +265,35 @@ class MotionHistoryEncoder(nn.Module):
         self.frame_projection = nn.Linear(
             config.frame_feature_dim, config.hidden_size, bias=True
         )
+
         self.text_projection = nn.Linear(
             config.text_embedding_dim, 2 * config.hidden_size, bias=True
         )
+
         self.layers = nn.ModuleList(
             [
                 MotionHistoryTemporalLayer(config)
                 for _ in range(config.num_hidden_layers)
             ]
         )
+
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.global_to_joints = self.GlobalToJointMapper(config)
+        self.global_to_joints = nn.Sequential(
+            nn.Linear(config.hidden_size, config.hidden_size * 2, bias=config.mlp_bias),
+            nn.GELU(),
+            GatedMLP(
+                hidden_size=config.hidden_size * 2,
+                intermediate_size=config.hidden_size * 4,
+                bias=config.mlp_bias,
+                activation=config.hidden_act,
+                dropout=config.dropout,
+            ),
+            nn.Linear(
+                config.hidden_size * 2,
+                config.joint_count * config.per_joint_output_dim,
+                bias=config.mlp_bias,
+            ),
+        )
 
     def _empty_cache_state(self) -> TemporalCacheState:
         return TemporalCacheState(
@@ -353,13 +336,24 @@ class MotionHistoryEncoder(nn.Module):
         hidden_states = self.final_norm(hidden_states)
 
         if not return_all:
-            hidden_states = hidden_states[:, -1:]
+            hidden_states = hidden_states[:, -1]
 
             joint_tokens = self.global_to_joints(hidden_states)
-            return joint_tokens[:, 0]  # (B, joint_count, per_joint_out_dim)
+            joint_context = joint_tokens.reshape(
+                batch_size,
+                self.joint_count,
+                self.per_joint_out_dim,
+            )
+            return joint_context
         else:
             joint_tokens = self.global_to_joints(hidden_states)
-            return joint_tokens  # (B, seq_len, joint_count, per_joint_out_dim)
+            joint_context = joint_tokens.reshape(
+                batch_size,
+                seq_len,
+                self.joint_count,
+                self.per_joint_out_dim,
+            )
+            return joint_context
 
     def step(
         self,
@@ -606,6 +600,10 @@ class FlowMatchingPredictor(nn.Module):
             config.global_cond_dim, 2 * config.hidden_size, bias=True
         )
 
+        self.text_token_projection = nn.Linear(
+            config.global_cond_dim, config.hidden_size, bias=True
+        )
+
         # Time embedding for denoising timestep
         self.time_embedder = SinusoidalEmbedder(config.hidden_size)
 
@@ -762,19 +760,37 @@ class FlowMatchingPredictor(nn.Module):
         joint_hidden = self.joint_input_projection(joint_inputs)
         hidden_states = torch.cat([root_hidden, joint_hidden], dim=1)  # (B, 22, H)
 
+        text_token = self.text_token_projection(text_embedding).unsqueeze(
+            1
+        )  # (B, 1, H)
+        hidden_states = torch.cat([text_token, hidden_states], dim=1)  # (B, 23, H)
+
         # Build static per-joint kinematic tokens once and reuse across layers.
         B, N, H = hidden_states.shape
-        kin_tokens = self.kinematic_encoder(self.joint_ids)  # (22, H)
-        if kin_tokens.shape[0] != N:
+        expected_token_count = self.joint_count + 1
+        if N != expected_token_count:
             raise ValueError(
-                f"Joint count mismatch: predictor got N={N}, "
-                f"but kinematic table has {kin_tokens.shape[0]} joints."
+                f"Expected hidden_states to contain text token + {self.joint_count} joint tokens, got {N} tokens."
+            )
+        kin_tokens = self.kinematic_encoder(self.joint_ids)  # (22, H)
+        if kin_tokens.shape[0] != self.joint_count:
+            raise ValueError(
+                f"Joint count mismatch: predictor expected {self.joint_count} joints, got {kin_tokens.shape[0]}."
             )
         kin_tokens = self.kinematic_token_norm(kin_tokens)
         kin_tokens = kin_tokens.to(
             device=hidden_states.device, dtype=hidden_states.dtype
         )
-        kin_tokens = kin_tokens.unsqueeze(0).expand(B, N, H)  # (B, N, H)
+        kin_tokens = torch.cat(
+            [
+                torch.zeros((1, H), device=kin_tokens.device, dtype=kin_tokens.dtype),
+                kin_tokens,
+            ],
+            dim=0,
+        )  # Add zero token for text/global conditioning
+        kin_tokens = kin_tokens.unsqueeze(0).expand(
+            B, expected_token_count, H
+        )  # (B, joint_count + 1, H)
 
         # 3. Time conditioning
         # Handle both (B,) and (B, 1) timestep formats
@@ -817,6 +833,10 @@ class FlowMatchingPredictor(nn.Module):
 
             if output_attentions:
                 all_self_attns.append(layer_outputs[1])
+
+        hidden_states = hidden_states[
+            :, 1:, :
+        ]  # Remove text/global token before output
 
         # 5. Output prediction
         normed_states = self.output_norm(hidden_states)  # (B, N, H)

@@ -99,9 +99,9 @@ Current config dataclass:
 MotionHistoryEncoderConfig(
     frame_feature_dim=271,
     text_embedding_dim=512,
-    hidden_size=512,
-    intermediate_size=2048,
-    num_hidden_layers=3,
+    hidden_size=256,
+    intermediate_size=512,
+    num_hidden_layers=4,
     num_attention_heads=8,
     hidden_act="gelu",
     layer_norm_eps=1e-5,
@@ -118,9 +118,9 @@ MotionHistoryEncoderConfig(
 Active defaults inside `Config()`:
 
 ```python
-hidden_size=256
+hidden_size=128
 intermediate_size=512
-num_hidden_layers=4
+num_hidden_layers=3
 num_attention_heads=8
 per_joint_output_dim=64
 ```
@@ -145,13 +145,12 @@ output_dim -> int
 ```
 
 Implementation notes:
-- `frame_projection` maps each 271D frame into model space.
-- `text_projection` outputs `2 * hidden_size`, which is split into per-sample shift and scale terms.
+- `frame_projection` maps each 271D frame into model space, then `text_projection` applies per-sample shift/scale modulation.
 - Each temporal layer is `LayerNorm -> causal RoPE attention -> LayerNorm -> gated MLP`.
-- `global_to_joints` maps each timestep to `22 * per_joint_output_dim`, then reshapes to per-joint tokens.
+- `GlobalToJointMapper` expands the final hidden context with `motion_code_proj`, `KinematicChainEncoder`, `kinematic_query`, gated modulation, and `joint_out_proj`.
 - `return_all=True` returns contexts for every timestep and is the path used by training.
 - `step(...)` is used by autoregressive generation. It concatenates the new frame onto `frame_buffer` and runs a full forward pass over that buffer.
-- `TemporalCacheState` exists, but there is no real key/value caching yet. The cache object is mainly a placeholder interface right now.
+- `TemporalCacheState` exists, but there is no real key/value caching yet. The cache object is still a placeholder interface.
 
 ### `FlowMatchingPredictor`
 
@@ -160,6 +159,33 @@ Source: `src/models.py`
 Purpose:
 - Predicts flow in the reduced 68D next-frame state space.
 - Reasons jointly over root and non-root joints using attention across 22 tokens.
+
+Current config dataclass:
+
+```python
+FlowMatchingPredictorConfig(
+    hidden_size=256,
+    intermediate_size=768,
+    num_hidden_layers=4,
+    num_attention_heads=8,
+    hidden_act="silu",
+    rms_norm_eps=1e-6,
+    attention_bias=True,
+    attention_dropout=0.1,
+    mlp_bias=True,
+    track_dimensionality=3,
+    global_cond_dim=512,
+)
+```
+
+Active defaults inside `Config()`:
+
+```python
+hidden_size=64
+intermediate_size=256
+num_hidden_layers=3
+num_attention_heads=4
+```
 
 Current interface:
 
@@ -212,18 +238,21 @@ generate_sequence(
     input_positions=None,
     total_duration=None,
     guidance_scale=1.0,
+    guidance_drop_text=True,
+    guidance_drop_context=False,
     dataset_type="t2m",
     use_fk=True,
 ) -> tuple[position_history, feature_history, relative_shift_history]
 ```
 
 Behavior notes:
-- `text` may be a string, list of strings, or pre-encoded `(B, 1, 512)` tensor.
+- `text` may be a string, list of strings, or pre-encoded `(B, 1, 512)` tensor, which is squeezed to `(B, 512)` before inference.
 - `input_positions` may be `(B, 22, 3)` or `(B, T, 22, 3)`.
 - Cold start initializes a single zero-pose frame and derives its 271D features.
 - Context trimming is controlled by the `horizon` argument, falling back to `config.horizon` when omitted.
 - The encoder no longer owns a separate context-length limit.
-- `guidance_scale` and `total_duration` are present in the signature but are not currently used inside `generate_sequence(...)`.
+- `guidance_scale` is active during ODE integration through `integrate_flow_ode(...)`; if `guidance_scale != 1.0`, at least one of `guidance_drop_text` or `guidance_drop_context` must be enabled.
+- `total_duration` is present in the signature but is not currently used inside `generate_sequence(...)`.
 - `relative_shift_history` is returned for inspection; the true recurrent state is `position_history` plus `feature_history`.
 
 Checkpoint loading:
@@ -256,7 +285,7 @@ What each one does:
 - `sequence_joints_to_features(...)`: converts ground-truth joint sequences to the 271D format.
 - `features_to_positions(...)`: reconstructs global positions from 271D features.
 - `flow_output_to_positions(...)`: converts a predicted 68D reduced state into absolute global joint positions.
-- `generated_positions_to_271d(...)`: converts one newly generated frame of positions back into a 271D frame, optionally normalizing it and optionally producing FK-consistent positions.
+- `generated_positions_to_271d(...)`: converts one newly generated frame of positions back into a 271D frame, optionally normalizing it and optionally producing FK-consistent positions. This is the incremental autoregressive re-derivation step used after each generated frame.
 
 ### Normalization
 
@@ -368,15 +397,18 @@ encoder_ema, predictor_ema = Trainer.train(
 
 ### Rollout status
 
-There are rollout-schedule helpers and config fields, but the current `incremental_flow_loss(...)` path does not actually perform stochastic rollout replacement. The relevant code is commented out and the method currently returns `rollout_prob = 0.0`.
+There are rollout-schedule helpers and config fields, and the current `incremental_flow_loss(...)` path uses them to build a separate rollout branch on a sampled subset of the batch when rollout is enabled.
 
-Treat these fields as preparatory or dormant until rollout logic is re-enabled:
+Treat these fields as active training controls:
 - `rollout_prob_start`
 - `rollout_prob_end`
 - `rollout_warmup_fraction`
 - `rollout_block_len_start`
 - `rollout_block_len_end`
 - `rollout_integration_steps`
+- `rollout_subset_fraction`
+- `rollout_loss_weight`
+- `rollout_block_len_bias_power`
 
 ### Validation
 
@@ -422,14 +454,14 @@ joint_dim = 3
 max_motion_length = 200
 fps = 20
 
-encoder.hidden_size = 256
+encoder.hidden_size = 128
 encoder.intermediate_size = 512
-encoder.num_hidden_layers = 4
+encoder.num_hidden_layers = 3
 encoder.num_attention_heads = 8
 encoder.per_joint_output_dim = 64
 
-predictor.hidden_size = 96
-predictor.intermediate_size = 384
+predictor.hidden_size = 64
+predictor.intermediate_size = 256
 predictor.num_hidden_layers = 3
 predictor.num_attention_heads = 4
 ```
@@ -438,16 +470,17 @@ predictor.num_attention_heads = 4
 
 ```python
 batch_size = 200
-learning_rate = 1e-4
+learning_rate = 5e-5
 weight_decay = 1e-5
-gradient_clip = 1.0
+gradient_clip = 10.0
 ema_decay = 0.999
 horizon = 40
-cfg_dropout = 0.0
+cfg_dropout = 0.1
 t_sampling_mode = "power"
-t_sampling_power = 2.0
+t_sampling_power = 3.0
+t_sampling_power_warmup_fraction = 1
 use_consistency_loss = True
-consistency_loss_weight = 0.2
+consistency_loss_weight = 10
 num_inference_steps = 20
 val_interval = 5
 val_batches = 20
@@ -458,17 +491,19 @@ checkpoint_interval = 50
 
 ```python
 [
-    {"horizon": 10, "epochs": 100},
-    {"horizon": 20, "epochs": 200},
-    {"horizon": 40, "epochs": 400},
+    {"horizon": 5, "epochs": 100},
+    {"horizon": 10, "epochs": 200},
+    {"horizon": 20, "epochs": 400},
+    {"horizon": 40, "epochs": 2000},
 ]
 ```
 
 ### Config fields worth treating cautiously
 
 Some config fields exist for planned, partially implemented, or inference-only paths:
-- rollout schedule fields are present but not active in the current training loss path
-- `guidance_scale` exists in config and generator signatures but is not used in sampling yet
+- rollout schedule fields are active in training via `incremental_flow_loss(...)`
+- `guidance_scale` is active in inference via `integrate_flow_ode(...)`
+- `total_duration` exists in generator signatures but is not used in the current sampling path
 - degenerate-pose guard fields are present but not central to the current default path
 
 Check the source before depending on these fields for new work.
