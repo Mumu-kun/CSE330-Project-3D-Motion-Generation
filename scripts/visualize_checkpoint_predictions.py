@@ -29,7 +29,7 @@ CHECKPOINT_PATH = (
     PROJECT_ROOT
     / "tests"
     / "checkpoints"
-    / "latest.pt"
+    / "best_val.pt"
     # / "before_submit"
     # / "best_val_noss_fullset.pt"
 )

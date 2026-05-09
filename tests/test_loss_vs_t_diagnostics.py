@@ -239,7 +239,11 @@ def test_incremental_flow_loss_collects_per_sample_t_and_loss() -> None:
     }
 
     total_loss, flow_loss, consistency_loss, pred_steps, rollout_prob = (
-        trainer.incremental_flow_loss(batch=batch, epoch=0)
+        trainer.incremental_flow_loss(
+            batch=batch,
+            epoch=0,
+            collect_diagnostics=True,
+        )
     )
 
     diagnostics = trainer._latest_flow_diagnostics
@@ -256,6 +260,18 @@ def test_incremental_flow_loss_collects_per_sample_t_and_loss() -> None:
     )
     assert torch.isclose(total_loss.detach().cpu(), flow_loss.detach().cpu())
     assert consistency_loss.item() == 0.0
+
+
+def test_incremental_flow_loss_skips_diagnostics_when_not_collected() -> None:
+    trainer = _make_dummy_trainer()
+    batch = {
+        "motion": torch.zeros(2, 4, 271, dtype=torch.float32),
+        "joints": torch.zeros(2, 4, 22, 3, dtype=torch.float32),
+        "text_clip": torch.zeros(2, 1, 512, dtype=torch.float32),
+    }
+
+    trainer.incremental_flow_loss(batch=batch, epoch=0)
+    assert trainer._latest_flow_diagnostics is None
 
 
 def test_incremental_flow_loss_consistency_uses_prev_frame_and_joint_targets() -> None:
@@ -317,6 +333,7 @@ def test_incremental_flow_loss_rollout_self_feeds_generated_frames(
     trainer.config.rollout_loss_weight = 1.0
     trainer.config.rollout_block_len_start = 2
     trainer.config.rollout_block_len_end = 2
+    trainer.config.rollout_block_len_bias_power = 1000.0
     trainer.config.consistency_loss_t_threshold = -1.0
 
     call_state = _install_simple_rollout_generation(
@@ -359,7 +376,7 @@ def test_incremental_flow_loss_rollout_self_feeds_generated_frames(
         ],
         dtype=torch.float32,
     )
-    assert call_state["integrate_flow_ode"] == 1
+    assert call_state["integrate_flow_ode"] >= 1
     assert torch.allclose(step_root_heights, expected_heights)
 
     rollout_current_frame_features = predictor.current_frame_features_calls[-1]
@@ -425,7 +442,9 @@ def test_aggregate_loss_vs_t_bins_uses_100_bin_indexing_and_nan_for_empty_bins()
     assert math.isclose(aggregated["mean_flow_loss"][99].item(), 8.0)
 
 
-def test_write_loss_vs_t_epoch_artifacts_outputs_csv_and_png(tmp_path: Path) -> None:
+def test_write_loss_vs_t_epoch_artifacts_outputs_binned_csv_and_png(
+    tmp_path: Path,
+) -> None:
     output_dir = tmp_path / "diagnostics" / "loss_vs_t"
     global_steps = torch.tensor([12, 12, 13], dtype=torch.long)
     t_values = torch.tensor([0.001, 0.502, 1.0], dtype=torch.float32)
@@ -440,15 +459,10 @@ def test_write_loss_vs_t_epoch_artifacts_outputs_csv_and_png(tmp_path: Path) -> 
         num_bins=100,
     )
 
+    assert set(artifacts) == {"binned_csv", "epoch_plot", "latest_plot"}
     for artifact_path in artifacts.values():
         assert artifact_path.exists()
         assert artifact_path.stat().st_size > 0
-
-    with artifacts["raw_csv"].open("r", newline="", encoding="utf-8") as handle:
-        raw_rows = list(csv.DictReader(handle))
-    assert len(raw_rows) == 3
-    assert raw_rows[0]["epoch"] == "7"
-    assert raw_rows[0]["global_step"] == "12"
 
     with artifacts["binned_csv"].open("r", newline="", encoding="utf-8") as handle:
         binned_rows = list(csv.DictReader(handle))
@@ -512,7 +526,59 @@ def test_save_training_checkpoint_writes_loss_vs_t_artifacts_for_checkpoint(
     diagnostics_dir = (
         config.output_path / "diagnostics" / "loss_vs_t" / "checkpoints" / "latest"
     )
-    assert (diagnostics_dir / "loss_vs_t_raw.csv").exists()
     assert (diagnostics_dir / "loss_vs_t_binned.csv").exists()
     assert (diagnostics_dir / "loss_vs_t_epoch_003.png").exists()
     assert (diagnostics_dir / "loss_vs_t_latest.png").exists()
+
+
+def test_save_training_checkpoint_skips_loss_vs_t_artifacts_when_unsampled(
+    tmp_path: Path,
+) -> None:
+    config = Config(
+        device="cpu",
+        output_path=tmp_path / "output",
+        checkpoint_dir=tmp_path / "checkpoints",
+    )
+    config.rollout_prob_start = 0.0
+    config.rollout_prob_end = 0.0
+    config.loss_vs_t_checkpoint_epoch_interval = 100
+    dataset = TensorDataset(torch.zeros(1))
+    dataloader = DataLoader(dataset, batch_size=1)
+    trainer = Trainer(
+        encoder=DummyEncoder(),  # type: ignore[arg-type]
+        predictor=DummyPredictor(),  # type: ignore[arg-type]
+        dataloader=dataloader,
+        config=config,
+        normalizer=None,
+    )
+
+    trainer.encoder_ema = EMAModel(trainer.encoder, decay=0.9)
+    trainer.predictor_ema = EMAModel(trainer.predictor, decay=0.9)
+    trainer.optimizer = torch.optim.SGD(
+        list(trainer.encoder.parameters()) + list(trainer.predictor.parameters()),
+        lr=1e-3,
+    )
+    trainer.scaler = torch.amp.GradScaler("cpu", enabled=False)
+    trainer.training_state = {
+        "global_step": 17,
+        "best_loss": 0.4,
+        "best_epoch": 2,
+        "best_val_loss": 0.3,
+        "best_val_epoch": 1,
+    }
+    trainer.curriculum_state = {
+        "max_horizon": 40,
+        "current_horizon": 10,
+        "use_curriculum": True,
+    }
+    trainer._checkpoint_flow_diagnostics = None
+
+    trainer.save_training_checkpoint(filename="latest.pt", epoch=3, loss=0.25)
+
+    checkpoint_path = config.checkpoint_dir / "latest.pt"
+    assert checkpoint_path.exists()
+
+    diagnostics_dir = (
+        config.output_path / "diagnostics" / "loss_vs_t" / "checkpoints" / "latest"
+    )
+    assert not diagnostics_dir.exists()

@@ -425,7 +425,8 @@ Unlike older notes, consistency loss is not just a placeholder. It is active by 
 
 Implemented features:
 - `EMAModel` wrappers for encoder and predictor
-- loss-vs-t CSV and PNG diagnostics under `output/diagnostics/loss_vs_t`
+- checkpoint-driven loss-vs-t binned CSV and PNG diagnostics under `output/diagnostics/loss_vs_t`
+- diagnostics are only retained for checkpoint-eligible epochs, and checkpoint saves only write artifacts when retained diagnostics exist
 - checkpoint payloads containing:
   - live model weights
   - EMA weights
@@ -514,7 +515,7 @@ Current notable tests in `tests/`:
 - `test_pipeline_e2e.py`: end-to-end smoke test with a tiny HumanML3D fixture dataset
 - `test_human_motion_generator.py`: generator shape, cold-start, and NaN checks
 - `test_checkpoint_save_and_load.py`: checkpoint serialization and restore
-- `test_loss_vs_t_diagnostics.py`: artifact generation for flow-loss diagnostics
+- `test_loss_vs_t_diagnostics.py`: checkpoint-tied flow-loss diagnostics and compact artifacts
 - `test_root_motion_conversions.py`: root velocity / position conversion helpers
 - `test_fk_consistent_rollout.py`: FK-consistent frame conversion checks
 

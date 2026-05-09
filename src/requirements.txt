@@ -16,8 +16,6 @@ seaborn
 
 # Utilities
 tqdm
-gdown
 
 # Text Encoding
-ftfy
 regex

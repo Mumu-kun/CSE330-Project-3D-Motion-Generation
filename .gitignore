@@ -39,3 +39,6 @@ sample_data/archive.zip
 tests/dataset/humanml3d-subset-mini*
 *tmp*
 *.log
+src/evaluator/Comp_v6_KLD005/*
+src/evaluator/glove/*
+src/evaluator/text_mot_match/*

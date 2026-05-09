@@ -336,6 +336,20 @@ def compute_root_delta_yaw_sin_cos(
     return yaw_to_sin_cos(delta_yaw)
 
 
+def compute_root_delta_yaw(
+    root_rot_6d: torch.Tensor,
+    prev_root_rot_6d: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute scalar yaw velocity between consecutive root rotations."""
+    current_yaw = root_rot6d_to_yaw(root_rot_6d)
+    if prev_root_rot_6d is None:
+        delta_yaw = torch.zeros_like(current_yaw)
+    else:
+        prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
+        delta_yaw = wrap_angle(current_yaw - prev_yaw)
+    return delta_yaw.unsqueeze(-1)
+
+
 def _compute_ik(
     positions: torch.Tensor,
     raw_offsets: torch.Tensor,
@@ -567,6 +581,73 @@ def subset_271d_to_68d(
     joint_ric = x[..., 6:69]
 
     return torch.cat([root_height, root_vel, root_delta_yaw, joint_ric], dim=-1)
+
+
+def frame_271d_to_263d(
+    x: torch.Tensor,
+    prev_frame: Optional[torch.Tensor] = None,
+    normalizer: Optional["FeatureNormalizer"] = None,
+) -> torch.Tensor:
+    """Convert a single 271D frame to the legacy 263D evaluator layout."""
+    if x.shape[-1] != 271:
+        raise ValueError(f"Expected x to have trailing dimension 271, got {x.shape}")
+    if prev_frame is not None and prev_frame.shape != x.shape:
+        raise ValueError(
+            f"Expected prev_frame shape {tuple(x.shape)}, got {tuple(prev_frame.shape)}"
+        )
+
+    raw_x = normalizer.denormalize(x) if normalizer is not None else x
+    raw_prev = (
+        normalizer.denormalize(prev_frame)
+        if (normalizer is not None and prev_frame is not None)
+        else prev_frame
+    )
+
+    root_rot_vel = compute_root_delta_yaw(
+        raw_x[..., 69:75], None if raw_prev is None else raw_prev[..., 69:75]
+    )
+    root_height = x[..., 0:1]
+    root_vel = x[..., 1:3]
+
+    root_features = torch.cat([root_rot_vel, root_vel, root_height], dim=-1)
+    joint_ric = x[..., 6:69]
+    joint_rot6d = x[..., 75:201]
+    joint_vel = x[..., 201:267]
+    foot_contacts = x[..., 267:271]
+
+    return torch.cat(
+        [root_features, joint_ric, joint_rot6d, joint_vel, foot_contacts], dim=-1
+    )
+
+
+def sequence_271d_to_263d(
+    x: torch.Tensor,
+    normalizer: Optional["FeatureNormalizer"] = None,
+) -> torch.Tensor:
+    """Convert a 271D motion sequence to the legacy 263D evaluator layout."""
+    if x.shape[-1] != 271:
+        raise ValueError(f"Expected x to have trailing dimension 271, got {x.shape}")
+    if x.ndim not in (2, 3):
+        raise ValueError(
+            f"Expected x to have shape (T, 271) or (B, T, 271), got {tuple(x.shape)}"
+        )
+
+    if x.ndim == 2:
+        converted_frames = []
+        prev_frame = None
+        for frame in x:
+            converted_frames.append(
+                frame_271d_to_263d(frame, prev_frame=prev_frame, normalizer=normalizer)
+            )
+            prev_frame = frame
+        return torch.stack(converted_frames, dim=0)
+
+    converted_batches = []
+    for batch_index in range(x.shape[0]):
+        converted_batches.append(
+            sequence_271d_to_263d(x[batch_index], normalizer=normalizer)
+        )
+    return torch.stack(converted_batches, dim=0)
 
 
 def _subset_unused(x: torch.Tensor) -> torch.Tensor:

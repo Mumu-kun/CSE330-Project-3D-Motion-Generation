@@ -284,7 +284,7 @@ def write_loss_vs_t_epoch_artifacts(
     per_sample_flow_loss: torch.Tensor,
     num_bins: int = LOSS_VS_T_NUM_BINS,
 ) -> Dict[str, Path]:
-    """Write raw CSV, binned CSV, and PNG diagnostics for one epoch."""
+    """Write compact binned CSV and PNG diagnostics for one epoch."""
     if global_steps.ndim != 1 or t_values.ndim != 1 or per_sample_flow_loss.ndim != 1:
         raise ValueError(
             "Loss-vs-t artifact writing expects 1D tensors for steps, t, and loss"
@@ -302,31 +302,9 @@ def write_loss_vs_t_epoch_artifacts(
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    steps_cpu = global_steps.detach().to(dtype=torch.long, device="cpu")
     t_cpu = t_values.detach().to(dtype=torch.float64, device="cpu")
     loss_cpu = per_sample_flow_loss.detach().to(dtype=torch.float64, device="cpu")
     aggregated = aggregate_loss_vs_t_bins(t_cpu, loss_cpu, num_bins=num_bins)
-
-    raw_csv_path = output_dir / "loss_vs_t_raw.csv"
-    raw_rows = [
-        {
-            "epoch": epoch,
-            "global_step": int(step),
-            "t": float(t_value),
-            "per_sample_flow_loss": float(loss_value),
-        }
-        for step, t_value, loss_value in zip(
-            steps_cpu.tolist(),
-            t_cpu.tolist(),
-            loss_cpu.tolist(),
-        )
-    ]
-    if raw_rows:
-        _append_csv_rows(
-            raw_csv_path,
-            ["epoch", "global_step", "t", "per_sample_flow_loss"],
-            raw_rows,
-        )
 
     binned_csv_path = output_dir / "loss_vs_t_binned.csv"
     edges = aggregated["bin_edges"].tolist()
@@ -365,7 +343,6 @@ def write_loss_vs_t_epoch_artifacts(
     _plot_loss_vs_t_curve(latest_plot_path, epoch, t_cpu, loss_cpu, aggregated)
 
     return {
-        "raw_csv": raw_csv_path,
         "binned_csv": binned_csv_path,
         "epoch_plot": epoch_plot_path,
         "latest_plot": latest_plot_path,
@@ -429,6 +406,10 @@ class Trainer:
                 total_epochs = checkpoint_config.num_epochs
             else:
                 total_epochs = self.config.num_epochs
+
+        if self.config.curriculum is not None:
+            total_epochs = max(total_epochs, self.config.curriculum[-1]["epochs"])
+
         return max(0, int(total_epochs))
 
     def _build_epoch_progress(self) -> tuple[range, int, int]:
@@ -1090,6 +1071,7 @@ class Trainer:
         rollout_max_block_len_override: Optional[int] = None,
         encoder: Optional[MotionHistoryEncoder] = None,
         predictor: Optional[FlowMatchingPredictor] = None,
+        collect_diagnostics: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int, float]:
         enc = encoder if encoder is not None else self.encoder
         pred_model = predictor if predictor is not None else self.predictor
@@ -1171,7 +1153,7 @@ class Trainer:
             target_motion=target_motion,
             text_for_encoder=text_for_encoder,
             epoch=epoch,
-            collect_diagnostics=True,
+            collect_diagnostics=collect_diagnostics,
             consistency_log_prefix="consistency",
         )
         if diagnostics is not None:
@@ -1295,6 +1277,7 @@ class Trainer:
                     self.incremental_flow_loss(
                         batch=batch,
                         epoch=epoch,
+                        collect_diagnostics=False,
                         stochastic_rollout=False,
                         use_cfg_dropout=False,
                         use_context_dropout=False,
@@ -1356,6 +1339,10 @@ class Trainer:
             for epoch in epoch_pbar:
                 self.current_epoch = epoch
                 prev_horizon = self.curriculum_state["current_horizon"]
+                collect_epoch_diagnostics = (
+                    self.config.checkpoint_interval > 0
+                    and (epoch + 1) % self.config.checkpoint_interval == 0
+                )
                 if self.curriculum_state["use_curriculum"] and self.config.curriculum:
                     for level in reversed(self.config.curriculum):
                         if epoch <= level["epochs"]:
@@ -1419,6 +1406,7 @@ class Trainer:
                                 stochastic_rollout=False,
                                 use_cfg_dropout=True,
                                 use_context_dropout=True,
+                                collect_diagnostics=collect_epoch_diagnostics,
                             )
 
                     nonfinite_losses = [

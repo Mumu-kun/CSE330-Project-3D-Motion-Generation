@@ -300,7 +300,9 @@ class Text2MotionDataset(Dataset):
         # text_embedding shape: (1, 512) - pooled CLIP embedding
         # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
         # valid_length is the number of real frames before zero-padding, capped at target_len.
-        return caption, motion, joints, valid_length, text_embedding
+        sample_id = self.name_list[idx]
+
+        return caption, motion, joints, valid_length, text_embedding, sample_id
 
     def reset_min_len(self, length: int | None = None):
         if length is None:
@@ -333,7 +335,7 @@ CLIP_EMBED_DIM = 512
 
 
 def text2motion_collate_fn(
-    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor]],
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str]],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
@@ -342,7 +344,8 @@ def text2motion_collate_fn(
       - motion: (max_T, 271) torch.Tensor - full 271D features
       - joints: (max_T, J, 3) torch.Tensor
       - length: int number of valid frames before padding, capped at the returned horizon
-      - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
+    - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
+    - sample_id: str sample identifier
     """
     # Lists of items
     captions = [b[0] for b in batch]
@@ -350,6 +353,7 @@ def text2motion_collate_fn(
     joints_list = [b[2] for b in batch]
     lengths = [b[3] for b in batch]
     text_embs_list = [b[4] for b in batch]
+    sample_ids = [b[5] for b in batch]
 
     # Stack tensors directly
     motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)
@@ -360,6 +364,7 @@ def text2motion_collate_fn(
 
     return {
         "captions": captions,
+        "sample_ids": sample_ids,
         "motion": motion_batch,
         "joints": joints_batch,
         "lengths": length_batch,

@@ -113,8 +113,8 @@ class Config:
         default_factory=lambda: MotionHistoryEncoderConfig(
             frame_feature_dim=271,
             text_embedding_dim=512,
-            hidden_size=128,
-            intermediate_size=2 * 128,
+            hidden_size=192,
+            intermediate_size=2 * 192,
             num_hidden_layers=4,
             num_attention_heads=8,
             hidden_act="gelu",
@@ -123,7 +123,7 @@ class Config:
             attention_dropout=0.1,
             mlp_bias=True,
             dropout=0.1,
-            per_joint_output_dim=64,
+            per_joint_output_dim=128,
             joint_count=22,
             text_scale=1.0,
         )
@@ -154,17 +154,17 @@ class Config:
     batch_size: int = 200
     learning_rate: float = 0.5e-4
     weight_decay: float = 1e-5
-    gradient_clip: float = 10.0
+    gradient_clip: float = 30.0
     ema_decay: float = 0.999
 
     # Curriculum learning settings
     # Set to None to disable curriculum (use fixed horizon from horizon field)
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
-            {"horizon": 5, "epochs": 50},
-            {"horizon": 10, "epochs": 100},
-            {"horizon": 20, "epochs": 200},
-            {"horizon": 40, "epochs": 500},
+            {"horizon": 5, "epochs": 100},
+            {"horizon": 10, "epochs": 200},
+            {"horizon": 20, "epochs": 300},
+            {"horizon": 40, "epochs": 1000},
         ]
     )
 
@@ -292,7 +292,7 @@ class Config:
         def _convert(value: Any) -> Any:
             if isinstance(value, Path):
                 return str(value)
-            if is_dataclass(value):
+            if is_dataclass(value) and not isinstance(value, type):
                 return {k: _convert(v) for k, v in asdict(value).items()}
             if isinstance(value, dict):
                 return {k: _convert(v) for k, v in value.items()}
