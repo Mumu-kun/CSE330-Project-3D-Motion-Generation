@@ -15,9 +15,12 @@ Compatible with 271D custom feature format from motion_utils.py:
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
+import os
+import pathlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, cast
@@ -32,6 +35,20 @@ from utils.motion_utils import (
     extract_prev_frame_features,
     flow_output_to_positions,
 )
+
+
+@contextmanager
+def _windows_checkpoint_path_compat():
+    """Allow checkpoints pickled with PosixPath to load on Windows."""
+    original_posix_path = pathlib.PosixPath
+    should_patch_posix = os.name == "nt"
+    if should_patch_posix:
+        pathlib.PosixPath = pathlib.WindowsPath
+    try:
+        yield
+    finally:
+        if should_patch_posix:
+            pathlib.PosixPath = original_posix_path
 
 
 class KinematicChainEncoder(nn.Module):
@@ -1301,9 +1318,10 @@ class HumanMotionGenerator:
             normalizer: Optional FeatureNormalizer for raw feature normalization
         """
         print(f"Loading checkpoint from {checkpoint_path}...")
-        checkpoint = torch.load(
-            checkpoint_path, map_location=device, weights_only=False
-        )
+        with _windows_checkpoint_path_compat():
+            checkpoint = torch.load(
+                checkpoint_path, map_location=device, weights_only=False
+            )
 
         if "config" in checkpoint:
             config: Config = checkpoint["config"]

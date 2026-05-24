@@ -18,6 +18,7 @@ Redesigned training mechanism:
 
 import copy
 import csv
+from datetime import datetime
 import math
 import os
 import time
@@ -57,6 +58,12 @@ T = TypeVar("T", bound=nn.Module)
 LOSS_VS_T_NUM_BINS = 100
 LOSS_VS_T_SCATTER_MAX_POINTS = 5000
 CONTEXT_DROPOUT_PROB = 0.00
+
+
+def _training_short_string(now: datetime | None = None) -> str:
+    current = datetime.now() if now is None else now
+    return f"{current.strftime('%H%M')}{current.day}{current.strftime('%m')}"
+
 
 # =============================================================================
 # EMA Model Wrapper
@@ -393,6 +400,9 @@ class Trainer:
         self.start_epoch = 0
         self.current_epoch = 0
         self.total_epochs = int(config.num_epochs)
+        self.checkpoint_id = (
+            str(wandb_run_name) if wandb_run_name else _training_short_string()
+        )
         self.device_str = str(config.device)
         self.use_amp = False
         self.amp_dtype = torch.float32
@@ -919,6 +929,11 @@ class Trainer:
             checkpoint_wandb_run_name = checkpoint.get("wandb_run_name")
             if self.wandb_run_name is None and checkpoint_wandb_run_name is not None:
                 self.wandb_run_name = str(checkpoint_wandb_run_name)
+            checkpoint_id = checkpoint.get("checkpoint_id")
+            if checkpoint_id is not None:
+                self.checkpoint_id = str(checkpoint_id)
+            elif self.wandb_run_name is not None:
+                self.checkpoint_id = str(self.wandb_run_name)
             print(
                 f"Resumed from epoch {self.start_epoch}/{self.total_epochs}, "
                 f"step {self.training_state['global_step']}"
@@ -949,6 +964,7 @@ class Trainer:
             if self.wandb_logger.run is not None:
                 self.wandb_resume_id = str(self.wandb_logger.run.id)
                 self.wandb_run_name = str(self.wandb_logger.run.name)
+                self.checkpoint_id = str(self.wandb_run_name)
 
         if curriculum is not None and len(curriculum) > 0:
             print(f"Training for {num_epochs} epochs with curriculum: {curriculum}")
@@ -1009,6 +1025,16 @@ class Trainer:
         ):
             raise RuntimeError("Training state is not initialized.")
 
+        checkpoint_id = self.checkpoint_id
+        if self.wandb_run_name is not None:
+            checkpoint_id = str(self.wandb_run_name)
+            self.checkpoint_id = checkpoint_id
+        elif self.wandb_logger is not None and self.wandb_logger.run is not None:
+            run_name = self.wandb_logger.run.name
+            if run_name:
+                checkpoint_id = str(run_name)
+                self.checkpoint_id = checkpoint_id
+
         path = os.path.join(self.checkpoint_dir, filename)
         checkpoint = {
             "encoder": self.encoder.state_dict(),
@@ -1028,6 +1054,7 @@ class Trainer:
             "best_epoch": self.training_state["best_epoch"],
             "best_val_loss": self.training_state["best_val_loss"],
             "best_val_epoch": self.training_state["best_val_epoch"],
+            "checkpoint_id": checkpoint_id,
         }
         wandb_run = self.wandb_logger.run if self.wandb_logger is not None else None
         if wandb_run is not None:

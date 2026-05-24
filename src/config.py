@@ -114,7 +114,7 @@ class Config:
             frame_feature_dim=271,
             text_embedding_dim=512,
             hidden_size=192,
-            intermediate_size=2 * 192,
+            intermediate_size=4 * 192,
             num_hidden_layers=4,
             num_attention_heads=8,
             hidden_act="gelu",
@@ -123,7 +123,7 @@ class Config:
             attention_dropout=0.1,
             mlp_bias=True,
             dropout=0.1,
-            per_joint_output_dim=128,
+            per_joint_output_dim=64,
             joint_count=22,
             text_scale=1.0,
         )
@@ -137,8 +137,8 @@ class Config:
     predictor_config: FlowMatchingPredictorConfig = field(
         default_factory=lambda: FlowMatchingPredictorConfig(
             hidden_size=128,
-            intermediate_size=2 * 128,
-            num_hidden_layers=2,
+            intermediate_size=4 * 128,
+            num_hidden_layers=3,
             num_attention_heads=4,
             hidden_act="silu",
             rms_norm_eps=1e-6,
@@ -276,6 +276,38 @@ class Config:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)
+
+        # self.encoder_config = MotionHistoryEncoderConfig(
+        #     frame_feature_dim=271,
+        #     text_embedding_dim=512,
+        #     hidden_size=192,
+        #     intermediate_size=2 * 192,
+        #     num_hidden_layers=5,
+        #     num_attention_heads=8,
+        #     hidden_act="silu",
+        #     layer_norm_eps=1e-05,
+        #     attention_bias=True,
+        #     attention_dropout=0.1,
+        #     mlp_bias=True,
+        #     dropout=0.1,
+        #     per_joint_output_dim=64,
+        #     joint_count=22,
+        #     text_scale=1.0,
+        # )
+
+        # self.predictor_config = FlowMatchingPredictorConfig(
+        #     hidden_size=128,
+        #     intermediate_size=4 * 128,
+        #     num_hidden_layers=3,
+        #     num_attention_heads=4,
+        #     hidden_act="silu",
+        #     rms_norm_eps=1e-06,
+        #     attention_bias=True,
+        #     attention_dropout=0.1,
+        #     mlp_bias=True,
+        #     track_dimensionality=3,
+        #     head_dim=None,
+        # )
 
     def get_predictor_feature_size(self) -> int:
         """

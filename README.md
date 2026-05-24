@@ -82,6 +82,17 @@ text_prompt = "A person is walking forward"
 generated_motion = generate_motion(context_encoder, flow_matching_net, text_prompt)
 ```
 
+### Evaluation
+
+Run the native evaluator wrapper on a checkpoint and a HumanML3D-style split:
+
+```bash
+python scripts/evaluate_human_motion_checkpoint.py --checkpoint tests/checkpoints/best_val.pt --dataset-path tests/dataset/humanml3d-subset-mini --split val --device cpu --max-batches 1
+```
+
+The wrapper prints only FID, diversity, R-precision, matching score, and multimodality.
+Saved summaries go under `output/evaluation/<checkpoint-id>/val_summary.json` by default, where `<checkpoint-id>` comes from the checkpoint metadata.
+
 ### Output Format
 
 Generated motions are saved in the following structure:
@@ -136,7 +147,7 @@ Key configuration parameters in `config.py`:
 - [ ] Implement feature_to_joints conversion
 - [ ] Implement joints_to_bvh conversion
 - [ ] Integrate text encoder (CLIP or similar)
-- [ ] Implement evaluation metrics (FID, diversity, R-precision)
+- [ ] Document the evaluation CLI wrapper and mini-dataset workflow
 - [ ] Add visualization utilities
 - [ ] Implement flow matching training logic
 - [ ] Add checkpoint loading/saving utilities

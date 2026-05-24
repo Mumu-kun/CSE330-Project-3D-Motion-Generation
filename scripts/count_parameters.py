@@ -9,14 +9,15 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from config import Config
-from utils.checkpoint_eval import load_checkpoint_config
 from utils.train_utils import Trainer
 
 
 def _count_parameters(module) -> dict[str, int]:
     total = sum(parameter.numel() for parameter in module.parameters())
     trainable = sum(
-        parameter.numel() for parameter in module.parameters() if parameter.requires_grad
+        parameter.numel()
+        for parameter in module.parameters()
+        if parameter.requires_grad
     )
     return {
         "total": int(total),
@@ -26,9 +27,7 @@ def _count_parameters(module) -> dict[str, int]:
 
 
 def _load_config(checkpoint: str | None) -> Config:
-    if checkpoint is None:
-        return Config()
-    return load_checkpoint_config(checkpoint_path=checkpoint, map_location="cpu")
+    return Config()
 
 
 def main() -> None:
@@ -60,13 +59,13 @@ def main() -> None:
     predictor_counts = _count_parameters(predictor)
 
     combined_total = encoder_counts["total"] + predictor_counts["total"]
-    combined_trainable = (
-        encoder_counts["trainable"] + predictor_counts["trainable"]
-    )
+    combined_trainable = encoder_counts["trainable"] + predictor_counts["trainable"]
 
     result = {
         "config_source": (
-            str(Path(args.checkpoint).resolve()) if args.checkpoint else "Config() defaults"
+            str(Path(args.checkpoint).resolve())
+            if args.checkpoint
+            else "Config() defaults"
         ),
         "encoder": encoder_counts,
         "predictor": predictor_counts,
@@ -100,11 +99,7 @@ def main() -> None:
         f"total={predictor_counts['total']:,} "
         f"trainable={predictor_counts['trainable']:,}"
     )
-    print(
-        "Combined: "
-        f"total={combined_total:,} "
-        f"trainable={combined_trainable:,}"
-    )
+    print("Combined: " f"total={combined_total:,} " f"trainable={combined_trainable:,}")
     if args.include_ema:
         print(
             "Combined with EMA copies: "

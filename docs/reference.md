@@ -4,26 +4,26 @@ This document describes the implementation that currently lives in `src/`. When 
 
 ## Overview
 
-| Property | Current implementation |
-| :-- | :-- |
-| Task | Text-conditioned autoregressive 3D human motion generation |
-| Dataset format | HumanML3D-style 22-joint sequences with 271D per-frame features |
-| Context encoder | `MotionHistoryEncoder` using causal temporal self-attention with RoPE |
-| Next-frame predictor | `FlowMatchingPredictor` using a 22-token spatial transformer with AdaLN conditioning |
-| Predictor target space | 68D reduced motion state |
-| Inference state | Absolute positions plus derived 271D feature history |
-| Training entrypoint | `Trainer.train(...)` in `src/utils/train_utils.py` |
+| Property               | Current implementation                                                               |
+| :--------------------- | :----------------------------------------------------------------------------------- |
+| Task                   | Text-conditioned autoregressive 3D human motion generation                           |
+| Dataset format         | HumanML3D-style 22-joint sequences with 271D per-frame features                      |
+| Context encoder        | `MotionHistoryEncoder` using causal temporal self-attention with RoPE                |
+| Next-frame predictor   | `FlowMatchingPredictor` using a 22-token spatial transformer with AdaLN conditioning |
+| Predictor target space | 68D reduced motion state                                                             |
+| Inference state        | Absolute positions plus derived 271D feature history                                 |
+| Training entrypoint    | `Trainer.train(...)` in `src/utils/train_utils.py`                                   |
 
 ## Core Files
 
-| File | Purpose |
-| :-- | :-- |
-| `src/config.py` | Project configuration dataclasses and active defaults |
-| `src/models.py` | Temporal encoder, predictor, ODE integrator, and `HumanMotionGenerator` |
+| File                        | Purpose                                                                       |
+| :-------------------------- | :---------------------------------------------------------------------------- |
+| `src/config.py`             | Project configuration dataclasses and active defaults                         |
+| `src/models.py`             | Temporal encoder, predictor, ODE integrator, and `HumanMotionGenerator`       |
 | `src/utils/motion_utils.py` | 271D feature conversions, reduced-state packing, IK/FK helpers, normalization |
-| `src/utils/train_utils.py` | Trainer, EMA, diagnostics, validation, checkpointing |
-| `src/utils/dataset.py` | HumanML3D dataset loader, text embedding cache, dataloader factory |
-| `src/utils/text_encoder.py` | CLIP wrapper returning pooled embeddings of shape `(B, 1, 512)` |
+| `src/utils/train_utils.py`  | Trainer, EMA, diagnostics, validation, checkpointing                          |
+| `src/utils/dataset.py`      | HumanML3D dataset loader, text embedding cache, dataloader factory            |
+| `src/utils/text_encoder.py` | CLIP wrapper returning pooled embeddings of shape `(B, 1, 512)`               |
 
 ## Data Representations
 
@@ -31,13 +31,13 @@ This document describes the implementation that currently lives in `src/`. When 
 
 Source: `src/utils/motion_utils.py`
 
-| Slice | Size | Meaning |
-| :-- | :-- | :-- |
-| `[0:3]` | 3 | Root features: absolute height `y`, root velocity `x`, root velocity `z` |
-| `[3:69]` | 66 | Root-invariant coordinates (RIC) for all 22 joints |
-| `[69:201]` | 132 | 22 joint rotations in 6D form |
-| `[201:267]` | 66 | Root-local causal joint velocities |
-| `[267:271]` | 4 | Foot-contact flags |
+| Slice       | Size | Meaning                                                                  |
+| :---------- | :--- | :----------------------------------------------------------------------- |
+| `[0:3]`     | 3    | Root features: absolute height `y`, root velocity `x`, root velocity `z` |
+| `[3:69]`    | 66   | Root-invariant coordinates (RIC) for all 22 joints                       |
+| `[69:201]`  | 132  | 22 joint rotations in 6D form                                            |
+| `[201:267]` | 66   | Root-local causal joint velocities                                       |
+| `[267:271]` | 4    | Foot-contact flags                                                       |
 
 Notes:
 - Root `x` and `z` are stored as velocities for autoregressive stability.
@@ -47,10 +47,10 @@ Notes:
 
 Source: `subset_271d_to_68d(...)` in `src/utils/motion_utils.py`
 
-| Slice | Size | Meaning |
-| :-- | :-- | :-- |
-| `[0:5]` | 5 | Root state: height, velocity `x/z`, `sin(dyaw)`, `cos(dyaw)` |
-| `[5:68]` | 63 | 21 non-root joint RIC coordinates |
+| Slice    | Size | Meaning                                                      |
+| :------- | :--- | :----------------------------------------------------------- |
+| `[0:5]`  | 5    | Root state: height, velocity `x/z`, `sin(dyaw)`, `cos(dyaw)` |
+| `[5:68]` | 63   | 21 non-root joint RIC coordinates                            |
 
 This is the state used for the flow-matching target `x1` during training and the state integrated by the inference-time ODE solver.
 
@@ -58,10 +58,10 @@ This is the state used for the flow-matching target `x1` during training and the
 
 Source: `extract_prev_frame_features(...)` in `src/utils/motion_utils.py`
 
-| Slice | Size | Meaning |
-| :-- | :-- | :-- |
-| `[0:5]` | 5 | Root state: height, velocity `x/z`, `sin(yaw)`, `cos(yaw)` |
-| `[5:257]` | 252 | 21 non-root joints, each with `RIC(3) + rot6d(6) + vel(3)` |
+| Slice     | Size | Meaning                                                    |
+| :-------- | :--- | :--------------------------------------------------------- |
+| `[0:5]`   | 5    | Root state: height, velocity `x/z`, `sin(yaw)`, `cos(yaw)` |
+| `[5:257]` | 252  | 21 non-root joints, each with `RIC(3) + rot6d(6) + vel(3)` |
 
 This 257D vector conditions the predictor on the current frame while the temporal encoder supplies longer-range history.
 
@@ -326,13 +326,35 @@ Current behavior:
 Current sample format:
 
 ```python
-caption, motion, joints, valid_length, text_embedding
+caption, motion, joints, valid_length, text_embedding, sample_id
 ```
 
 Shapes:
 - `motion`: `(T, 271)`
 - `joints`: `(T, 22, 3)`
 - `text_embedding`: `(1, 512)`
+
+### Evaluator bridge
+
+Source: `src/evaluator/eval_t2m.py`
+
+Current behavior:
+- Uses the native generator output as the source motion stream.
+- Converts 271D motion to the legacy 263D evaluator layout before text-motion scoring.
+- Loads evaluator text/motion encoders from the bundled local checkpoint and GloVe assets under `src/evaluator/`.
+- Preserves batch order by keeping the evaluator wrapper order-stable.
+- Recovered caption tokens come from `texts/<sample_id>.txt` when available, with a fallback tokenizer for missing text files.
+- The CLI wrapper stores summaries under `output/evaluation/<checkpoint-id>/<split>_summary.json`, reading `<checkpoint-id>` from checkpoint metadata and falling back to a timestamp-based `...unk` id for legacy checkpoints.
+
+Default reported outputs:
+- FID
+- diversity
+- R-precision
+- matching score
+- multimodality
+
+Implementation note:
+- The evaluator wrapper accepts unsorted sequence lengths, so it can consume the native dataloader without reshuffling samples.
 
 ### Text embeddings
 
@@ -434,6 +456,7 @@ Implemented features:
   - epoch and global step
   - best train / validation losses
   - curriculum horizon state
+    - `checkpoint_id` derived from `wandb_run_name` when available, otherwise from a training-time short timestamp
   - serialized `Config`
 
 Saved checkpoints may include:

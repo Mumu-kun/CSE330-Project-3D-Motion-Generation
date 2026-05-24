@@ -5,11 +5,16 @@ import time
 import math
 import random
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
 # from networks.layers import *
 
 
 def init_weight(m):
-    if isinstance(m, nn.Conv1d) or isinstance(m, nn.Linear) or isinstance(m, nn.ConvTranspose1d):
+    if (
+        isinstance(m, nn.Conv1d)
+        or isinstance(m, nn.Linear)
+        or isinstance(m, nn.ConvTranspose1d)
+    ):
         nn.init.xavier_normal_(m.weight)
         # m.bias.data.fill_(0.01)
         if m.bias is not None:
@@ -20,10 +25,13 @@ def init_weight(m):
 # output: (batch_size, dim)
 def positional_encoding(batch_size, dim, pos):
     assert batch_size == pos.shape[0]
-    positions_enc = np.array([
-        [pos[j] / np.power(10000, (i-i%2)/dim) for i in range(dim)]
-        for j in range(batch_size)
-    ], dtype=np.float32)
+    positions_enc = np.array(
+        [
+            [pos[j] / np.power(10000, (i - i % 2) / dim) for i in range(dim)]
+            for j in range(batch_size)
+        ],
+        dtype=np.float32,
+    )
     positions_enc[:, 0::2] = np.sin(positions_enc[:, 0::2])
     positions_enc[:, 1::2] = np.cos(positions_enc[:, 1::2])
     return torch.from_numpy(positions_enc).float()
@@ -40,7 +48,7 @@ def get_padding_mask(batch_size, seq_len, cap_lens):
 def top_k_logits(logits, k):
     v, ix = torch.topk(logits, k)
     out = logits.clone()
-    out[out < v[:, [-1]]] = -float('Inf')
+    out[out < v[:, [-1]]] = -float("Inf")
     return out
 
 
@@ -51,11 +59,13 @@ class PositionalEncoding(nn.Module):
 
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        div_term = torch.exp(
+            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
+        )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
         # pe = pe.unsqueeze(0).transpose(0, 1)
-        self.register_buffer('pe', pe)
+        self.register_buffer("pe", pe)
 
     def forward(self, pos):
         return self.pe[pos]
@@ -104,6 +114,7 @@ class MovementConvDecoder(nn.Module):
         outputs = self.main(inputs).permute(0, 2, 1)
         return self.out_net(outputs)
 
+
 class TextEncoderBiGRUCo(nn.Module):
     def __init__(self, word_size, pos_size, hidden_size, output_size, device):
         super(TextEncoderBiGRUCo, self).__init__()
@@ -111,12 +122,14 @@ class TextEncoderBiGRUCo(nn.Module):
 
         self.pos_emb = nn.Linear(pos_size, word_size)
         self.input_emb = nn.Linear(word_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=True)
+        self.gru = nn.GRU(
+            hidden_size, hidden_size, batch_first=True, bidirectional=True
+        )
         self.output_net = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_size, output_size)
+            nn.Linear(hidden_size, output_size),
         )
 
         self.input_emb.apply(init_weight)
@@ -125,7 +138,9 @@ class TextEncoderBiGRUCo(nn.Module):
         # self.linear2.apply(init_weight)
         # self.batch_size = batch_size
         self.hidden_size = hidden_size
-        self.hidden = nn.Parameter(torch.randn((2, 1, self.hidden_size), requires_grad=True))
+        self.hidden = nn.Parameter(
+            torch.randn((2, 1, self.hidden_size), requires_grad=True)
+        )
 
     # input(batch_size, seq_len, dim)
     def forward(self, word_embs, pos_onehot, cap_lens):
@@ -157,18 +172,22 @@ class MotionEncoderBiGRUCo(nn.Module):
         self.device = device
 
         self.input_emb = nn.Linear(input_size, hidden_size)
-        self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True, bidirectional=True)
+        self.gru = nn.GRU(
+            hidden_size, hidden_size, batch_first=True, bidirectional=True
+        )
         self.output_net = nn.Sequential(
-            nn.Linear(hidden_size*2, hidden_size),
+            nn.Linear(hidden_size * 2, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(hidden_size, output_size)
+            nn.Linear(hidden_size, output_size),
         )
 
         self.input_emb.apply(init_weight)
         self.output_net.apply(init_weight)
         self.hidden_size = hidden_size
-        self.hidden = nn.Parameter(torch.randn((2, 1, self.hidden_size), requires_grad=True))
+        self.hidden = nn.Parameter(
+            torch.randn((2, 1, self.hidden_size), requires_grad=True)
+        )
 
     # input(batch_size, seq_len, dim)
     def forward(self, inputs, m_lens):
