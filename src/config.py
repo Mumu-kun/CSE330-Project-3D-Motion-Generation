@@ -56,6 +56,7 @@ class MotionHistoryEncoderConfig:
     dropout: float = 0.1
     per_joint_output_dim: int = 64
     joint_count: int = 22
+    num_registers: int = 2
     text_scale: float = 1.0
 
     def __post_init__(self) -> None:

@@ -16,6 +16,7 @@ seaborn
 
 # Utilities
 tqdm
+pytorch-ignite
 
 # Text Encoding
 regex
