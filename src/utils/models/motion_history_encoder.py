@@ -1,184 +1,29 @@
-import os
-import pathlib
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from contextlib import contextmanager
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional, List, Tuple, Union, cast
-from utils.config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
-from transformers.activations import ACT2FN
 
-from utils.motion_utils import (
-    get_fk_offsets,
-    sequence_joints_to_features,
-    generated_positions_to_271d,
-    FeatureNormalizer,
-    extract_prev_frame_features,
-    flow_output_to_positions,
-)
+from utils.config import MotionHistoryEncoderConfig
+from utils.models import AdaLN, GatedMLP, TemporalCacheState, TemporalLayerCache, TemporalRoPEAttention
 
 
-@dataclass
-class TemporalLayerCache:
-    key: Optional[torch.Tensor] = None
-    value: Optional[torch.Tensor] = None
-
-
-@dataclass
-class TemporalCacheState:
-    layers: List[TemporalLayerCache]
-
-
-class GatedMLP(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        *,
-        bias: bool,
-        activation: str,
-        dropout: float = 0.0,
-    ) -> None:
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-        self.act_fn = ACT2FN[activation]
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-        hidden_states = self.dropout(hidden_states)
-        hidden_states = self.down_proj(hidden_states)
-        hidden_states = self.dropout(hidden_states)
-        return hidden_states
-
-
-class AdaLN(nn.Module):
-    """
-    Adaptive Layer Normalization.
-
-    Applies conditioning BEFORE an operation (attention or FFN)
-    by modulating the normalized input with learned scale and shift.
-
-    Following DiT (Peebles & Xie, 2023) AdaLN-Zero formulation:
-      - scale, shift, gate are all predicted from the condition
-      - all three are zero-initialized → identity at step 0
-      - gate is applied AFTER the operation as a residual scale
-    """
-
-    def __init__(self, d_model: int, d_cond: int):
-        super().__init__()
-
-        # No learnable affine params — AdaLN supplies them externally
-        self.norm = nn.LayerNorm(d_model, elementwise_affine=False)
-
-        # Predicts scale (γ), shift (β), gate (α) for one sub-layer
-        # Zero-init → at step 0: scale=0, shift=0, gate=0
-        #   effective scale = 1 + 0 = 1 (identity norm)
-        #   effective gate  = 0         (zero residual contribution)
-        self.proj = nn.Linear(d_cond, 3 * d_model)
-        nn.init.zeros_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(
-        self,
-        x: torch.Tensor,  # [B, T, d_model]
-        cond: torch.Tensor,  # [B, d_cond]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            x_modulated: AdaLN(x, cond) — feed this into attention/FFN
-            gate:        [B, 1, d_model] — multiply with op output
-                         before adding residual
-        """
-        # Project condition to scale, shift, gate
-        # SiLU activation on condition before projection — standard
-        params = self.proj(torch.nn.functional.silu(cond))  # [B, 3*d]
-        scale, shift, gate = params.chunk(3, dim=-1)  # each [B, d]
-
-        # Unsqueeze over T for broadcasting
-        scale = scale.unsqueeze(1)  # [B, 1, d_model]
-        shift = shift.unsqueeze(1)  # [B, 1, d_model]
-        gate = gate.unsqueeze(1)  # [B, 1, d_model]
-
-        # Modulated norm — applied before attention/FFN
-        x_modulated = self.norm(x) * (1 + scale) + shift
-
-        # Gate returned separately — applied after attention/FFN
-        return x_modulated, gate
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x_even = x[..., 0::2]
-    x_odd = x[..., 1::2]
-    return torch.stack((-x_odd, x_even), dim=-1).flatten(-2)
-
-
-class TemporalRoPEAttention(nn.Module):
+class EncoderRoPEAttention(TemporalRoPEAttention):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
-        super().__init__()
-        self.hidden_size = config.hidden_size
-        self.num_heads = config.num_attention_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        super().__init__(config)
         self.num_registers = config.num_registers
         if self.head_dim % 2 != 0:
             raise ValueError(
-                "TemporalRoPEAttention requires an even per-head dimension, "
-                f"got head_dim={self.head_dim}."
+                f"TemporalRoPEAttention requires an even per-head dimension, got head_dim={self.head_dim}."
             )
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=config.attention_bias
-        )
-        self.out_proj = nn.Linear(
-            config.hidden_size, config.hidden_size, bias=config.attention_bias
-        )
+        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
+        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
+        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
+        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
         self.attention_dropout = config.attention_dropout
 
-    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(
-            1, 2
-        )
-
-    def _build_rope(
-        self,
-        seq_len: int,
-        device: torch.device,
-        dtype: torch.dtype,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        positions = torch.arange(seq_len, device=device, dtype=torch.float32)
-        inv_freq = torch.exp(
-            torch.arange(0, self.head_dim, 2, device=device, dtype=torch.float32)
-            * (-torch.log(torch.tensor(10000.0, device=device)) / self.head_dim)
-        )
-        freqs = positions[:, None] * inv_freq[None, :]
-        cos = freqs.cos().repeat_interleave(2, dim=-1).to(dtype=dtype)
-        sin = freqs.sin().repeat_interleave(2, dim=-1).to(dtype=dtype)
-        return cos.view(1, 1, seq_len, self.head_dim), sin.view(
-            1, 1, seq_len, self.head_dim
-        )
-
-    def _apply_rope(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        return (x * cos) + (_rotate_half(x) * sin)
-
-    def forward(
-        self, hidden_states: torch.Tensor, is_causal: bool = True
-    ) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         query = self._reshape_heads(self.q_proj(hidden_states))
@@ -190,12 +35,8 @@ class TemporalRoPEAttention(nn.Module):
             device=hidden_states.device,
             dtype=hidden_states.dtype,
         )
-        query[:, :, self.num_registers :, :] = self._apply_rope(
-            query[:, :, self.num_registers :, :], cos, sin
-        )
-        key[:, :, self.num_registers :, :] = self._apply_rope(
-            key[:, :, self.num_registers :, :], cos, sin
-        )
+        query[:, :, self.num_registers :, :] = self._apply_rope(query[:, :, self.num_registers :, :], cos, sin)
+        key[:, :, self.num_registers :, :] = self._apply_rope(key[:, :, self.num_registers :, :], cos, sin)
 
         attn_output = F.scaled_dot_product_attention(
             query,
@@ -204,15 +45,11 @@ class TemporalRoPEAttention(nn.Module):
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=is_causal,
         )
-        attn_output = (
-            attn_output.transpose(1, 2)
-            .contiguous()
-            .view(batch_size, seq_len, self.hidden_size)
-        )
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
         return self.out_proj(attn_output)
 
 
-class MotionHistoryTemporalMLP(GatedMLP):
+class EncoderMLP(GatedMLP):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__(
             hidden_size=config.hidden_size,
@@ -223,21 +60,17 @@ class MotionHistoryTemporalMLP(GatedMLP):
         )
 
 
-class MotionHistoryTemporalLayer(nn.Module):
+class EncoderLayer(nn.Module):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__()
 
-        self.adaln_attn = AdaLN(
-            d_model=config.hidden_size, d_cond=config.text_embedding_dim
-        )
+        self.adaln_attn = AdaLN(d_model=config.hidden_size, d_cond=config.text_embedding_dim)
 
-        self.self_attn = TemporalRoPEAttention(config)
+        self.self_attn = EncoderRoPEAttention(config)
 
-        self.adaln_mlp = AdaLN(
-            d_model=config.hidden_size, d_cond=config.text_embedding_dim
-        )
+        self.adaln_mlp = AdaLN(d_model=config.hidden_size, d_cond=config.text_embedding_dim)
 
-        self.mlp = MotionHistoryTemporalMLP(config)
+        self.mlp = EncoderMLP(config)
 
     def forward(
         self,
@@ -263,22 +96,13 @@ class MotionHistoryEncoder(nn.Module):
         super().__init__()
         self.config = config
 
-        self.frame_projection = nn.Linear(
-            config.frame_feature_dim, config.hidden_size, bias=True
-        )
+        self.frame_projection = nn.Linear(config.frame_feature_dim, config.hidden_size, bias=True)
 
-        self.layers = nn.ModuleList(
-            [
-                MotionHistoryTemporalLayer(config)
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
+        self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_hidden_layers)])
 
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        self.register_tokens = nn.Parameter(
-            torch.empty(config.num_registers, config.hidden_size)
-        )
+        self.register_tokens = nn.Parameter(torch.empty(config.num_registers, config.hidden_size))
         self.mask_token = nn.Parameter(torch.empty(1, config.hidden_size))
 
         self._init_weights()
@@ -307,30 +131,23 @@ class MotionHistoryEncoder(nn.Module):
                     nn.init.zeros_(module.bias)
 
     def _empty_cache_state(self) -> TemporalCacheState:
-        return TemporalCacheState(
-            layers=[TemporalLayerCache() for _ in range(self.config.num_hidden_layers)]
-        )
+        return TemporalCacheState(layers=[TemporalLayerCache() for _ in range(self.config.num_hidden_layers)])
 
     def forward(
         self,
         motion_seq: torch.Tensor,
         text_emb: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
-        return_all: bool = False,
+        return_layer_outputs: bool = False,
         is_causal: bool = True,
     ) -> torch.Tensor:
-        if (
-            motion_seq.ndim != 3
-            or motion_seq.shape[-1] != self.config.frame_feature_dim
-        ):
+        if motion_seq.ndim != 3 or motion_seq.shape[-1] != self.config.frame_feature_dim:
             raise ValueError(
-                "Expected motion_seq shape "
-                f"(B, T, {self.config.frame_feature_dim}), got {tuple(motion_seq.shape)}"
+                f"Expected motion_seq shape (B, T, {self.config.frame_feature_dim}), got {tuple(motion_seq.shape)}"
             )
         if text_emb.ndim != 2 or text_emb.shape[-1] != self.config.text_embedding_dim:
             raise ValueError(
-                "Expected text_emb shape "
-                f"(B, {self.config.text_embedding_dim}), got {tuple(text_emb.shape)}"
+                f"Expected text_emb shape (B, {self.config.text_embedding_dim}), got {tuple(text_emb.shape)}"
             )
         if text_emb.shape[0] != motion_seq.shape[0]:
             raise ValueError(
@@ -344,6 +161,8 @@ class MotionHistoryEncoder(nn.Module):
                     "Expected mask shape (B, T) matching motion_seq, got "
                     f"{tuple(mask.shape)} vs {tuple(motion_seq.shape[:2])}"
                 )
+
+        # --------------------------
 
         batch_size, seq_len, _ = motion_seq.shape
         if seq_len == 0:
@@ -359,16 +178,22 @@ class MotionHistoryEncoder(nn.Module):
 
         hidden_states = torch.cat([register_tokens, hidden_states], dim=1)
 
+        all_hidden_states: list[torch.Tensor] = []
+
         for layer in self.layers:
             hidden_states = layer(hidden_states, text_emb, is_causal=is_causal)
+
+            if return_layer_outputs:
+                all_hidden_states.append(hidden_states[:, self.config.num_registers :, :])
 
         hidden_states = self.final_norm(hidden_states)
         hidden_states = hidden_states[:, self.config.num_registers :, :]
 
-        if not return_all:
-            return hidden_states[:, -1, :]
-        else:
-            return hidden_states
+        if return_layer_outputs:
+            all_hidden_states.append(hidden_states)
+            return torch.stack(all_hidden_states, dim=2)  # (B, N, L, H)
+
+        return hidden_states  # (B, N, H)
 
     def step(
         self,
@@ -378,18 +203,12 @@ class MotionHistoryEncoder(nn.Module):
         cache_state: Optional[TemporalCacheState] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, TemporalCacheState]:
         if x_t.ndim != 2 or x_t.shape[-1] != self.config.frame_feature_dim:
-            raise ValueError(
-                "Expected x_t shape "
-                f"(B, {self.config.frame_feature_dim}), got {tuple(x_t.shape)}"
-            )
+            raise ValueError(f"Expected x_t shape (B, {self.config.frame_feature_dim}), got {tuple(x_t.shape)}")
 
         if frame_buffer is None:
             next_frame_buffer = x_t.unsqueeze(1)
         else:
-            if (
-                frame_buffer.ndim != 3
-                or frame_buffer.shape[-1] != self.config.frame_feature_dim
-            ):
+            if frame_buffer.ndim != 3 or frame_buffer.shape[-1] != self.config.frame_feature_dim:
                 raise ValueError(
                     "Expected frame_buffer shape "
                     f"(B, T, {self.config.frame_feature_dim}), got {tuple(frame_buffer.shape)}"
@@ -435,10 +254,7 @@ class LinearProbe(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.ndim != 3:
-            raise ValueError(
-                "Expected hidden_states shape (B, T, D), got "
-                f"{tuple(hidden_states.shape)}"
-            )
+            raise ValueError(f"Expected hidden_states shape (B, T, D), got {tuple(hidden_states.shape)}")
         seq_mean = hidden_states.mean(dim=1)
         x = self.norm(seq_mean)
         x = self.linear(x)
@@ -467,6 +283,18 @@ class JepaMLPBlock(nn.Module):
         x = residual + x
         return x
 
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
 
 class JepaPredictor(nn.Module):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
@@ -482,12 +310,22 @@ class JepaPredictor(nn.Module):
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.output_head = nn.Linear(config.hidden_size, config.hidden_size)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_normal_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.LayerNorm):
+                if module.weight is not None:
+                    nn.init.ones_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
 
     def forward(self, motion_history_emb: torch.Tensor) -> torch.Tensor:
-        if (
-            motion_history_emb.ndim != 2
-            or motion_history_emb.shape[-1] != self.config.hidden_size
-        ):
+        if motion_history_emb.ndim != 2 or motion_history_emb.shape[-1] != self.config.hidden_size:
             raise ValueError(
                 "Expected motion_history_emb shape "
                 f"(B, {self.config.hidden_size}), got {tuple(motion_history_emb.shape)}"
@@ -495,9 +333,7 @@ class JepaPredictor(nn.Module):
 
         batch_size = motion_history_emb.shape[0]
 
-        z = torch.randn(
-            batch_size, self.z_proj.in_features, device=motion_history_emb.device
-        )
+        z = torch.randn(batch_size, self.z_proj.in_features, device=motion_history_emb.device)
 
         z_proj = self.z_proj(z)
         combined = torch.cat([motion_history_emb, z_proj], dim=-1)

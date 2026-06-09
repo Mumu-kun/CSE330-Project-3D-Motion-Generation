@@ -10,15 +10,14 @@ from __future__ import annotations
 
 import copy
 import sys
-from typing import Any, Dict, Tuple, Generic, TypeVar, Union, Mapping as MappingABC
 from enum import Enum
 from pathlib import Path
+from typing import Any, Dict, Generic, Tuple, TypeVar, Union
+from typing import Mapping as MappingABC
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
 from ignite.engine import Engine, Events, State
 from ignite.handlers import (
     Checkpoint,
@@ -28,10 +27,11 @@ from ignite.handlers import (
 )
 from ignite.handlers.tqdm_logger import ProgressBar
 from ignite.metrics import RunningAverage
+from torch.amp.grad_scaler import GradScaler
+from torch.utils.data import DataLoader
 
 from utils.config import Config
-from utils.models import MotionHistoryEncoder
-from utils.models.motion_history_encoder import JepaPredictor, LinearProbe
+from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
 from utils.motion_utils import FeatureNormalizer
 from utils.wandb_logger import WandbLogger
 
@@ -63,22 +63,12 @@ class ProgressScheduler:
                 if interp == InterpEnum.NONE:
                     return self.value[i - 1]
                 elif interp == InterpEnum.LINEAR:
-                    ratio = (progress - self.progress[i - 1]) / (
-                        self.progress[i] - self.progress[i - 1]
-                    )
-                    return self.value[i - 1] + ratio * (
-                        self.value[i] - self.value[i - 1]
-                    )
+                    ratio = (progress - self.progress[i - 1]) / (self.progress[i] - self.progress[i - 1])
+                    return self.value[i - 1] + ratio * (self.value[i] - self.value[i - 1])
                 elif interp == InterpEnum.CUBIC:
-                    ratio = (progress - self.progress[i - 1]) / (
-                        self.progress[i] - self.progress[i - 1]
-                    )
-                    ratio_cubic = (
-                        3 * ratio**2 - 2 * ratio**3
-                    )  # Smooth cubic interpolation
-                    return self.value[i - 1] + ratio_cubic * (
-                        self.value[i] - self.value[i - 1]
-                    )
+                    ratio = (progress - self.progress[i - 1]) / (self.progress[i] - self.progress[i - 1])
+                    ratio_cubic = 3 * ratio**2 - 2 * ratio**3  # Smooth cubic interpolation
+                    return self.value[i - 1] + ratio_cubic * (self.value[i] - self.value[i - 1])
                 else:
                     raise ValueError(f"Unsupported interpolation type: {interp}")
 
@@ -98,11 +88,7 @@ class PretrainState(State):
 
     def epoch_progress(self, config: Config) -> float:
         """Return progress through current epoch as a float in [0, 1]."""
-        return (
-            self.epoch / float(config.get_num_epochs())
-            if config.get_num_epochs() > 0
-            else 0.0
-        )
+        return self.epoch / float(config.get_num_epochs()) if config.get_num_epochs() > 0 else 0.0
 
 
 class PretrainEngine(Engine):
@@ -190,23 +176,15 @@ class PretrainTrainer:
         # Device and AMP setup
         self.device = torch.device(config.device)
         self.use_amp = self.device.type == "cuda"
-        self.amp_dtype = (
-            torch.bfloat16
-            if self.use_amp and torch.cuda.is_bf16_supported()
-            else torch.float16
-        )
+        self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
         # Models - built internally
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config.encoder_config)
         self.jepa_predictor: JepaPredictor = JepaPredictor(config.encoder_config)
 
         # EMA models
-        self.ema_encoder: EMAModel = EMAModel(
-            self.encoder, decay=float(config.ema_decay)
-        )
-        self.ema_jepa: EMAModel = EMAModel(
-            self.jepa_predictor, decay=float(config.ema_decay)
-        )
+        self.ema_encoder: EMAModel = EMAModel(self.encoder, decay=float(config.ema_decay))
+        self.ema_jepa: EMAModel = EMAModel(self.jepa_predictor, decay=float(config.ema_decay))
 
         probe_hidden = getattr(config.encoder_config, "hidden_size", 512)
         probe_text_dim = getattr(config.encoder_config, "text_embedding_dim", 512)
@@ -230,9 +208,7 @@ class PretrainTrainer:
         # W&B logger
         self.wandb_logger: WandbLogger | None = None
 
-        self.accumulation_steps = (
-            config.effective_batch_size // config.batch_size
-        ) or 1
+        self.accumulation_steps = (config.effective_batch_size // config.batch_size) or 1
         # Initialize all objects
         self._initialize()
 
@@ -257,16 +233,12 @@ class PretrainTrainer:
                     "ema_decay": float(self.config.ema_decay),
                     "batch_size": self.train_loader.batch_size,
                     "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
-                    "jepa_params": sum(
-                        p.numel() for p in self.jepa_predictor.parameters()
-                    ),
+                    "jepa_params": sum(p.numel() for p in self.jepa_predictor.parameters()),
                     "phase": "pretrain",
                 },
             )
 
-    def _train_step(
-        self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
+    def _train_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one pretraining step."""
         # Prepare batch
         motion = batch["motion"].to(self.device)
@@ -275,23 +247,16 @@ class PretrainTrainer:
         text = batch["text_clip"].to(self.device)
 
         if motion.ndim != 3 or motion.shape[1] < 2:
-            raise ValueError(
-                f"Expected motion (B, torch.Tensor, 271), got {tuple(motion.shape)}"
-            )
+            raise ValueError(f"Expected motion (B, torch.Tensor, 271), got {tuple(motion.shape)}")
 
         batch_size, seq_len, _ = motion.shape
         num_masked = max(1, int(seq_len * 0.25))
 
         # Build mask
         mask_indices = torch.stack(
-            [
-                torch.randperm(seq_len, device=self.device)[:num_masked]
-                for _ in range(batch_size)
-            ]
+            [torch.randperm(seq_len, device=self.device)[:num_masked] for _ in range(batch_size)]
         )
-        mask_bool = torch.zeros(
-            batch_size, seq_len, dtype=torch.bool, device=self.device
-        )
+        mask_bool = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=self.device)
         for b in range(batch_size):
             mask_bool[b, mask_indices[b]] = True
 
@@ -303,49 +268,33 @@ class PretrainTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         self.probe_optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast(
+        with torch.amp.autocast(  # type: ignore
             device_type=self.device.type,
             dtype=self.amp_dtype,
             enabled=self.use_amp,
         ):
             text_emb = text[:, 0, :] if text.ndim == 3 else text
-            masked_context = self.encoder(
-                motion, torch.zeros_like(text_emb), mask=mask_bool, return_all=True
-            )
+            masked_context = self.encoder(motion, torch.zeros_like(text_emb), mask=mask_bool)
 
             with torch.no_grad():
                 target_encoder = self.ema_encoder.model
                 target_encoder.eval()
-                target_context = target_encoder(
-                    motion, torch.zeros_like(text_emb), mask=None, return_all=True
-                ).detach()
+                target_context = target_encoder(motion, torch.zeros_like(text_emb), mask=None).detach()
 
             # Extract masked tokens
-            b_idx = (
-                torch.arange(batch_size, device=self.device)
-                .unsqueeze(1)
-                .expand(-1, num_masked)
-            )
-            masked_tokens = masked_context[b_idx, mask_indices, :].reshape(
-                batch_size * num_masked, -1
-            )
-            target_masked = target_context[b_idx, mask_indices, :].reshape(
-                batch_size * num_masked, -1
-            )
+            b_idx = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, num_masked)
+            masked_tokens = masked_context[b_idx, mask_indices, :].reshape(batch_size * num_masked, -1)
+            target_masked = target_context[b_idx, mask_indices, :].reshape(batch_size * num_masked, -1)
 
             predicted = self.jepa_predictor(masked_tokens)
             mask_loss = F.smooth_l1_loss(predicted, target_masked)
 
-            token_diff = F.smooth_l1_loss(
-                masked_context, target_context, reduction="none"
-            ).mean(dim=-1)
+            token_diff = F.smooth_l1_loss(masked_context, target_context, reduction="none").mean(dim=-1)
 
             # Compute distance of each position to nearest masked position
             # pos: (1, seq_len, 1), mask_idx_exp: (B, 1, num_masked)
             # distances: (B, seq_len, num_masked)
-            pos = torch.arange(seq_len, device=self.device)[
-                None, :, None
-            ]  # (1, seq_len, 1)
+            pos = torch.arange(seq_len, device=self.device)[None, :, None]  # (1, seq_len, 1)
             mask_idx_exp = mask_indices.unsqueeze(1)  # (B, 1, num_masked)
             distances = torch.abs(
                 pos - mask_idx_exp
@@ -363,9 +312,7 @@ class PretrainTrainer:
             probe_out = self.linear_probe(target_context)
             probe_out = F.normalize(probe_out, dim=-1)
             normalized_text = F.normalize(text_emb, dim=-1)
-            probe_loss = (
-                1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
-            )
+            probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
 
         engine.state.metrics["mask_loss"] = float(mask_loss.detach().item())
         engine.state.metrics["context_loss"] = float(context_loss.detach().item())
@@ -385,9 +332,7 @@ class PretrainTrainer:
 
             # Update engine state
             loss_val = float(loss.detach().item())
-            engine.state.metrics["global_step"] = (
-                engine.state.iteration // self.accumulation_steps
-            )
+            engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
             engine.state.metrics["best_train_loss"] = min(
                 float(engine.state.metrics.get("best_train_loss", float("inf"))),
                 loss_val,
@@ -399,9 +344,7 @@ class PretrainTrainer:
             "probe_loss": probe_loss.detach(),
         }
 
-    def _val_step(
-        self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
+    def _val_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one validation step."""
         motion = batch["motion"].to(self.device)
         if self.normalizer is not None:
@@ -413,29 +356,21 @@ class PretrainTrainer:
 
         with torch.no_grad():
             text_emb = text[:, 0, :] if text.ndim == 3 else text
-            hidden_states = self.encoder(
-                motion, torch.zeros_like(text_emb), return_all=True
-            ).detach()
+            hidden_states = self.encoder(motion, torch.zeros_like(text_emb)).detach()
             probe_out = self.linear_probe(hidden_states)
             probe_out = F.normalize(probe_out, dim=-1)
             normalized_text = F.normalize(text_emb, dim=-1)
-            probe_loss = (
-                1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
-            )
+            probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
 
         metrics: Dict[str, torch.Tensor] = {"val_loss": probe_loss.detach()}
 
         return metrics
 
-    def _attach_handlers(
-        self, trainer: PretrainEngine, evaluator: PretrainEngine
-    ) -> None:
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         """Attach Ignite event handlers for training orchestration."""
         # Running averages
         RunningAverage(output_transform=lambda o: o["loss"]).attach(trainer, "loss")
-        RunningAverage(output_transform=lambda o: o["val_loss"]).attach(
-            evaluator, "val_loss"
-        )
+        RunningAverage(output_transform=lambda o: o["val_loss"]).attach(evaluator, "val_loss")
 
         # NaN termination
         trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
@@ -465,15 +400,13 @@ class PretrainTrainer:
 
         @trainer.on(Events.GET_BATCH_STARTED)
         def _set_horizon(engine: PretrainEngine) -> None:
-            from typing import cast
 
-            engine.state.dataloader.dataset.set_horizon(engine.state.horizon)
+            engine.state.dataloader.dataset.set_horizon(engine.state.horizon)  # type: ignore[attr-defined]
 
         @evaluator.on(Events.ITERATION_COMPLETED)
         def _set_horizon_eval(engine: PretrainEngine) -> None:
-            from typing import cast
 
-            engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)
+            engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)  # type: ignore[attr-defined]
 
         # Best checkpoint handler
         best_checkpoint = Checkpoint(
@@ -513,9 +446,7 @@ class PretrainTrainer:
             latest_checkpoint,
         )
 
-        @trainer.on(
-            Events.EPOCH_COMPLETED(every=getattr(self.config, "val_interval", 10))
-        )
+        @trainer.on(Events.EPOCH_COMPLETED(every=getattr(self.config, "val_interval", 10)))
         def _run_validation(engine: PretrainEngine) -> None:
             evaluator.run(self.val_loader)
 
@@ -537,9 +468,7 @@ class PretrainTrainer:
                         {
                             "val/loss": val_loss,
                             "val/epoch": int(trainer.state.epoch),
-                            "train/global_step": int(
-                                trainer.state.metrics.get("global_step", 0)
-                            ),
+                            "train/global_step": int(trainer.state.metrics.get("global_step", 0)),
                         },
                         step=int(trainer.state.metrics.get("global_step", 0)),
                     )

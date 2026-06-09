@@ -15,9 +15,9 @@ Feature Layout (271D) - Updated per normalization plan:
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
-from pathlib import Path
 from dataclasses import asdict, dataclass, field, is_dataclass
-from typing import Optional, Any
+from pathlib import Path
+from typing import Any, Optional
 
 
 @dataclass
@@ -183,34 +183,22 @@ class Config:
     # Training-time timestep sampling
     t_sampling_mode: str = "power"  # "uniform" or "power"
     t_sampling_power: float = 3.0  # Power-law exponent k in p(t)=(k+1)t^k
-    t_sampling_power_warmup_fraction: float = (
-        1  # Fraction of training used to ramp k from 0 to target
-    )
+    t_sampling_power_warmup_fraction: float = 1  # Fraction of training used to ramp k from 0 to target
 
     use_fk: bool = False  # Whether to compute FK loss during training
     # Rollout scheduling settings
     rollout_prob_start: float = 0.1  # Rollout probability at first epoch
     rollout_prob_end: float = 0.3  # Rollout probability at final epoch
-    rollout_warmup_fraction: float = (
-        0.15  # Fraction of training with rollout disabled before schedule starts
-    )
+    rollout_warmup_fraction: float = 0.15  # Fraction of training with rollout disabled before schedule starts
     rollout_block_len_start: int = 1  # Rollout block length at schedule start
     rollout_block_len_end: int = 4  # Rollout block length at schedule end
-    rollout_integration_steps: int = (
-        3  # Number of ODE integration steps for rollout branch
-    )
+    rollout_integration_steps: int = 3  # Number of ODE integration steps for rollout branch
     rollout_subset_fraction: float = 0.25  # Fraction of batch for rollout branch
     rollout_loss_weight: float = 0.25  # Weight of rollout-conditioned loss branch
-    rollout_block_len_bias_power: float = (
-        2.0  # Power > 1 biases sampled rollout lengths toward the scheduled max
-    )
+    rollout_block_len_bias_power: float = 2.0  # Power > 1 biases sampled rollout lengths toward the scheduled max
 
-    use_consistency_loss: bool = (
-        True  # Enable endpoint consistency loss after no-grad rollout
-    )
-    consistency_loss_t_threshold: float = (
-        0.5  # Only apply consistency loss for t > threshold
-    )
+    use_consistency_loss: bool = True  # Enable endpoint consistency loss after no-grad rollout
+    consistency_loss_t_threshold: float = 0.5  # Only apply consistency loss for t > threshold
     consistency_loss_weight: float = 10  # Weight for consistency loss in total loss
 
     # Data loading
@@ -219,9 +207,7 @@ class Config:
 
     # Inference settings
     num_inference_steps: int = 20  # Number of flow matching steps
-    inference_t_schedule_power: float = (
-        3.0  # End-bias power p in t=1-(1-s)^p for inference ODE time boundaries
-    )
+    inference_t_schedule_power: float = 3.0  # End-bias power p in t=1-(1-s)^p for inference ODE time boundaries
     guidance_scale: float = 1.0  # CFG scale for inference
 
     # Validation settings
@@ -243,10 +229,7 @@ class Config:
     def __post_init__(self):
         self.t_sampling_mode = str(self.t_sampling_mode).lower()
         if self.t_sampling_mode not in {"uniform", "power"}:
-            raise ValueError(
-                "t_sampling_mode must be 'uniform' or 'power', got "
-                f"{self.t_sampling_mode!r}"
-            )
+            raise ValueError(f"t_sampling_mode must be 'uniform' or 'power', got {self.t_sampling_mode!r}")
         self.t_sampling_power = max(0.0, float(self.t_sampling_power))
         self.t_sampling_power_warmup_fraction = min(
             max(float(self.t_sampling_power_warmup_fraction), 0.0),
@@ -270,15 +253,11 @@ class Config:
         self.rollout_block_len_bias_power = float(self.rollout_block_len_bias_power)
         if self.rollout_block_len_bias_power <= 1.0:
             raise ValueError(
-                "rollout_block_len_bias_power must be greater than 1, got "
-                f"{self.rollout_block_len_bias_power}"
+                f"rollout_block_len_bias_power must be greater than 1, got {self.rollout_block_len_bias_power}"
             )
         self.inference_t_schedule_power = float(self.inference_t_schedule_power)
         if self.inference_t_schedule_power <= 0.0:
-            raise ValueError(
-                "inference_t_schedule_power must be positive, got "
-                f"{self.inference_t_schedule_power}"
-            )
+            raise ValueError(f"inference_t_schedule_power must be positive, got {self.inference_t_schedule_power}")
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)
