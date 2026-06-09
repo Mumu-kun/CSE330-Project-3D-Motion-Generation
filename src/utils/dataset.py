@@ -12,7 +12,7 @@ from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-from config import Config
+from utils.config import Config
 from utils.motion_utils import FeatureNormalizer
 
 
@@ -195,7 +195,7 @@ class Text2MotionDataset(Dataset):
     This is the ONLY version that works - replace everything else
     """
 
-    def __getitem__(self, item):
+    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str]:
         """
         Returns a single sample from the dataset.
         GUARANTEES: All returned tensors have shape (max_motion_length, features)

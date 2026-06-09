@@ -114,11 +114,11 @@ class Config:
         default_factory=lambda: MotionHistoryEncoderConfig(
             frame_feature_dim=271,
             text_embedding_dim=512,
-            hidden_size=192,
-            intermediate_size=4 * 192,
+            hidden_size=512,
+            intermediate_size=2 * 512,
             num_hidden_layers=4,
-            num_attention_heads=8,
-            hidden_act="gelu",
+            num_attention_heads=16,
+            hidden_act="silu",
             layer_norm_eps=1e-5,
             attention_bias=True,
             attention_dropout=0.1,
@@ -151,7 +151,10 @@ class Config:
         )
     )
 
+    text_embedding_dim = 512  # Dimension of text embeddings for conditioning
+
     # Training settings
+    effective_batch_size: int = 400
     batch_size: int = 200
     learning_rate: float = 0.5e-4
     weight_decay: float = 1e-5
@@ -171,6 +174,8 @@ class Config:
 
     horizon: int = 40  # Maximum/target horizon for training
     _num_epochs: int = 200
+
+    jepa_ctx_weight: float = 0.2
 
     # CFG (Classifier-Free Guidance) settings
     cfg_dropout: float = 0.1  # Dropout probability for CFG
@@ -232,6 +237,9 @@ class Config:
 
     unit_length = 5
 
+    enable_linear_probe: bool = True
+    probe_loss_weight: float = 1.0
+
     def __post_init__(self):
         self.t_sampling_mode = str(self.t_sampling_mode).lower()
         if self.t_sampling_mode not in {"uniform", "power"}:
@@ -271,9 +279,6 @@ class Config:
                 "inference_t_schedule_power must be positive, got "
                 f"{self.inference_t_schedule_power}"
             )
-        self.num_epochs = (
-            self.curriculum[-1]["epochs"] if self.curriculum else self._num_epochs
-        )
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)
@@ -310,14 +315,9 @@ class Config:
         #     head_dim=None,
         # )
 
-    def get_predictor_feature_size(self) -> int:
-        """
-        Compute input feature size for FlowMatchingPredictor.
-
-        For tokenized predictor inputs with shape (B, N, F), this returns F
-        (the per-joint feature width), not N * F.
-        """
-        return self.encoder_config.per_joint_output_dim
+    def get_num_epochs(self) -> int:
+        """Return the total number of training epochs, accounting for curriculum."""
+        return self.curriculum[-1]["epochs"] if self.curriculum else self._num_epochs
 
     def to_dict(self) -> dict:
         """Export the configuration as a serializable dictionary."""

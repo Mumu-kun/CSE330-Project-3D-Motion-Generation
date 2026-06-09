@@ -24,8 +24,12 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Tuple, Union, cast
-from utils.models.motion_history_encoder import MotionHistoryEncoder, GatedMLP
-from config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
+from .motion_history_encoder import (
+    MotionHistoryEncoder,
+    GatedMLP,
+    TemporalCacheState,
+)
+from utils.config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
 from transformers.activations import ACT2FN
 
 from utils.motion_utils import (
@@ -818,8 +822,10 @@ class HumanMotionGenerator:
 
             if input_positions is None:
                 # Cold start from a zero pose frame.
+                joint_count = int(self.config.num_joints)
+                joint_dim = int(self.config.joint_dim)
                 position_history = torch.zeros(
-                    (B, 1, self.encoder.joint_count, self.config.joint_dim),
+                    (B, 1, joint_count, joint_dim),
                     device=device,
                 )
                 feature_history = sequence_joints_to_features(
@@ -857,7 +863,7 @@ class HumanMotionGenerator:
             )
 
             relative_shift_history = torch.zeros(
-                (B, 1, self.encoder.joint_count, self.config.joint_dim),
+                (B, 1, self.config.num_joints, self.config.joint_dim),
                 device=device,
             )
 
