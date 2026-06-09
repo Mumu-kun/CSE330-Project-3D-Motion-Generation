@@ -116,13 +116,14 @@ def test_jepa_checkpoint_load():
         return
 
     # Create trainer to load checkpoint into
-    train_dataloader, _ = create_dataloader(config, split="train", shuffle=False)
+    train_dataloader, normalizer = create_dataloader(config, split="train", shuffle=False)
     val_dataloader, _ = create_dataloader(config, split="val", shuffle=False)
 
     trainer = PretrainTrainer(
         config=config,
         train_loader=train_dataloader,
         val_loader=val_dataloader,
+        normalizer=normalizer,
     )
 
     # Test loading via trainer's state

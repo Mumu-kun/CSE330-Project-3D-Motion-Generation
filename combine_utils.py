@@ -90,6 +90,7 @@ from enum import Enum
 # models/__init__.py defines AdaLN, TemporalRoPEAttention, GatedMLP, TemporalCacheState.
 # models/motion_history_encoder.py subclasses TemporalRoPEAttention.
 # models/flow_matching_predictor.py uses AdaLN, GatedMLP, KinematicChainEncoder.
+# models/human_motion_generator.py is the high-level generation interface.
 FILE_ORDER = [
     "quaternion.py",
     "motion_utils.py",
@@ -99,10 +100,11 @@ FILE_ORDER = [
     "visualization.py",
     "wandb_logger.py",
     "models/__init__.py",
+    # "models/human_motion_generator.py",
     "models/motion_history_encoder.py",
-    "models/flow_matching_predictor.py",
+    # "models/flow_matching_predictor.py",
     "models/pretrain_trainer.py",
-    "models/finetune_trainer.py",
+    # "models/finetune_trainer.py",
 ]
 
 _IMPORT_RE = re.compile(r"^(\s*)(from\s+(?:utils\.[A-Za-z_.][\w.]*|\.+[\w.]*)\s+import)")
@@ -177,7 +179,7 @@ def build():
 
     combined = "\n".join(sections)
 
-    for out_path in (OUTPUT_SRC, OUTPUT_BUILD):
+    for out_path in (OUTPUT_BUILD,):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(combined, encoding="utf-8")
         print(f"  Wrote {out_path}  ({out_path.stat().st_size:,} bytes)")

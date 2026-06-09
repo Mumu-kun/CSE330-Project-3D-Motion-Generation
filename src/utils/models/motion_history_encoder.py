@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.config import MotionHistoryEncoderConfig
-from utils.models import AdaLN, GatedMLP, TemporalCacheState, TemporalLayerCache, TemporalRoPEAttention
+from utils.models import AdaLN, GatedMLP, TemporalCacheState, TemporalLayerCache, TemporalRoPEAttention, init_weights
 
 
 class EncoderRoPEAttention(TemporalRoPEAttention):
@@ -16,12 +16,6 @@ class EncoderRoPEAttention(TemporalRoPEAttention):
             raise ValueError(
                 f"TemporalRoPEAttention requires an even per-head dimension, got head_dim={self.head_dim}."
             )
-
-        self.q_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
-        self.k_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
-        self.v_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
-        self.out_proj = nn.Linear(config.hidden_size, config.hidden_size, bias=config.attention_bias)
-        self.attention_dropout = config.attention_dropout
 
     def forward(self, hidden_states: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
@@ -108,27 +102,9 @@ class MotionHistoryEncoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self):
-        # Register tokens:
-        # slightly larger init so they participate in attention early
         nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
-
-        # Mask token:
-        # slightly smaller helps continuous motion stability
         nn.init.normal_(self.mask_token, mean=0.0, std=0.01)
-
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                # ViT-style transformer init
-                nn.init.trunc_normal_(module.weight, std=0.02)
-
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_weights(self, linear_init="trunc_normal", linear_std=0.02)
 
     def _empty_cache_state(self) -> TemporalCacheState:
         return TemporalCacheState(layers=[TemporalLayerCache() for _ in range(self.config.num_hidden_layers)])
@@ -139,7 +115,7 @@ class MotionHistoryEncoder(nn.Module):
         text_emb: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
         return_layer_outputs: bool = False,
-        is_causal: bool = True,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         if motion_seq.ndim != 3 or motion_seq.shape[-1] != self.config.frame_feature_dim:
             raise ValueError(
@@ -190,7 +166,7 @@ class MotionHistoryEncoder(nn.Module):
         hidden_states = hidden_states[:, self.config.num_registers :, :]
 
         if return_layer_outputs:
-            all_hidden_states.append(hidden_states)
+            all_hidden_states[-1] = hidden_states
             return torch.stack(all_hidden_states, dim=2)  # (B, N, L, H)
 
         return hidden_states  # (B, N, H)
@@ -283,18 +259,6 @@ class JepaMLPBlock(nn.Module):
         x = residual + x
         return x
 
-    def _init_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
 
 class JepaPredictor(nn.Module):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
@@ -303,46 +267,68 @@ class JepaPredictor(nn.Module):
 
         self.z_proj = nn.Linear(config.hidden_size // 4, config.hidden_size)
 
+        self.input_mlp = GatedMLP(
+            hidden_size=config.num_hidden_layers * config.hidden_size,
+            intermediate_size=4 * config.hidden_size,
+            output_size=config.hidden_size,
+            bias=True,
+            activation=config.hidden_act,
+            dropout=config.dropout,
+        )
+
         self.input_proj = nn.Linear(2 * config.hidden_size, config.hidden_size)
 
         self.blocks = nn.ModuleList([JepaMLPBlock(config) for _ in range(2)])
 
         self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
-        self.output_head = nn.Linear(config.hidden_size, config.hidden_size)
+        self.output_head = nn.Linear(config.hidden_size, config.hidden_size * config.num_hidden_layers)
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_weights(self, linear_init="xavier_normal")
 
     def forward(self, motion_history_emb: torch.Tensor) -> torch.Tensor:
-        if motion_history_emb.ndim != 2 or motion_history_emb.shape[-1] != self.config.hidden_size:
+        """
+        Args:
+            motion_history_emb: (B, T, L, H) where
+                B = batch size,
+                T = sequence length,
+                L = config.num_hidden_layers,
+                H = config.hidden_size.
+
+        Returns:
+            (B, T, L, H) where
+                B = batch size,
+                T = sequence length,
+                L = config.num_hidden_layers,
+                H = config.hidden_size.
+        """
+
+        if motion_history_emb.ndim != 4 or motion_history_emb.shape[-1] != self.config.hidden_size:
             raise ValueError(
                 "Expected motion_history_emb shape "
-                f"(B, {self.config.hidden_size}), got {tuple(motion_history_emb.shape)}"
+                f"(B, T, L, {self.config.hidden_size}), got {tuple(motion_history_emb.shape)}"
             )
 
-        batch_size = motion_history_emb.shape[0]
+        B, T, L, H = motion_history_emb.shape
 
-        z = torch.randn(batch_size, self.z_proj.in_features, device=motion_history_emb.device)
+        motion_history_emb = motion_history_emb.reshape(B, T, -1)  # (B, T, L*H)
+        motion_history_emb = self.input_mlp(motion_history_emb)  # (B, T, H)
 
-        z_proj = self.z_proj(z)
+        z = torch.randn(B, self.z_proj.in_features, device=motion_history_emb.device)  # (B, H//4)
+        # VJEPA-style latent noise — random noise injected as a learnable conditioning signal.
+
+        z_proj = self.z_proj(z).unsqueeze(1).expand(-1, T, -1)  # (B, T, H)
         combined = torch.cat([motion_history_emb, z_proj], dim=-1)
-        x = self.input_proj(combined)
+        x = self.input_proj(combined)  # (B, T, H)
 
         for block in self.blocks:
             x = block(x)
 
         x = self.final_norm(x)
         output = self.output_head(x)
+
+        output = output.view(B, T, self.config.num_hidden_layers, self.config.hidden_size)
 
         return output

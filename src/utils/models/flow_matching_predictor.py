@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from utils.config import Config, FlowMatchingPredictorConfig
-from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention
+from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
 from utils.motion_utils import FeatureNormalizer, flow_output_to_positions
 
 
@@ -22,16 +22,7 @@ class SinusoidalEmbedder(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_weights(self, linear_init="xavier_normal")
 
     @staticmethod
     def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
@@ -78,16 +69,7 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_weights(self, linear_init="xavier_normal")
 
     def attn_weights(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
         attn_weights = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
@@ -103,8 +85,6 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         output_attentions: bool = False,
     ):
         batch_size, seq_len, _ = hidden_states.shape
-
-        query = self._reshape_heads(self.q_proj(hidden_states))
 
         encoder_cache = self.kv_cache if _encoder_cache is None else _encoder_cache
 
@@ -213,16 +193,7 @@ class FlowMatchingPredictor(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.LayerNorm):
-                if module.weight is not None:
-                    nn.init.ones_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_weights(self, linear_init="xavier_normal")
 
     def forward(
         self,
@@ -244,7 +215,7 @@ class FlowMatchingPredictor(nn.Module):
         # 4. Transformer processing (NO ATTENTION MASKING)
         all_cross_attns: list[torch.Tensor] = []
 
-        hidden_states = self.latent_in_proj(noisy_states)  # (B, N, H)
+        hidden_states = self.latent_in_proj(noisy_states)  # (B, N, H) — projected into predictor hidden dim
 
         for layer_idx, layer in enumerate(self.layers):
             # Bounded signed gate allows add/subtract structural prior per layer.
@@ -289,11 +260,7 @@ class LatentDecoder(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self) -> None:
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_normal_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        init_weights(self, linear_init="xavier_normal")
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         pred = self.decoder(latent)

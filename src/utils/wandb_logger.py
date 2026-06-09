@@ -20,8 +20,7 @@ Usage:
 
 import os
 import sys
-from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
 # Check if wandb is available
 try:
@@ -101,6 +100,10 @@ class WandbLogger:
         else:
             self.name = name
 
+        if wandb is None:
+            print("[WandbLogger] wandb not available. Cannot log model.")
+            return
+
         if not self.enabled:
             if not WANDB_AVAILABLE:
                 print("[WandbLogger] wandb not installed. Logging disabled.")
@@ -136,6 +139,10 @@ class WandbLogger:
         if api_key is None:
             api_key = get_kaggle_secret(secret_name)
 
+        if wandb is None:
+            print("[WandbLogger] wandb not available. Cannot log model.")
+            return
+
         if api_key:
             try:
                 wandb.login(key=api_key)
@@ -143,9 +150,7 @@ class WandbLogger:
             except Exception as e:
                 print(f"[WandbLogger] Authentication failed: {e}")
         else:
-            print(
-                "[WandbLogger] No API key found. Using existing login or anonymous mode."
-            )
+            print("[WandbLogger] No API key found. Using existing login or anonymous mode.")
 
     def log(
         self,
@@ -160,6 +165,10 @@ class WandbLogger:
             step: Global step (optional, auto-incremented if not provided)
         """
         if not self.enabled or self.run is None:
+            return
+
+        if wandb is None:
+            print("[WandbLogger] wandb not available. Cannot log metrics.")
             return
 
         try:
@@ -182,6 +191,10 @@ class WandbLogger:
             description: Optional description
         """
         if not self.enabled or self.run is None:
+            return
+
+        if wandb is None:
+            print("[WandbLogger] wandb not available. Cannot log model.")
             return
 
         try:
@@ -211,6 +224,10 @@ class WandbLogger:
         if not self.enabled or self.run is None:
             return
 
+        if wandb is None:
+            print("[WandbLogger] wandb not available. Cannot log model.")
+            return
+
         try:
             wandb.log({key: wandb.Image(path, caption=caption)}, step=step)
         except Exception as e:
@@ -235,6 +252,10 @@ class WandbLogger:
     def finish(self) -> None:
         """Finish the W&B run."""
         if not self.enabled or self.run is None:
+            return
+
+        if wandb is None:
+            print("[WandbLogger] wandb not available. Cannot log model.")
             return
 
         try:

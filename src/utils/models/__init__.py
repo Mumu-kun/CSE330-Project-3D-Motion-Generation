@@ -77,40 +77,6 @@ class KinematicChainEncoder(nn.Module):
         return torch.cat([self.chain_emb(chains), self.depth_emb(depths)], dim=-1)  # (n_joints, model_dim)
 
 
-class SinusoidalEmbedder(nn.Module):
-    """Embeds scalar timesteps into vector representations."""
-
-    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256):
-        super().__init__()
-        self.frequency_embedding_size = frequency_embedding_size
-        self.mlp: nn.Sequential = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-
-    @staticmethod
-    def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-        half = dim // 2
-        if half == 0:
-            return torch.zeros((t.shape[0], dim), device=t.device, dtype=torch.float32)
-
-        max_period_tensor = torch.tensor(max_period, device=t.device, dtype=torch.float32)
-        freqs = torch.exp(
-            -torch.log(max_period_tensor) * torch.arange(half, dtype=torch.float32, device=t.device) / half
-        )
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        out = self.mlp(t_freq)
-        return out
-
-
 class AdaLN(nn.Module):
     """
     Adaptive Layer Normalization.
@@ -171,6 +137,7 @@ class GatedMLP(nn.Module):
         self,
         hidden_size: int,
         intermediate_size: int,
+        output_size: Optional[int] = None,
         *,
         bias: bool,
         activation: str,
@@ -179,7 +146,11 @@ class GatedMLP(nn.Module):
         super().__init__()
         self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+
+        if output_size is None:
+            output_size = hidden_size
+
+        self.down_proj = nn.Linear(intermediate_size, output_size, bias=bias)
         self.dropout = nn.Dropout(dropout)
         self.act_fn = ACT2FN[activation]
 
@@ -252,3 +223,27 @@ class TemporalLayerCache:
 @dataclass
 class TemporalCacheState:
     layers: List[TemporalLayerCache]
+
+
+def init_weights(module: nn.Module, linear_init: str = "xavier_normal", linear_std: float = 0.02) -> None:
+    """Apply standard weight initialization to a module and all sub-modules.
+
+    Args:
+        module: The module to initialize (typically called as init_weights(self) from __init__).
+        linear_init: Initialization scheme for nn.Linear weights.
+                     Use "xavier_normal" for flow/predictor, "trunc_normal" for encoder.
+        linear_std: Standard deviation for trunc_normal init (ignored for xavier_normal).
+    """
+    for m in module.modules():
+        if isinstance(m, nn.Linear):
+            if linear_init == "trunc_normal":
+                nn.init.trunc_normal_(m.weight, std=linear_std)
+            else:
+                nn.init.xavier_normal_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            if m.weight is not None:
+                nn.init.ones_(m.weight)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)

@@ -115,7 +115,7 @@ class Config:
             frame_feature_dim=271,
             text_embedding_dim=512,
             hidden_size=512,
-            intermediate_size=2 * 512,
+            intermediate_size=4 * 512,
             num_hidden_layers=4,
             num_attention_heads=16,
             hidden_act="silu",
@@ -124,9 +124,6 @@ class Config:
             attention_dropout=0.1,
             mlp_bias=True,
             dropout=0.1,
-            per_joint_output_dim=64,
-            joint_count=22,
-            text_scale=1.0,
         )
     )
 
@@ -160,6 +157,8 @@ class Config:
     weight_decay: float = 1e-5
     gradient_clip: float = 30.0
     ema_decay: float = 0.999
+    lr_warmup_epochs: int = 5
+    lr_scheduler: str = "cosine"
 
     # Curriculum learning settings
     # Set to None to disable curriculum (use fixed horizon from horizon field)
@@ -173,7 +172,7 @@ class Config:
     )
 
     horizon: int = 40  # Maximum/target horizon for training
-    _num_epochs: int = 200
+    _num_epochs: int = 2000
 
     jepa_ctx_weight: float = 0.2
 

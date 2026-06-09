@@ -8,17 +8,14 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from config import Config
-from utils.train_utils import Trainer
+
+from utils.config import Config
+from utils.models.pretrain_trainer import PretrainTrainer
 
 
 def _count_parameters(module) -> dict[str, int]:
     total = sum(parameter.numel() for parameter in module.parameters())
-    trainable = sum(
-        parameter.numel()
-        for parameter in module.parameters()
-        if parameter.requires_grad
-    )
+    trainable = sum(parameter.numel() for parameter in module.parameters() if parameter.requires_grad)
     return {
         "total": int(total),
         "trainable": int(trainable),
@@ -53,22 +50,24 @@ def main() -> None:
     args = parser.parse_args()
 
     config = _load_config(args.checkpoint)
-    encoder, predictor = Trainer._build_models_from_config(config, normalizer=None)
 
-    encoder_counts = _count_parameters(encoder)
-    predictor_counts = _count_parameters(predictor)
+    config.dataset_path = Path("tests/dataset/humanml3d-subset-mini")
+    config.device = "cpu"
 
-    combined_total = encoder_counts["total"] + predictor_counts["total"]
-    combined_trainable = encoder_counts["trainable"] + predictor_counts["trainable"]
+    trainer = PretrainTrainer(config)
+
+    encoder_counts = _count_parameters(trainer.encoder)
+    jepa_predictor_counts = _count_parameters(trainer.jepa_predictor)
+    probe_counts = _count_parameters(trainer.linear_probe)
+
+    combined_total = encoder_counts["total"] + jepa_predictor_counts["total"]
+    combined_trainable = encoder_counts["trainable"] + jepa_predictor_counts["trainable"]
 
     result = {
-        "config_source": (
-            str(Path(args.checkpoint).resolve())
-            if args.checkpoint
-            else "Config() defaults"
-        ),
+        "config_source": (str(Path(args.checkpoint).resolve()) if args.checkpoint else "Config() defaults"),
         "encoder": encoder_counts,
-        "predictor": predictor_counts,
+        "predictor": jepa_predictor_counts,
+        "probe": probe_counts,
         "combined": {
             "total": int(combined_total),
             "trainable": int(combined_trainable),
@@ -89,23 +88,12 @@ def main() -> None:
 
     print(f"Config source: {result['config_source']}")
     print()
-    print(
-        "MotionHistoryEncoder: "
-        f"total={encoder_counts['total']:,} "
-        f"trainable={encoder_counts['trainable']:,}"
-    )
-    print(
-        "FlowMatchingPredictor: "
-        f"total={predictor_counts['total']:,} "
-        f"trainable={predictor_counts['trainable']:,}"
-    )
-    print("Combined: " f"total={combined_total:,} " f"trainable={combined_trainable:,}")
+    print(f"MotionHistoryEncoder: total={encoder_counts['total']:,} trainable={encoder_counts['trainable']:,}")
+    print(f"JepaPredictor: total={jepa_predictor_counts['total']:,} trainable={jepa_predictor_counts['trainable']:,}")
+    print(f"LinearProbe: total={probe_counts['total']:,} trainable={probe_counts['trainable']:,}")
+    print(f"Combined: total={combined_total:,} trainable={combined_trainable:,}")
     if args.include_ema:
-        print(
-            "Combined with EMA copies: "
-            f"total={combined_total * 2:,} "
-            f"trainable={combined_trainable:,}"
-        )
+        print(f"Combined with EMA copies: total={combined_total * 2:,} trainable={combined_trainable:,}")
 
 
 if __name__ == "__main__":

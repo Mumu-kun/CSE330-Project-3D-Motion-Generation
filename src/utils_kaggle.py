@@ -4,30 +4,30 @@
 
 from __future__ import annotations
 
+import copy
 import os
 import sys
-import copy
-import re
-import ast
 from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union, cast, reveal_type
+from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp.grad_scaler import GradScaler
 from torch.utils.data import DataLoader, Dataset
-import numpy as np
 
 try:
     import wandb
+
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
     wandb = None
 
 try:
-    from transformers import CLIPTokenizer, CLIPTextModel, ACT2FN
+    from transformers import ACT2FN, CLIPTextModel, CLIPTokenizer
+
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
     TRANSFORMERS_AVAILABLE = False
@@ -69,9 +69,7 @@ except ImportError:
 
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
-from datetime import datetime
 from enum import Enum
-
 
 # ========== quaternion.py ==========
 
@@ -83,22 +81,16 @@ from enum import Enum
 #
 # Streamlined version - unused functions removed
 
-import torch
-import numpy as np
 
 _EPS4 = np.finfo(float).eps * 4.0
 
 _FLOAT_EPS = np.finfo(np.float64).eps
 
 
-def _safe_normalize_quaternion(
-    quaternions: torch.Tensor, eps: float = 1e-8
-) -> torch.Tensor:
+def _safe_normalize_quaternion(quaternions: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     """Normalize quaternions and fall back to identity when the norm collapses."""
     if quaternions.shape[-1] != 4:
-        raise ValueError(
-            f"Expected quaternions with trailing dimension 4, got {quaternions.shape}"
-        )
+        raise ValueError(f"Expected quaternions with trailing dimension 4, got {quaternions.shape}")
 
     norms = torch.norm(quaternions, dim=-1, keepdim=True)
     identity = torch.zeros_like(quaternions)
@@ -242,13 +234,9 @@ def matrix_to_quaternion(rotation_matrix):
     rotation_matrix = rotation_matrix.reshape(-1, 3, 3)
 
     batch_size = rotation_matrix.shape[0]
-    q = torch.zeros(
-        batch_size, 4, device=rotation_matrix.device, dtype=rotation_matrix.dtype
-    )
+    q = torch.zeros(batch_size, 4, device=rotation_matrix.device, dtype=rotation_matrix.dtype)
 
-    trace = (
-        rotation_matrix[:, 0, 0] + rotation_matrix[:, 1, 1] + rotation_matrix[:, 2, 2]
-    )
+    trace = rotation_matrix[:, 0, 0] + rotation_matrix[:, 1, 1] + rotation_matrix[:, 2, 2]
 
     # Case 1: trace > 0
     mask1 = trace > 0
@@ -265,13 +253,7 @@ def matrix_to_quaternion(rotation_matrix):
         & (rotation_matrix[:, 0, 0] > rotation_matrix[:, 2, 2])
     )
     s2 = (
-        torch.sqrt(
-            1.0
-            + rotation_matrix[mask2, 0, 0]
-            - rotation_matrix[mask2, 1, 1]
-            - rotation_matrix[mask2, 2, 2]
-        )
-        * 2
+        torch.sqrt(1.0 + rotation_matrix[mask2, 0, 0] - rotation_matrix[mask2, 1, 1] - rotation_matrix[mask2, 2, 2]) * 2
     )
     q[mask2, 0] = (rotation_matrix[mask2, 2, 1] - rotation_matrix[mask2, 1, 2]) / s2
     q[mask2, 1] = 0.25 * s2
@@ -281,13 +263,7 @@ def matrix_to_quaternion(rotation_matrix):
     # Case 3: R11 > R22
     mask3 = (~mask1) & (~mask2) & (rotation_matrix[:, 1, 1] > rotation_matrix[:, 2, 2])
     s3 = (
-        torch.sqrt(
-            1.0
-            + rotation_matrix[mask3, 1, 1]
-            - rotation_matrix[mask3, 0, 0]
-            - rotation_matrix[mask3, 2, 2]
-        )
-        * 2
+        torch.sqrt(1.0 + rotation_matrix[mask3, 1, 1] - rotation_matrix[mask3, 0, 0] - rotation_matrix[mask3, 2, 2]) * 2
     )
     q[mask3, 0] = (rotation_matrix[mask3, 0, 2] - rotation_matrix[mask3, 2, 0]) / s3
     q[mask3, 1] = (rotation_matrix[mask3, 0, 1] + rotation_matrix[mask3, 1, 0]) / s3
@@ -297,13 +273,7 @@ def matrix_to_quaternion(rotation_matrix):
     # Case 4: else
     mask4 = (~mask1) & (~mask2) & (~mask3)
     s4 = (
-        torch.sqrt(
-            1.0
-            + rotation_matrix[mask4, 2, 2]
-            - rotation_matrix[mask4, 0, 0]
-            - rotation_matrix[mask4, 1, 1]
-        )
-        * 2
+        torch.sqrt(1.0 + rotation_matrix[mask4, 2, 2] - rotation_matrix[mask4, 0, 0] - rotation_matrix[mask4, 1, 1]) * 2
     )
     q[mask4, 0] = (rotation_matrix[mask4, 1, 0] - rotation_matrix[mask4, 0, 1]) / s4
     q[mask4, 1] = (rotation_matrix[mask4, 0, 2] + rotation_matrix[mask4, 2, 0]) / s4
@@ -353,9 +323,8 @@ API:
 - IncrementalFeatureExtractor: Frame-by-frame inference
 """
 
-import torch
 import numpy as np
-from typing import List, Tuple, Dict, Any, Optional
+
 # [internal import removed]  from utils.quaternion import (
 
 
@@ -403,11 +372,7 @@ T2M_KINEMATIC_CHAIN = [
 # Precompute once at module level
 
 __PARENT_INDICES, __CHILD_INDICES = zip(
-    *[
-        (parent, child)
-        for chain in T2M_KINEMATIC_CHAIN
-        for parent, child in zip(chain[:-1], chain[1:])
-    ]
+    *[(parent, child) for chain in T2M_KINEMATIC_CHAIN for parent, child in zip(chain[:-1], chain[1:])]
 )
 _PARENT_INDICES = torch.tensor(__PARENT_INDICES, dtype=torch.long)
 _CHILD_INDICES = torch.tensor(__CHILD_INDICES, dtype=torch.long)
@@ -434,9 +399,7 @@ DATASET_CONFIGS = {
 def get_dataset_config(dataset_type: str = "t2m") -> Dict[str, Any]:
     """Get configuration for a dataset type."""
     if dataset_type not in DATASET_CONFIGS:
-        raise ValueError(
-            f"Unknown dataset_type: {dataset_type}. Available: {list(DATASET_CONFIGS.keys())}"
-        )
+        raise ValueError(f"Unknown dataset_type: {dataset_type}. Available: {list(DATASET_CONFIGS.keys())}")
     return DATASET_CONFIGS[dataset_type]
 
 
@@ -474,9 +437,7 @@ def root_features_to_root_positions(
     - Sequence: `(..., T, 3)` with `prev_root_pos` shape `(..., 3)`
     """
     if root_features.size(-1) != 3:
-        raise ValueError(
-            "root_features must end with 3 values: [root_height_y, root_vel_x, root_vel_z]"
-        )
+        raise ValueError("root_features must end with 3 values: [root_height_y, root_vel_x, root_vel_z]")
     if prev_root_pos.size(-1) != 3:
         raise ValueError("prev_root_pos must end with 3 values: [x, y, z]")
 
@@ -562,9 +523,7 @@ def get_fk_offsets(positions: torch.Tensor) -> torch.Tensor:
     parent_idx = _PARENT_INDICES.to(positions.device)
     child_idx = _CHILD_INDICES.to(positions.device)
 
-    edge_lengths = torch.norm(
-        positions[..., child_idx, :] - positions[..., parent_idx, :], dim=-1
-    ).mean(
+    edge_lengths = torch.norm(positions[..., child_idx, :] - positions[..., parent_idx, :], dim=-1).mean(
         dim=1
     )  # (B, E)
 
@@ -611,9 +570,7 @@ def wrap_angle(angle: torch.Tensor) -> torch.Tensor:
 def root_rot6d_to_yaw(root_rot_6d: torch.Tensor) -> torch.Tensor:
     """Extract yaw from the yaw-only root 6D rotation convention."""
     if root_rot_6d.shape[-1] != 6:
-        raise ValueError(
-            f"Expected root_rot_6d with trailing dimension 6, got {root_rot_6d.shape}"
-        )
+        raise ValueError(f"Expected root_rot_6d with trailing dimension 6, got {root_rot_6d.shape}")
     rotation_matrix = cont6d_to_matrix(root_rot_6d)
     return torch.atan2(-rotation_matrix[..., 2, 0], rotation_matrix[..., 0, 0])
 
@@ -638,9 +595,7 @@ def yaw_to_sin_cos(yaw: torch.Tensor) -> torch.Tensor:
 def sin_cos_to_yaw(sin_cos: torch.Tensor) -> torch.Tensor:
     """Decode [sin(angle), cos(angle)] back to an angle."""
     if sin_cos.shape[-1] != 2:
-        raise ValueError(
-            f"Expected sin_cos with trailing dimension 2, got {sin_cos.shape}"
-        )
+        raise ValueError(f"Expected sin_cos with trailing dimension 2, got {sin_cos.shape}")
     return torch.atan2(sin_cos[..., 0], sin_cos[..., 1])
 
 
@@ -836,9 +791,7 @@ def _forward_kinematics(
     elif offsets.ndim == 3:
         offsets_expanded = offsets
     else:
-        raise ValueError(
-            f"Offsets must have shape (22, 3) or (B, 22, 3), got {offsets.shape}"
-        )
+        raise ValueError(f"Offsets must have shape (22, 3) or (B, 22, 3), got {offsets.shape}")
 
     rot_matrices = cont6d_to_matrix(rotations_flat)  # (B, 22, 3, 3)
 
@@ -857,9 +810,7 @@ def _forward_kinematics(
 
             # Compute position
             offset_vec = offsets_expanded[:, child_idx].unsqueeze(-1)  # (B, 3, 1)
-            positions[:, child_idx] = (
-                torch.bmm(matR, offset_vec).squeeze(-1) + positions[:, parent_idx]
-            )
+            positions[:, child_idx] = torch.bmm(matR, offset_vec).squeeze(-1) + positions[:, parent_idx]
 
     return positions.reshape(batch_shape + (22, 3))
 
@@ -888,16 +839,10 @@ def subset_271d_to_68d(
     if x.shape[-1] != 271:
         raise ValueError(f"Expected x to have trailing dimension 271, got {x.shape}")
     if prev_frame is not None and prev_frame.shape != x.shape:
-        raise ValueError(
-            f"Expected prev_frame shape {tuple(x.shape)}, got {tuple(prev_frame.shape)}"
-        )
+        raise ValueError(f"Expected prev_frame shape {tuple(x.shape)}, got {tuple(prev_frame.shape)}")
 
     raw_x = normalizer.denormalize(x) if normalizer is not None else x
-    raw_prev = (
-        normalizer.denormalize(prev_frame)
-        if (normalizer is not None and prev_frame is not None)
-        else prev_frame
-    )
+    raw_prev = normalizer.denormalize(prev_frame) if (normalizer is not None and prev_frame is not None) else prev_frame
 
     root_height = x[..., 0:1]
     root_vel = x[..., 1:3]
@@ -919,20 +864,12 @@ def frame_271d_to_263d(
     if x.shape[-1] != 271:
         raise ValueError(f"Expected x to have trailing dimension 271, got {x.shape}")
     if prev_frame is not None and prev_frame.shape != x.shape:
-        raise ValueError(
-            f"Expected prev_frame shape {tuple(x.shape)}, got {tuple(prev_frame.shape)}"
-        )
+        raise ValueError(f"Expected prev_frame shape {tuple(x.shape)}, got {tuple(prev_frame.shape)}")
 
     raw_x = normalizer.denormalize(x) if normalizer is not None else x
-    raw_prev = (
-        normalizer.denormalize(prev_frame)
-        if (normalizer is not None and prev_frame is not None)
-        else prev_frame
-    )
+    raw_prev = normalizer.denormalize(prev_frame) if (normalizer is not None and prev_frame is not None) else prev_frame
 
-    root_rot_vel = compute_root_delta_yaw(
-        raw_x[..., 69:75], None if raw_prev is None else raw_prev[..., 69:75]
-    )
+    root_rot_vel = compute_root_delta_yaw(raw_x[..., 69:75], None if raw_prev is None else raw_prev[..., 69:75])
     root_height = x[..., 0:1]
     root_vel = x[..., 1:3]
 
@@ -942,9 +879,7 @@ def frame_271d_to_263d(
     joint_vel = x[..., 201:267]
     foot_contacts = x[..., 267:271]
 
-    return torch.cat(
-        [root_features, joint_ric, joint_rot6d, joint_vel, foot_contacts], dim=-1
-    )
+    return torch.cat([root_features, joint_ric, joint_rot6d, joint_vel, foot_contacts], dim=-1)
 
 
 def sequence_271d_to_263d(
@@ -955,25 +890,19 @@ def sequence_271d_to_263d(
     if x.shape[-1] != 271:
         raise ValueError(f"Expected x to have trailing dimension 271, got {x.shape}")
     if x.ndim not in (2, 3):
-        raise ValueError(
-            f"Expected x to have shape (T, 271) or (B, T, 271), got {tuple(x.shape)}"
-        )
+        raise ValueError(f"Expected x to have shape (T, 271) or (B, T, 271), got {tuple(x.shape)}")
 
     if x.ndim == 2:
         converted_frames = []
         prev_frame = None
         for frame in x:
-            converted_frames.append(
-                frame_271d_to_263d(frame, prev_frame=prev_frame, normalizer=normalizer)
-            )
+            converted_frames.append(frame_271d_to_263d(frame, prev_frame=prev_frame, normalizer=normalizer))
             prev_frame = frame
         return torch.stack(converted_frames, dim=0)
 
     converted_batches = []
     for batch_index in range(x.shape[0]):
-        converted_batches.append(
-            sequence_271d_to_263d(x[batch_index], normalizer=normalizer)
-        )
+        converted_batches.append(sequence_271d_to_263d(x[batch_index], normalizer=normalizer))
     return torch.stack(converted_batches, dim=0)
 
 
@@ -1019,9 +948,7 @@ class FeatureNormalizer:
             normalized_features: (..., 271) tensor of normalized features
         """
         if features.shape[-1] != 271:
-            raise ValueError(
-                f"Expected features to have shape (..., 271), got {features.shape}"
-            )
+            raise ValueError(f"Expected features to have shape (..., 271), got {features.shape}")
 
         if features.device != self.mean.device:
             self.mean = self.mean.to(features.device)
@@ -1038,9 +965,7 @@ class FeatureNormalizer:
             denormalized_features: (..., 271) tensor of denormalized features
         """
         if features.shape[-1] != 271:
-            raise ValueError(
-                f"Expected features to have shape (..., 271), got {features.shape}"
-            )
+            raise ValueError(f"Expected features to have shape (..., 271), got {features.shape}")
 
         if features.device != self.mean.device:
             self.mean = self.mean.to(features.device)
@@ -1062,9 +987,7 @@ class FeatureNormalizer:
             denormalized_flow_output: (..., 68) tensor of denormalized flow output
         """
         if flow_output.shape[-1] != 68:
-            raise ValueError(
-                f"Expected flow_output to have shape (..., 68), got {flow_output.shape}"
-            )
+            raise ValueError(f"Expected flow_output to have shape (..., 68), got {flow_output.shape}")
 
         if flow_output.device != self.mean.device:
             self.mean = self.mean.to(flow_output.device)
@@ -1102,9 +1025,7 @@ class FeatureNormalizer:
             normalized_flow_output: (..., 68) tensor of normalized flow output
         """
         if flow_output.shape[-1] != 68:
-            raise ValueError(
-                f"Expected flow_output to have shape (..., 68), got {flow_output.shape}"
-            )
+            raise ValueError(f"Expected flow_output to have shape (..., 68), got {flow_output.shape}")
 
         if flow_output.device != self.mean.device:
             self.mean = self.mean.to(flow_output.device)
@@ -1128,9 +1049,7 @@ class FeatureNormalizer:
         )
         return (flow_output - mean_68d) / std_68d
 
-    def normalize_current_frame_features(
-        self, current_frame_features: torch.Tensor
-    ) -> torch.Tensor:
+    def normalize_current_frame_features(self, current_frame_features: torch.Tensor) -> torch.Tensor:
         """
         Normalize the 257D current-frame conditioning vector for the predictor.
 
@@ -1143,8 +1062,7 @@ class FeatureNormalizer:
         """
         if current_frame_features.shape[-1] != 257:
             raise ValueError(
-                "Expected current_frame_features to have shape (..., 257), got "
-                f"{current_frame_features.shape}"
+                f"Expected current_frame_features to have shape (..., 257), got {current_frame_features.shape}"
             )
 
         if current_frame_features.device != self.mean.device:
@@ -1240,17 +1158,11 @@ def sequence_joints_to_features(
     root_features = torch.zeros(N, 3, device=device, dtype=dtype)
     root_features[:, 0] = positions[:, 0, 1]  # root height Y (keep absolute) at index 0
     if N > 1:
-        root_features[1:, 1] = (
-            positions[1:, 0, 0] - positions[:-1, 0, 0]
-        )  # vx at index 1
-        root_features[1:, 2] = (
-            positions[1:, 0, 2] - positions[:-1, 0, 2]
-        )  # vz at index 2
+        root_features[1:, 1] = positions[1:, 0, 0] - positions[:-1, 0, 0]  # vx at index 1
+        root_features[1:, 2] = positions[1:, 0, 2] - positions[:-1, 0, 2]  # vz at index 2
 
     # 2. IK for all frames
-    quaternions = _compute_ik(
-        positions, raw_offsets, kinematic_chain, face_joint_indx
-    )  # (N, 22, 4)
+    quaternions = _compute_ik(positions, raw_offsets, kinematic_chain, face_joint_indx)  # (N, 22, 4)
 
     # 3. Root rotation
     root_quat = quaternions[:, 0].clone()  # (N, 4)
@@ -1409,9 +1321,7 @@ def flow_output_to_positions(
     global_joints = new_root_pos.unsqueeze(1) + global_joint_offsets  # (B, 21, 3)
 
     # Combine root and joints: root at index 0, then 21 joints
-    positions = torch.cat(
-        [new_root_pos.unsqueeze(1), global_joints], dim=1
-    )  # (B, 22, 3)
+    positions = torch.cat([new_root_pos.unsqueeze(1), global_joints], dim=1)  # (B, 22, 3)
 
     return positions
 
@@ -1451,9 +1361,7 @@ def flow_output_to_displacements(
     # Combine: root displacement at index 0, then 21 joint displacements
     # Note: For joint 0 (root), we use the root displacement
     # For joints 1-21, we use the RIC values as displacements
-    displacements = torch.cat(
-        [root_disp.unsqueeze(1), joint_disps], dim=1
-    )  # (B, 22, 3)
+    displacements = torch.cat([root_disp.unsqueeze(1), joint_disps], dim=1)  # (B, 22, 3)
 
     return displacements
 
@@ -1507,9 +1415,7 @@ def extract_prev_frame_features(
 
     current_frame_features = torch.cat([root_features, joint_features], dim=-1)
     if normalize_output and normalizer is not None:
-        current_frame_features = normalizer.normalize_current_frame_features(
-            current_frame_features
-        )
+        current_frame_features = normalizer.normalize_current_frame_features(current_frame_features)
 
     return current_frame_features  # (B, 257)
 
@@ -1579,9 +1485,7 @@ def flow_output_to_271d(
     prev_ric = prev_frame[:, 3:69].reshape(B, 22, 3)
 
     prev_root_quat_exp = prev_root_quat.unsqueeze(1).expand(-1, 22, -1)
-    prev_positions = prev_root_pos.unsqueeze(1) + qrot(
-        qinv(prev_root_quat_exp), prev_ric
-    )
+    prev_positions = prev_root_pos.unsqueeze(1) + qrot(qinv(prev_root_quat_exp), prev_ric)
 
     # -------------------------------------------------
     # 5. Reconstruct new positions
@@ -1597,16 +1501,12 @@ def flow_output_to_271d(
 
     global_joints = new_root_pos.unsqueeze(1) + global_offsets
 
-    new_positions = torch.cat(
-        [new_root_pos.unsqueeze(1), global_joints], dim=1
-    )  # (B,22,3)
+    new_positions = torch.cat([new_root_pos.unsqueeze(1), global_joints], dim=1)  # (B,22,3)
 
     # -------------------------------------------------
     # 6. Compute rotations via IK
     # -------------------------------------------------
-    quaternions = _compute_ik(
-        new_positions, raw_offsets, kinematic_chain, face_joint_indx
-    )  # (B, 22, 4)
+    quaternions = _compute_ik(new_positions, raw_offsets, kinematic_chain, face_joint_indx)  # (B, 22, 4)
     rotations_6d = quaternion_to_cont6d(quaternions)  # (B, 22, 6)
 
     # -------------------------------------------------
@@ -1655,9 +1555,7 @@ def flow_output_to_271d(
 
 def generated_positions_to_271d(
     new_positions: torch.Tensor,  # (B, 22, 3) absolute global positions
-    prev_positions: Optional[
-        torch.Tensor
-    ] = None,  # (B, 22, 3) previous global positions
+    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous global positions
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
     fk_offsets: Optional[torch.Tensor] = None,
@@ -1697,9 +1595,7 @@ def generated_positions_to_271d(
         fk_positions: (B, 22, 3) FK-consistent positions (if fk_offsets provided), else None.
     """
     if new_positions.ndim != 3 or new_positions.shape[-2:] != (22, 3):
-        raise ValueError(
-            f"Expected new_positions shape (B, 22, 3), got {new_positions.shape}"
-        )
+        raise ValueError(f"Expected new_positions shape (B, 22, 3), got {new_positions.shape}")
 
     B = new_positions.shape[0]
     device = new_positions.device
@@ -1715,9 +1611,7 @@ def generated_positions_to_271d(
     # Resolve previous absolute positions.
     if prev_positions is not None:
         if prev_positions.shape != (B, 22, 3):
-            raise ValueError(
-                f"Expected prev_positions shape {(B, 22, 3)}, got {prev_positions.shape}"
-            )
+            raise ValueError(f"Expected prev_positions shape {(B, 22, 3)}, got {prev_positions.shape}")
         if prev_positions.device != device or prev_positions.dtype != dtype:
             prev_positions_resolved = prev_positions.to(device=device, dtype=dtype)
         else:
@@ -1726,40 +1620,26 @@ def generated_positions_to_271d(
         prev_positions_resolved = None
 
     candidate_positions = new_positions
-    _ensure_finite_tensor(
-        candidate_positions, "candidate_positions", new_positions.shape
-    )
+    _ensure_finite_tensor(candidate_positions, "candidate_positions", new_positions.shape)
     candidate_root_pos = candidate_positions[:, 0]  # (B, 3)
 
-    candidate_quaternions = _compute_ik(
-        candidate_positions, raw_offsets, kinematic_chain, face_joint_indx
-    )
-    _ensure_finite_tensor(
-        candidate_quaternions, "candidate_quaternions", new_positions.shape
-    )
+    candidate_quaternions = _compute_ik(candidate_positions, raw_offsets, kinematic_chain, face_joint_indx)
+    _ensure_finite_tensor(candidate_quaternions, "candidate_quaternions", new_positions.shape)
     candidate_rotations_6d = quaternion_to_cont6d(candidate_quaternions)  # (B,22,6)
-    _ensure_finite_tensor(
-        candidate_rotations_6d, "candidate_rotations_6d", new_positions.shape
-    )
+    _ensure_finite_tensor(candidate_rotations_6d, "candidate_rotations_6d", new_positions.shape)
 
     # Resolve the canonical pose first, then derive every returned feature from it.
     fk_positions = None
     if fk_offsets is not None:
-        fk_positions = _forward_kinematics(
-            candidate_rotations_6d, candidate_root_pos, fk_offsets, kinematic_chain
-        )
+        fk_positions = _forward_kinematics(candidate_rotations_6d, candidate_root_pos, fk_offsets, kinematic_chain)
         canonical_positions = fk_positions
     else:
         canonical_positions = candidate_positions
-    _ensure_finite_tensor(
-        canonical_positions, "canonical_positions", new_positions.shape
-    )
+    _ensure_finite_tensor(canonical_positions, "canonical_positions", new_positions.shape)
     if fk_positions is not None:
         _ensure_finite_tensor(fk_positions, "fk_positions", new_positions.shape)
 
-    quaternions = _compute_ik(
-        canonical_positions, raw_offsets, kinematic_chain, face_joint_indx
-    )
+    quaternions = _compute_ik(canonical_positions, raw_offsets, kinematic_chain, face_joint_indx)
     _ensure_finite_tensor(quaternions, "canonical_quaternions", new_positions.shape)
     rotations_6d = quaternion_to_cont6d(quaternions)  # (B,22,6)
     _ensure_finite_tensor(rotations_6d, "canonical_rotations_6d", new_positions.shape)
@@ -1865,9 +1745,7 @@ class RootPositionTracker:
         final_z = root_pos_z[:, -1]
         final_y = root_height[:, -1]
 
-        initial_root_pos = torch.stack([final_x, final_y, final_z], dim=-1).to(
-            device=device, dtype=dtype
-        )
+        initial_root_pos = torch.stack([final_x, final_y, final_z], dim=-1).to(device=device, dtype=dtype)
 
         return cls(initial_root_pos)
 
@@ -1886,8 +1764,7 @@ class RootPositionTracker:
         """
         if new_frame_271.device != self.root_pos.device:
             raise RuntimeError(
-                "Device mismatch in RootPositionTracker.update(): "
-                f"{new_frame_271.device} vs {self.root_pos.device}"
+                f"Device mismatch in RootPositionTracker.update(): {new_frame_271.device} vs {self.root_pos.device}"
             )
 
         root_height = new_frame_271[:, 0:1]
@@ -1918,10 +1795,6 @@ Feature Layout (271D) - Updated per normalization plan:
 
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
-
-from dataclasses import asdict, dataclass, field, is_dataclass
-from pathlib import Path
-from typing import Any, Optional
 
 
 @dataclass
@@ -2226,8 +2099,7 @@ Text encoding utility using CLIP model from Hugging Face Transformers.
 """
 
 import torch
-from transformers import CLIPTokenizer, CLIPTextModel
-from typing import List, Union
+from transformers import CLIPTextModel, CLIPTokenizer
 
 
 class CLIPEncoder(torch.nn.Module):
@@ -2277,9 +2149,7 @@ class CLIPEncoder(torch.nn.Module):
         # Determine device dynamically
         device = next(self.model.parameters()).device
 
-        inputs = self.tokenizer(
-            text, padding=True, truncation=True, return_tensors="pt"
-        ).to(device)
+        inputs = self.tokenizer(text, padding=True, truncation=True, return_tensors="pt").to(device)
         outputs = self.model(**inputs)
 
         # Use the pooler_output for a global representation of the sentence
@@ -2302,14 +2172,14 @@ Dataset loading and Text2Motion dataset implementation.
 Handles loading HumanML3D dataset with text-motion pairs.
 """
 
-import torch
-import numpy as np
-from os.path import join as pjoin
 import random
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from os.path import join as pjoin
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
+import torch
+from tqdm import tqdm
+
 # [internal import removed]  from utils.config import Config
 # [internal import removed]  from utils.motion_utils import FeatureNormalizer
 
@@ -2360,9 +2230,7 @@ class Text2MotionDataset(Dataset):
 
                 text_data = []
                 flag = False
-                with open(
-                    pjoin(str(text_dir), name + ".txt"), "r", encoding="utf-8"
-                ) as f:
+                with open(pjoin(str(text_dir), name + ".txt"), "r", encoding="utf-8") as f:
                     for line in f.readlines():
                         text_dict: Dict[str, Optional[Any]] = {}
                         line_split = line.strip().split("#")
@@ -2381,21 +2249,11 @@ class Text2MotionDataset(Dataset):
                         else:
                             try:
                                 n_motion = motion[int(f_tag * 20) : int(to_tag * 20)]
-                                if (len(n_motion)) < min_motion_len or (
-                                    len(n_motion) >= 200
-                                ):
+                                if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
                                     continue
-                                new_name = (
-                                    random.choice("ABCDEFGHIJKLMNOPQRSTUVW")
-                                    + "_"
-                                    + name
-                                )
+                                new_name = random.choice("ABCDEFGHIJKLMNOPQRSTUVW") + "_" + name
                                 while new_name in data_dict:
-                                    new_name = (
-                                        random.choice("ABCDEFGHIJKLMNOPQRSTUVW")
-                                        + "_"
-                                        + name
-                                    )
+                                    new_name = random.choice("ABCDEFGHIJKLMNOPQRSTUVW") + "_" + name
                                 n_joints = joints[int(f_tag * 20) : int(to_tag * 20)]
                                 data_dict[new_name] = {
                                     "motion": n_motion,
@@ -2418,7 +2276,7 @@ class Text2MotionDataset(Dataset):
                     }
                     new_name_list.append(name)
                     length_list.append(len(motion))
-            except Exception as e:
+            except Exception:
                 pass
 
         name_length_pairs = list(zip(new_name_list, length_list))
@@ -2460,9 +2318,7 @@ class Text2MotionDataset(Dataset):
             clip_encoder.to(config.device)
 
             batch_size = 32
-            for i in tqdm(
-                range(0, len(missing_captions), batch_size), desc="Encoding Texts"
-            ):
+            for i in tqdm(range(0, len(missing_captions), batch_size), desc="Encoding Texts"):
                 batch_caps = missing_captions[i : i + batch_size]
                 with torch.no_grad():
                     # (B, 1, 512) - pooled CLIP embeddings
@@ -2776,11 +2632,11 @@ Motion visualization utilities.
 Provides 3D animation and comparison visualization for motion sequences.
 """
 
-import numpy as np
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 from pathlib import Path
-from typing import Optional, Any
+
+import matplotlib.pyplot as plt
+import numpy as np
+
 # [internal import removed]  from utils.motion_utils import T2M_KINEMATIC_CHAIN
 
 
@@ -2849,9 +2705,10 @@ def plot_3d_motion(
     probe: bool = False,
     save_path: Optional[Path] = None,
 ):
-    import imageio
-    import io
     import base64
+    import io
+
+    import imageio
     from IPython.display import HTML
 
     colors = ["#2980b9", "#c0392b", "#27ae60", "#f39c12", "#8e44ad"]
@@ -2930,9 +2787,7 @@ def plot_3d_motion(
 
     target.seek(0)
     b64 = base64.b64encode(target.read()).decode()
-    return HTML(
-        f'<video controls width="600"><source src="data:video/mp4;base64,{b64}"></video>'
-    )
+    return HTML(f'<video controls width="600"><source src="data:video/mp4;base64,{b64}"></video>')
 
 
 def plot_3d_motion_plotly(
@@ -3014,9 +2869,7 @@ def plot_3d_motion_plotly(
         frame_data = []
         for i, c_indices in enumerate(T2M_KINEMATIC_CHAIN):
             joints = motion[frame_idx, c_indices, :]
-            frame_data.append(
-                go.Scatter3d(x=joints[:, 0], y=joints[:, 2], z=joints[:, 1])
-            )
+            frame_data.append(go.Scatter3d(x=joints[:, 0], y=joints[:, 2], z=joints[:, 1]))
 
         layout_update = {}
         if follow_root:
@@ -3028,9 +2881,7 @@ def plot_3d_motion_plotly(
                 )
             )
 
-        frames.append(
-            go.Frame(data=frame_data, name=str(frame_idx), layout=layout_update)
-        )
+        frames.append(go.Frame(data=frame_data, name=str(frame_idx), layout=layout_update))
 
     fig = go.Figure(data=initial_data, frames=frames)
 
@@ -3207,9 +3058,7 @@ def visualize_motion(
             backend = "matplotlib"
 
     if backend == "matplotlib":
-        html = plot_3d_motion(
-            motion_subsampled, radius=radius, fps=fps, title=title, probe=probe
-        )
+        html = plot_3d_motion(motion_subsampled, radius=radius, fps=fps, title=title, probe=probe)
 
         # if save_path:
         #     # imageio needs a real file for saving; re-render to disk
@@ -3265,10 +3114,6 @@ Usage:
     logger.finish()
 """
 
-import os
-import sys
-from datetime import datetime
-from typing import Optional, Dict, Any
 
 # Check if wandb is available
 try:
@@ -3390,9 +3235,7 @@ class WandbLogger:
             except Exception as e:
                 print(f"[WandbLogger] Authentication failed: {e}")
         else:
-            print(
-                "[WandbLogger] No API key found. Using existing login or anonymous mode."
-            )
+            print("[WandbLogger] No API key found. Using existing login or anonymous mode.")
 
     def log(
         self,
@@ -3518,15 +3361,11 @@ Compatible with 271D custom feature format from motion_utils.py:
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
-import os
 import pathlib
-from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 from transformers.activations import ACT2FN
 
 # [internal import removed]  from utils.config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
@@ -4225,11 +4064,9 @@ __all__ = sorted(  # pyright: ignore[reportUnsupportedDunderAll]
 
 # ========== models/motion_history_encoder.py ==========
 
-from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 # [internal import removed]  from utils.config import MotionHistoryEncoderConfig
 # [internal import removed]  from utils.models import AdaLN, GatedMLP, TemporalCacheState, TemporalLayerCache, TemporalRoPEAttention
@@ -4577,7 +4414,6 @@ class JepaPredictor(nn.Module):
 
 # ========== models/flow_matching_predictor.py ==========
 
-from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
@@ -4861,17 +4697,11 @@ Designed for direct use in Kaggle notebooks with minimal boilerplate.
 """
 
 
-import copy
-import sys
-from typing import Any, Dict, Tuple, Generic, TypeVar, Union, Mapping as MappingABC
-from enum import Enum
 from pathlib import Path
+from typing import Mapping as MappingABC
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
 from ignite.engine import Engine, Events, State
 from ignite.handlers import (
     Checkpoint,
@@ -4916,22 +4746,12 @@ class ProgressScheduler:
                 if interp == InterpEnum.NONE:
                     return self.value[i - 1]
                 elif interp == InterpEnum.LINEAR:
-                    ratio = (progress - self.progress[i - 1]) / (
-                        self.progress[i] - self.progress[i - 1]
-                    )
-                    return self.value[i - 1] + ratio * (
-                        self.value[i] - self.value[i - 1]
-                    )
+                    ratio = (progress - self.progress[i - 1]) / (self.progress[i] - self.progress[i - 1])
+                    return self.value[i - 1] + ratio * (self.value[i] - self.value[i - 1])
                 elif interp == InterpEnum.CUBIC:
-                    ratio = (progress - self.progress[i - 1]) / (
-                        self.progress[i] - self.progress[i - 1]
-                    )
-                    ratio_cubic = (
-                        3 * ratio**2 - 2 * ratio**3
-                    )  # Smooth cubic interpolation
-                    return self.value[i - 1] + ratio_cubic * (
-                        self.value[i] - self.value[i - 1]
-                    )
+                    ratio = (progress - self.progress[i - 1]) / (self.progress[i] - self.progress[i - 1])
+                    ratio_cubic = 3 * ratio**2 - 2 * ratio**3  # Smooth cubic interpolation
+                    return self.value[i - 1] + ratio_cubic * (self.value[i] - self.value[i - 1])
                 else:
                     raise ValueError(f"Unsupported interpolation type: {interp}")
 
@@ -4951,11 +4771,7 @@ class PretrainState(State):
 
     def epoch_progress(self, config: Config) -> float:
         """Return progress through current epoch as a float in [0, 1]."""
-        return (
-            self.epoch / float(config.get_num_epochs())
-            if config.get_num_epochs() > 0
-            else 0.0
-        )
+        return self.epoch / float(config.get_num_epochs()) if config.get_num_epochs() > 0 else 0.0
 
 
 class PretrainEngine(Engine):
@@ -5043,23 +4859,15 @@ class PretrainTrainer:
         # Device and AMP setup
         self.device = torch.device(config.device)
         self.use_amp = self.device.type == "cuda"
-        self.amp_dtype = (
-            torch.bfloat16
-            if self.use_amp and torch.cuda.is_bf16_supported()
-            else torch.float16
-        )
+        self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
         # Models - built internally
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config.encoder_config)
         self.jepa_predictor: JepaPredictor = JepaPredictor(config.encoder_config)
 
         # EMA models
-        self.ema_encoder: EMAModel = EMAModel(
-            self.encoder, decay=float(config.ema_decay)
-        )
-        self.ema_jepa: EMAModel = EMAModel(
-            self.jepa_predictor, decay=float(config.ema_decay)
-        )
+        self.ema_encoder: EMAModel = EMAModel(self.encoder, decay=float(config.ema_decay))
+        self.ema_jepa: EMAModel = EMAModel(self.jepa_predictor, decay=float(config.ema_decay))
 
         probe_hidden = getattr(config.encoder_config, "hidden_size", 512)
         probe_text_dim = getattr(config.encoder_config, "text_embedding_dim", 512)
@@ -5083,9 +4891,7 @@ class PretrainTrainer:
         # W&B logger
         self.wandb_logger: WandbLogger | None = None
 
-        self.accumulation_steps = (
-            config.effective_batch_size // config.batch_size
-        ) or 1
+        self.accumulation_steps = (config.effective_batch_size // config.batch_size) or 1
         # Initialize all objects
         self._initialize()
 
@@ -5110,16 +4916,12 @@ class PretrainTrainer:
                     "ema_decay": float(self.config.ema_decay),
                     "batch_size": self.train_loader.batch_size,
                     "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
-                    "jepa_params": sum(
-                        p.numel() for p in self.jepa_predictor.parameters()
-                    ),
+                    "jepa_params": sum(p.numel() for p in self.jepa_predictor.parameters()),
                     "phase": "pretrain",
                 },
             )
 
-    def _train_step(
-        self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
+    def _train_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one pretraining step."""
         # Prepare batch
         motion = batch["motion"].to(self.device)
@@ -5128,23 +4930,16 @@ class PretrainTrainer:
         text = batch["text_clip"].to(self.device)
 
         if motion.ndim != 3 or motion.shape[1] < 2:
-            raise ValueError(
-                f"Expected motion (B, torch.Tensor, 271), got {tuple(motion.shape)}"
-            )
+            raise ValueError(f"Expected motion (B, torch.Tensor, 271), got {tuple(motion.shape)}")
 
         batch_size, seq_len, _ = motion.shape
         num_masked = max(1, int(seq_len * 0.25))
 
         # Build mask
         mask_indices = torch.stack(
-            [
-                torch.randperm(seq_len, device=self.device)[:num_masked]
-                for _ in range(batch_size)
-            ]
+            [torch.randperm(seq_len, device=self.device)[:num_masked] for _ in range(batch_size)]
         )
-        mask_bool = torch.zeros(
-            batch_size, seq_len, dtype=torch.bool, device=self.device
-        )
+        mask_bool = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=self.device)
         for b in range(batch_size):
             mask_bool[b, mask_indices[b]] = True
 
@@ -5162,43 +4957,27 @@ class PretrainTrainer:
             enabled=self.use_amp,
         ):
             text_emb = text[:, 0, :] if text.ndim == 3 else text
-            masked_context = self.encoder(
-                motion, torch.zeros_like(text_emb), mask=mask_bool, return_all=True
-            )
+            masked_context = self.encoder(motion, torch.zeros_like(text_emb), mask=mask_bool, return_all=True)
 
             with torch.no_grad():
                 target_encoder = self.ema_encoder.model
                 target_encoder.eval()
-                target_context = target_encoder(
-                    motion, torch.zeros_like(text_emb), mask=None, return_all=True
-                ).detach()
+                target_context = target_encoder(motion, torch.zeros_like(text_emb), mask=None, return_all=True).detach()
 
             # Extract masked tokens
-            b_idx = (
-                torch.arange(batch_size, device=self.device)
-                .unsqueeze(1)
-                .expand(-1, num_masked)
-            )
-            masked_tokens = masked_context[b_idx, mask_indices, :].reshape(
-                batch_size * num_masked, -1
-            )
-            target_masked = target_context[b_idx, mask_indices, :].reshape(
-                batch_size * num_masked, -1
-            )
+            b_idx = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, num_masked)
+            masked_tokens = masked_context[b_idx, mask_indices, :].reshape(batch_size * num_masked, -1)
+            target_masked = target_context[b_idx, mask_indices, :].reshape(batch_size * num_masked, -1)
 
             predicted = self.jepa_predictor(masked_tokens)
             mask_loss = F.smooth_l1_loss(predicted, target_masked)
 
-            token_diff = F.smooth_l1_loss(
-                masked_context, target_context, reduction="none"
-            ).mean(dim=-1)
+            token_diff = F.smooth_l1_loss(masked_context, target_context, reduction="none").mean(dim=-1)
 
             # Compute distance of each position to nearest masked position
             # pos: (1, seq_len, 1), mask_idx_exp: (B, 1, num_masked)
             # distances: (B, seq_len, num_masked)
-            pos = torch.arange(seq_len, device=self.device)[
-                None, :, None
-            ]  # (1, seq_len, 1)
+            pos = torch.arange(seq_len, device=self.device)[None, :, None]  # (1, seq_len, 1)
             mask_idx_exp = mask_indices.unsqueeze(1)  # (B, 1, num_masked)
             distances = torch.abs(
                 pos - mask_idx_exp
@@ -5216,9 +4995,7 @@ class PretrainTrainer:
             probe_out = self.linear_probe(target_context)
             probe_out = F.normalize(probe_out, dim=-1)
             normalized_text = F.normalize(text_emb, dim=-1)
-            probe_loss = (
-                1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
-            )
+            probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
 
         engine.state.metrics["mask_loss"] = float(mask_loss.detach().item())
         engine.state.metrics["context_loss"] = float(context_loss.detach().item())
@@ -5238,9 +5015,7 @@ class PretrainTrainer:
 
             # Update engine state
             loss_val = float(loss.detach().item())
-            engine.state.metrics["global_step"] = (
-                engine.state.iteration // self.accumulation_steps
-            )
+            engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
             engine.state.metrics["best_train_loss"] = min(
                 float(engine.state.metrics.get("best_train_loss", float("inf"))),
                 loss_val,
@@ -5252,9 +5027,7 @@ class PretrainTrainer:
             "probe_loss": probe_loss.detach(),
         }
 
-    def _val_step(
-        self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
+    def _val_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one validation step."""
         motion = batch["motion"].to(self.device)
         if self.normalizer is not None:
@@ -5266,29 +5039,21 @@ class PretrainTrainer:
 
         with torch.no_grad():
             text_emb = text[:, 0, :] if text.ndim == 3 else text
-            hidden_states = self.encoder(
-                motion, torch.zeros_like(text_emb), return_all=True
-            ).detach()
+            hidden_states = self.encoder(motion, torch.zeros_like(text_emb), return_all=True).detach()
             probe_out = self.linear_probe(hidden_states)
             probe_out = F.normalize(probe_out, dim=-1)
             normalized_text = F.normalize(text_emb, dim=-1)
-            probe_loss = (
-                1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
-            )
+            probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
 
         metrics: Dict[str, torch.Tensor] = {"val_loss": probe_loss.detach()}
 
         return metrics
 
-    def _attach_handlers(
-        self, trainer: PretrainEngine, evaluator: PretrainEngine
-    ) -> None:
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         """Attach Ignite event handlers for training orchestration."""
         # Running averages
         RunningAverage(output_transform=lambda o: o["loss"]).attach(trainer, "loss")
-        RunningAverage(output_transform=lambda o: o["val_loss"]).attach(
-            evaluator, "val_loss"
-        )
+        RunningAverage(output_transform=lambda o: o["val_loss"]).attach(evaluator, "val_loss")
 
         # NaN termination
         trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
@@ -5318,14 +5083,10 @@ class PretrainTrainer:
 
         @trainer.on(Events.GET_BATCH_STARTED)
         def _set_horizon(engine: PretrainEngine) -> None:
-            from typing import cast
-
             engine.state.dataloader.dataset.set_horizon(engine.state.horizon)
 
         @evaluator.on(Events.ITERATION_COMPLETED)
         def _set_horizon_eval(engine: PretrainEngine) -> None:
-            from typing import cast
-
             engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)
 
         # Best checkpoint handler
@@ -5366,9 +5127,7 @@ class PretrainTrainer:
             latest_checkpoint,
         )
 
-        @trainer.on(
-            Events.EPOCH_COMPLETED(every=getattr(self.config, "val_interval", 10))
-        )
+        @trainer.on(Events.EPOCH_COMPLETED(every=getattr(self.config, "val_interval", 10)))
         def _run_validation(engine: PretrainEngine) -> None:
             evaluator.run(self.val_loader)
 
@@ -5390,9 +5149,7 @@ class PretrainTrainer:
                         {
                             "val/loss": val_loss,
                             "val/epoch": int(trainer.state.epoch),
-                            "train/global_step": int(
-                                trainer.state.metrics.get("global_step", 0)
-                            ),
+                            "train/global_step": int(trainer.state.metrics.get("global_step", 0)),
                         },
                         step=int(trainer.state.metrics.get("global_step", 0)),
                     )
@@ -5461,17 +5218,9 @@ Designed for direct use in Kaggle notebooks with minimal boilerplate.
 """
 
 
-import copy
-from typing import Any, Dict, Tuple
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
-from ignite.engine import Engine, Events
-from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, global_step_from_engine
-from ignite.metrics import RunningAverage
+from ignite.engine import Engine
 
 # [internal import removed]  from utils.config import Config
 # [internal import removed]  from utils.models import MotionHistoryEncoder, FlowMatchingPredictor
@@ -5557,7 +5306,7 @@ class EMAModel(nn.Module):
 class FiTrainer:
     """
     Flow matching fine-tuning trainer with curriculum support.
-    
+
     Fully self-contained: builds models, optimizer, and Ignite engine.
     Usage:
         trainer = FiTrainer(config=config, train_loader=train_loader, val_loader=val_loader)
@@ -5581,11 +5330,7 @@ class FiTrainer:
         # Device and AMP setup
         self.device = torch.device(config.device)
         self.use_amp = self.device.type == "cuda"
-        self.amp_dtype = (
-            torch.bfloat16
-            if self.use_amp and torch.cuda.is_bf16_supported()
-            else torch.float16
-        )
+        self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
         # Models - built internally
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config.encoder_config)
@@ -5717,7 +5462,9 @@ class FiTrainer:
                 pred_x1 = xt[t_thresh_mask] + predicted_flow[t_thresh_mask] * (1 - t.unsqueeze(1)[t_thresh_mask])
 
                 flow_raw = self.normalizer.denormalize_flow_output(pred_x1) if self.normalizer else pred_x1
-                x1_raw = self.normalizer.denormalize_flow_output(x1[t_thresh_mask]) if self.normalizer else x1[t_thresh_mask]
+                x1_raw = (
+                    self.normalizer.denormalize_flow_output(x1[t_thresh_mask]) if self.normalizer else x1[t_thresh_mask]
+                )
 
                 # Root loss
                 root_loss = F.mse_loss(flow_raw[:, :3], x1_raw[:, :3])
@@ -5914,7 +5661,7 @@ def train_finetune(
 ) -> Tuple[EMAModel, EMAModel]:
     """
     Fine-tune with flow matching objective in a single call.
-    
+
     Args:
         config: Training configuration
         train_loader: Training data loader
@@ -5922,7 +5669,7 @@ def train_finetune(
         normalizer: Optional feature normalizer
         wandb_project: Optional W&B project name
         max_epochs: Override number of epochs (uses config default if None)
-    
+
     Returns:
         Tuple of (ema_encoder, ema_predictor)
     """
