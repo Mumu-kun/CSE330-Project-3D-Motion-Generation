@@ -27,14 +27,14 @@ from ignite.handlers import (
     global_step_from_engine,
 )
 from ignite.handlers.tqdm_logger import ProgressBar
-from ignite.metrics import RunningAverage
 from torch.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
 
 from utils.config import Config
 from utils.dataset import create_dataloader
+from utils.models.flow_matching_predictor import LatentDecoder
 from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
-from utils.motion_utils import FeatureNormalizer
+from utils.motion_utils import F as Features
+from utils.motion_utils import x68_to_x271, x271_to_x68
 from utils.wandb_logger import WandbLogger
 
 
@@ -120,6 +120,49 @@ class PretrainEngine(Engine):
         super().__init__(process_function)
         self.state = PretrainState()
 
+    def get_metric(self, name: str, *args, **kwargs):
+        """Get a metric value by name."""
+        return self.state.metrics.get(name, *args, **kwargs)
+
+    def get_metrics(self, names: list[str], prefix: str = "") -> dict[str, Any]:
+        """Get specified metrics as a dict."""
+        return {f"{prefix}{name}": self.state.metrics.get(name) for name in names}
+
+    def set_metrics(self, pairs: list[tuple[str, Any]]) -> None:
+        """Set multiple metrics at once."""
+        for name, value in pairs:
+            self.state.metrics[name] = value
+
+    def clear_metrics(self, names: list[str]) -> None:
+        """Clear specified metrics."""
+        for name in names:
+            self.state.metrics.pop(name, None)
+
+    def csa_op_metrics(self, pairs: list[tuple[str, float]], scalers: float | list[float], clear: bool = False) -> None:
+        """Add a value to an existing metric (useful for running totals)."""
+        if clear:
+            self.clear_metrics([name for name, _ in pairs])
+        if not isinstance(scalers, list):
+            scalers = [scalers for _ in pairs]
+        for (name, value), scaler in zip(pairs, scalers):
+            self.state.metrics[name] = self.state.metrics.get(name, 0.0) + value * scaler
+
+
+def random_span_mask(
+    seq_len: int,
+    num_spans: int = 2,
+    min_span: int = 8,
+    max_span: int = 20,
+):
+    mask = torch.zeros(seq_len, dtype=torch.bool)
+
+    for _ in range(num_spans):
+        span = torch.randint(min_span, max_span + 1, ()).item()
+        start = torch.randint(0, int(max(1, seq_len - span + 1)), ()).item()
+        mask[start : start + span] = True
+
+    return mask
+
 
 T = TypeVar("T", bound=nn.Module)
 
@@ -194,32 +237,19 @@ class PretrainTrainer:
         self.use_amp = self.device.type == "cuda"
         self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
+        self.scaler: GradScaler = GradScaler(self.device.type, enabled=self.use_amp)
+
         # Models - built internally
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config.encoder_config)
         self.jepa_predictor: JepaPredictor = JepaPredictor(config.encoder_config)
-
-        # EMA models
-        self.ema_encoder: EMAModel = EMAModel(self.encoder, decay=float(config.ema_decay))
-        self.ema_jepa: EMAModel = EMAModel(self.jepa_predictor, decay=float(config.ema_decay))
+        self.decoder: LatentDecoder = LatentDecoder(config)
 
         self.linear_probe: LinearProbe = LinearProbe(
             hidden_size=config.encoder_config.hidden_size,
             text_embedding_dim=config.text_embedding_dim,
         ).to(self.device)
 
-        self._log_model_parameters(self.encoder, self.jepa_predictor, self.linear_probe)
-
-        self.optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            list(self.encoder.parameters()) + list(self.jepa_predictor.parameters()),
-            lr=float(config.learning_rate),
-            weight_decay=float(config.weight_decay),
-        )
-        self.probe_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            self.linear_probe.parameters(),
-            lr=float(config.learning_rate),
-            weight_decay=float(config.weight_decay),
-        )
-        self.scaler: GradScaler = GradScaler("cuda", enabled=self.use_amp)
+        self._log_model_parameters(self.encoder, self.jepa_predictor, self.linear_probe, self.decoder)
 
         # W&B logger
         self.wandb_logger: WandbLogger | None = None
@@ -241,11 +271,26 @@ class PretrainTrainer:
         self.train_loader, self.normalizer = create_dataloader(config, "train", shuffle=True)
         self.val_loader, _ = create_dataloader(config, "val", shuffle=False)
 
+        self.optimizer: torch.optim.Optimizer = torch.optim.AdamW(
+            list(self.encoder.parameters()) + list(self.jepa_predictor.parameters()),
+            lr=float(config.learning_rate),
+            weight_decay=float(config.weight_decay),
+        )
+        self.aux_optimizer: torch.optim.Optimizer = torch.optim.AdamW(
+            list(self.linear_probe.parameters()) + list(self.decoder.parameters()),
+            lr=float(config.learning_rate),
+            weight_decay=float(config.weight_decay),
+        )
+
+        # EMA models
+        self.ema_encoder: EMAModel = EMAModel(self.encoder, decay=float(config.ema_decay))
+
         # Move to device
         self.encoder.to(self.device)
         self.jepa_predictor.to(self.device)
+        self.linear_probe.to(self.device)
+        self.decoder.to(self.device)
         self.ema_encoder.to(self.device)
-        self.ema_jepa.to(self.device)
 
         self.accumulation_steps = ceil(config.effective_batch_size / config.batch_size) or 1
 
@@ -262,13 +307,15 @@ class PretrainTrainer:
             pct_start=pct_start,
             anneal_strategy="cos",
         )
-        self.probe_lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.probe_optimizer,
+        self.aux_lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.aux_optimizer,
             max_lr=float(config.learning_rate),
             total_steps=total_steps,
             pct_start=pct_start,
             anneal_strategy="cos",
         )
+
+        self.resume_id = None
 
         # Setup W&B
         if self.wandb_project:
@@ -280,17 +327,22 @@ class PretrainTrainer:
                     "weight_decay": float(self.config.weight_decay),
                     "ema_decay": float(self.config.ema_decay),
                     "batch_size": self.train_loader.batch_size,
+                    "effective_batch_size": self.config.effective_batch_size,
                     "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
                     "jepa_params": sum(p.numel() for p in self.jepa_predictor.parameters()),
                     "phase": "pretrain",
                     "session_id": self.session_id,
                 },
+                resume_id=self.resume_id if self.resume_id else None,
             )
+
+            self.resume_id = self.wandb_logger.run.id if self.wandb_logger.run else None
+            print(f"Initialized W&B run with ID: {self.resume_id}")
 
     @staticmethod
     def _log_model_parameters(
-        encoder: MotionHistoryEncoder, jepa_predictor: JepaPredictor, linear_probe: LinearProbe
-    ) -> Tuple[int, int, int]:
+        encoder: MotionHistoryEncoder, jepa_predictor: JepaPredictor, linear_probe: LinearProbe, decoder: LatentDecoder
+    ) -> dict[str, int]:
         """Print total and category-wise parameter counts for all models."""
 
         def _print_model_summary(name: str, model: nn.Module) -> int:
@@ -342,34 +394,97 @@ class PretrainTrainer:
         p_enc = _print_model_summary("MotionHistoryEncoder", encoder)
         p_jepa = _print_model_summary("JepaPredictor", jepa_predictor)
         p_linear = _print_model_summary("LinearProbe", linear_probe)
+        p_decoder = _print_model_summary("LatentDecoder", decoder)
 
-        return p_enc, p_jepa, p_linear
+        return {
+            "encoder": p_enc,
+            "jepa_predictor": p_jepa,
+            "linear_probe": p_linear,
+            "decoder": p_decoder,
+        }
 
     def _train_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one pretraining step."""
-        # Prepare batch
-        motion = batch["motion"].to(self.device)
-        motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
-
-        if motion.ndim != 3 or motion.shape[1] < 2:
-            raise ValueError(f"Expected motion (B, torch.Tensor, 271), got {tuple(motion.shape)}")
-
-        batch_size, seq_len, _ = motion.shape
-        num_masked = max(1, int(seq_len * 0.25))
-
-        # Build mask
-        mask_indices = torch.stack(
-            [torch.randperm(seq_len, device=self.device)[:num_masked] for _ in range(batch_size)]
-        )
-        mask_bool = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=self.device)
-        for b in range(batch_size):
-            mask_bool[b, mask_indices[b]] = True
 
         # Forward pass
         self.encoder.train()
         self.jepa_predictor.train()
         self.linear_probe.train()
+        self.decoder.train()
+
+        # Prepare batch
+        motion = batch["motion"].to(self.device)
+        motion = self.normalizer.normalize(motion)
+        text = batch["text_clip"].to(self.device)
+        joints = batch["joints"].to(self.device)
+
+        if motion.ndim != 3 or motion.shape[1] < 2:
+            raise ValueError(f"Expected motion (B, T, 271), got {tuple(motion.shape)}")
+
+        losses = self._compute_loss(engine, motion, joints, text)
+
+        loss = losses["loss"]
+        probe_loss = losses["probe_loss"]
+        decoder_loss = losses["decoder_loss"]
+
+        self.scaler.scale(loss / self.accumulation_steps).backward()
+        self.scaler.scale(probe_loss / self.accumulation_steps).backward()
+        self.scaler.scale(decoder_loss / self.accumulation_steps).backward()
+
+        if engine.state.iteration % self.accumulation_steps == 0:
+            self.scaler.step(self.optimizer)
+            self.scaler.step(self.aux_optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+            self.aux_optimizer.zero_grad(set_to_none=True)
+
+            self.ema_encoder.update(self.encoder)
+            self.lr_scheduler.step()
+            self.aux_lr_scheduler.step()
+
+            engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
+
+        return {
+            "loss": loss.detach(),
+            "lr": losses["lr"],
+            "probe_loss": probe_loss.detach(),
+            "decoder_loss": decoder_loss.detach(),
+        }
+
+    def _val_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Execute one validation step."""
+        if self.config.val_use_ema:
+            self.ema_encoder.model.eval()
+        else:
+            self.encoder.eval()
+        self.jepa_predictor.eval()
+        self.linear_probe.eval()
+        self.decoder.eval()
+
+        motion = batch["motion"].to(self.device)
+        motion = self.normalizer.normalize(motion)
+        text = batch["text_clip"].to(self.device)
+        joints = batch["joints"].to(self.device)
+
+        with torch.no_grad():
+            losses = self._compute_loss(engine, motion, joints, text)
+
+        return {
+            "lr": losses["lr"],
+            "val_loss": losses["loss"],
+            "val_probe_loss": losses["probe_loss"],
+            "val_decoder_loss": losses["decoder_loss"],
+        }
+
+    def _compute_loss(
+        self, engine: PretrainEngine, motion: torch.Tensor, joints: torch.Tensor, text: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        batch_size, seq_len, _ = motion.shape
+
+        # Build mask
+        mask_bool = (
+            random_span_mask(seq_len, num_spans=2, min_span=2, max_span=4).unsqueeze(0).expand(batch_size, -1)
+        ).to(self.device)  # (B, seq_len)
 
         with torch.amp.autocast(  # type: ignore
             device_type=self.device.type,
@@ -390,98 +505,133 @@ class PretrainTrainer:
 
             _, _, L, H = masked_context.shape
 
-            # Extract masked tokens
-            b_idx = torch.arange(batch_size, device=self.device).unsqueeze(1).expand(-1, num_masked)  # (B, num_masked)
-
             predicted = self.jepa_predictor(masked_context)  # (B, seq_len, L, H)
 
+            #
+            # Compute Loss
+            #
             _loss = F.smooth_l1_loss(predicted, target_context, reduction="none").mean(dim=(2, 3))  # (B, seq_len)
-            mask_loss = _loss[b_idx, mask_indices].mean()
-
-            # Compute distance of each position to nearest masked position
-            # pos: (1, seq_len, 1), mask_idx_exp: (B, 1, num_masked)
-            # distances: (B, seq_len, num_masked)
-            pos = torch.arange(seq_len, device=self.device)[None, :, None]  # (1, seq_len, 1)
-            mask_idx_exp = mask_indices.unsqueeze(1)  # (B, 1, num_masked)
-            distances = torch.abs(
-                pos - mask_idx_exp
-            )  # (1, seq_len, 1) - (B, 1, num_masked) -> (B, seq_len, num_masked)
-            min_distances = distances.min(dim=2).values  # (B, seq_len)
-
-            weights = 1.0 / torch.sqrt(min_distances + 1.0)  # (B, seq_len)
-
-            unmasked_bool = ~mask_bool  # (B, seq_len)
-            context_loss = (_loss * unmasked_bool.float() * weights).sum()
-            context_loss = context_loss / (unmasked_bool.sum().float() + 1e-8)
-
+            # Extract masked tokens
+            mask_loss = (_loss * mask_bool.float()).sum() / mask_bool.sum().clamp(min=1)
+            context_loss = self._context_loss(engine, _loss, mask_bool)
             loss = mask_loss + context_loss * self.config.jepa_ctx_weight
 
+            #
+            # Linear probe loss (cosine similarity between predicted context and text embedding)
+            #
             probe_out = self.linear_probe(target_context[:, :, -1, :])  # Use last layer's output for probing
             probe_out = F.normalize(probe_out, dim=-1)
             normalized_text = F.normalize(text_emb, dim=-1)
             probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
 
-        engine.state.metrics["mask_loss"] = float(mask_loss.detach().item())
-        engine.state.metrics["context_loss"] = float(context_loss.detach().item())
+            #
+            # Decoder loss
+            #
+            latent = target_context[:, 1:, -1, :]  # (B, seq_len-1, H_enc)
+            decoded = self.decoder(latent)  # (B, seq_len-1, 68)
 
-        self.scaler.scale(loss / self.accumulation_steps).backward()
-        self.scaler.scale(probe_loss / self.accumulation_steps).backward()
+            decoder_losses = self._decoder_loss(engine, motion, joints, decoded)
+            decoder_loss = decoder_losses["decoder_loss"]
 
-        if engine.state.iteration % self.accumulation_steps == 0:
-            self.scaler.step(self.optimizer)
-            self.scaler.step(self.probe_optimizer)
-            self.scaler.update()
-            self.optimizer.zero_grad(set_to_none=True)
-            self.probe_optimizer.zero_grad(set_to_none=True)
-
-            self.ema_encoder.update(self.encoder)
-            self.ema_jepa.update(self.jepa_predictor)
-            self.lr_scheduler.step()
-            self.probe_lr_scheduler.step()
-
-            loss_val = float(loss.detach().item())
-            engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
-            engine.state.metrics["best_train_loss"] = min(
-                float(engine.state.metrics.get("best_train_loss", float("inf"))),
-                loss_val,
-            )
+        engine.csa_op_metrics(
+            [
+                ("loss", loss.detach().item()),
+                ("mask_loss", mask_loss.detach().item()),
+                ("context_loss", context_loss.detach().item()),
+                ("probe_loss", probe_loss.detach().item()),
+            ],
+            1.0 / self.accumulation_steps,
+            engine.state.iteration % self.accumulation_steps == 1,  # Clear on first step of accumulation
+        )
 
         return {
-            "loss": loss.detach(),
+            "loss": loss,
             "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
-            "probe_loss": probe_loss.detach(),
+            "probe_loss": probe_loss,
+            "decoder_loss": decoder_loss,
         }
 
-    def _val_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Execute one validation step."""
-        motion = batch["motion"].to(self.device)
-        motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
+    def _context_loss(self, engine: PretrainEngine, _loss: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len = mask_bool.shape
+        all_mask_indices = [
+            mask_bool[b].nonzero(as_tuple=False).squeeze(1)  # (num_masked_b,)
+            for b in range(batch_size)
+        ]
 
-        if self.config.val_use_ema:
-            self.ema_encoder.model.eval()
-        else:
-            self.encoder.eval()
-        self.linear_probe.eval()
+        pos = torch.arange(seq_len, device=self.device)  # (seq_len,)
+        weights = torch.zeros(batch_size, seq_len, device=self.device)
 
-        with torch.no_grad():
-            text_emb = text[:, -1, :] if text.ndim == 3 else text
-            encoder_model = self.ema_encoder.model if self.config.val_use_ema else self.encoder
-            hidden_states = encoder_model(motion, torch.zeros_like(text_emb)).detach()
-            probe_out = self.linear_probe(hidden_states)
-            probe_out = F.normalize(probe_out, dim=-1)
-            normalized_text = F.normalize(text_emb, dim=-1)
-            probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
+        # Compute distance of each position to nearest masked position
+        pos_exp = pos.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1)
+        mask_idx_exp = torch.stack(all_mask_indices).unsqueeze(1)  # (B, 1, num_masked)
+        distances = (pos_exp - mask_idx_exp).abs()  # (B, seq_len, num_masked)
+        min_distances = distances.min(dim=2).values  # (B, seq_len)
+        weights = 1.0 / torch.sqrt(min_distances + 1e-8)  # Higher weight = closer to masked
+        weights[mask_bool] = 0.0  # Masked positions don't contribute to context loss
 
-        metrics: Dict[str, torch.Tensor] = {"val_loss": probe_loss.detach()}
+        unmasked_bool = ~mask_bool  # (B, seq_len)
+        context_loss = (_loss * unmasked_bool.float() * weights.detach()).sum() / (unmasked_bool.sum().float() + 1e-8)
 
-        return metrics
+        return context_loss
+
+    def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
+        prev_positions = joints[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 22, 3)
+        prev_frames = motion[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 271)
+        y_frames = motion[:, 1:, :].flatten(0, 1)  # (B * (seq_len-1), 271)
+        decoded = decoded.flatten(0, 1)  # (B * (seq_len-1), 68)
+
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_frames)  # (B * (seq_len-1), 68)
+        y_vel = y_frames[..., Features.VEL]  # (B * (seq_len-1), 66)
+        y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
+
+        dec_271d = x68_to_x271(decoded, self.normalizer, prev_positions, prev_frames)  # (B * (seq_len-1), 271)
+        dec_vel = dec_271d[..., Features.VEL]  # (B * (seq_len-1), 66)
+        dec_feet = dec_271d[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
+        dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
+
+        loss_68d = F.mse_loss(decoded, y_68d, reduction="mean")
+        loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
+
+        mask_feet_4d = (
+            y_feet.bool() & ~dec_feet.bool()
+        )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
+        mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
+        loss_feet = (
+            dec_foot_vel[mask_feet_miss].square().mean()
+            if mask_feet_miss.any()
+            else torch.tensor(0.0, device=self.device)
+        )
+
+        decoder_loss = loss_68d + loss_vel * 0.5 + loss_feet * 0.5
+
+        feet_miss_rate = (
+            mask_feet_4d.sum().float() / y_feet.bool().sum().float()
+            if y_feet.bool().sum() > 0
+            else torch.tensor(0.0, device=self.device)
+        )
+
+        engine.csa_op_metrics(
+            [
+                ("decoder_loss", decoder_loss.detach().item()),
+                ("loss_68d", loss_68d.detach().item()),
+                ("loss_vel", loss_vel.detach().item()),
+                ("loss_feet", loss_feet.detach().item()),
+                ("feet_miss_rate", feet_miss_rate.detach().item()),
+            ],
+            1.0 / self.accumulation_steps,
+            engine.state.iteration % self.accumulation_steps == 1,  # Clear on first step of accumulation
+        )
+
+        return {
+            "decoder_loss": decoder_loss,
+            "loss_68d": loss_68d.detach(),
+            "loss_vel": loss_vel.detach(),
+            "loss_feet": loss_feet.detach(),
+            "feet_miss_rate": feet_miss_rate.detach(),
+        }
 
     def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         """Attach Ignite event handlers for training orchestration."""
-        # Running averages
-        RunningAverage(output_transform=lambda o: o["loss"]).attach(trainer, "loss")
-        RunningAverage(output_transform=lambda o: o["val_loss"]).attach(evaluator, "val_loss")
 
         # NaN termination
         trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
@@ -502,58 +652,72 @@ class PretrainTrainer:
             output = engine.state.output
             if not isinstance(output, dict):
                 return
-            metrics = {
-                "train/loss": float(output.get("loss", 0.0)),
-                "train/probe_loss": float(output.get("probe_loss", 0.0)),
-                "train/loss_avg": float(engine.state.metrics.get("loss", 0.0)),
-                "train/lr": float(output.get("lr", 0.0)),
-                "train/global_step": int(engine.state.metrics.get("global_step", 0)),
-            }
-            self.wandb_logger.log(metrics, step=engine.state.metrics["global_step"])
+            metrics = engine.get_metrics(
+                [
+                    "loss",
+                    "mask_loss",
+                    "context_loss",
+                    "probe_loss",
+                    "decoder_loss",
+                    "decoder_loss_68d",
+                    "decoder_loss_vel",
+                    "decoder_loss_feet",
+                    "feet_miss_rate",
+                    "lr",
+                ],
+                prefix="train/",
+            )
+            self.wandb_logger.log(metrics, step=engine.get_metric("global_step", 0))
+            self.wandb_logger.log(
+                {
+                    "train/horizon": engine.state.horizon,
+                    "epoch": int(engine.state.epoch),
+                    "global_step": int(engine.get_metric("global_step", 0)),
+                },
+                step=engine.get_metric("global_step", 0),
+            )
 
         @trainer.on(Events.GET_BATCH_STARTED)
         def _set_horizon(engine: PretrainEngine) -> None:
-
             engine.state.dataloader.dataset.set_horizon(engine.state.horizon)  # type: ignore[attr-defined]
 
-        @evaluator.on(Events.ITERATION_COMPLETED)
+        @evaluator.on(Events.GET_BATCH_STARTED)
         def _set_horizon_eval(engine: PretrainEngine) -> None:
-
             engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)  # type: ignore[attr-defined]
 
+        checkpoint_mapping = {
+            "encoder": self.encoder,
+            "jepa_predictor": self.jepa_predictor,
+            "encoder_ema": self.ema_encoder,
+            "optimizer": self.optimizer,
+            "scaler": self.scaler,
+            "lr_scheduler": self.lr_scheduler,
+            "aux_lr_scheduler": self.aux_lr_scheduler,
+            "metadata": CheckpointMetadata({"session_id": self.pretraining_session_id, "resume_id": self.resume_id}),
+        }
         # Best checkpoint handler
-        best_checkpoint = Checkpoint(
-            {
-                "encoder": self.encoder,
-                "jepa_predictor": self.jepa_predictor,
-                "encoder_ema": self.ema_encoder,
-                "jepa_ema": self.ema_jepa,
-                "optimizer": self.optimizer,
-                "scaler": self.scaler,
-                "lr_scheduler": self.lr_scheduler,
-                "probe_lr_scheduler": self.probe_lr_scheduler,
-                "metadata": CheckpointMetadata({"session_id": self.pretraining_session_id}),
-            },
+        val_best_checkpoint = Checkpoint(
+            checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
             filename_prefix="pretrain_best_val",
-            score_function=lambda engine: -float(engine.state.metrics["val_loss"]),
+            score_function=lambda engine: -float(engine.state.metrics["loss"]),
             score_name="val_loss",
             global_step_transform=global_step_from_engine(trainer),
         )
 
+        eval_best_checkpoint = Checkpoint(
+            checkpoint_mapping,
+            DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
+            n_saved=1,
+            filename_prefix="pretrain_best_eval",
+            score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
+            score_name="eval_loss",
+            global_step_transform=global_step_from_engine(trainer),
+        )
+
         latest_checkpoint = Checkpoint(
-            {
-                "encoder": self.encoder,
-                "jepa_predictor": self.jepa_predictor,
-                "encoder_ema": self.ema_encoder,
-                "jepa_ema": self.ema_jepa,
-                "optimizer": self.optimizer,
-                "scaler": self.scaler,
-                "lr_scheduler": self.lr_scheduler,
-                "probe_lr_scheduler": self.probe_lr_scheduler,
-                "metadata": CheckpointMetadata({"session_id": self.pretraining_session_id}),
-            },
+            checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
             filename_prefix="pretrain_latest",
@@ -572,36 +736,64 @@ class PretrainTrainer:
         val_batches = self.config.val_batches
         if val_batches > 0:
 
-            @evaluator.on(Events.ITERATION_COMPLETED)
+            @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
             def _limit_val_batches(engine: PretrainEngine) -> None:
-                if engine.state.iteration >= val_batches:
+                if engine.state.iteration // self.accumulation_steps >= val_batches:
                     engine.terminate()
 
         if self.config.save_best_val:
 
             @evaluator.on(Events.COMPLETED)
             def _log_best_validation(engine: PretrainEngine) -> None:
-                val_loss = float(engine.state.metrics.get("val_loss", float("nan")))
+                val_loss = float(engine.get_metric("loss", float("inf")))
                 best_val_loss = float(engine.state.metrics.get("best_val_loss", float("inf")))
                 if val_loss < best_val_loss:
-                    engine.state.metrics["best_val_loss"] = val_loss
+                    engine.set_metrics([("best_val_loss", val_loss)])
+
+                eval_loss = float(engine.get_metric("decoder_loss", float("inf")))
+                best_eval_loss = float(engine.state.metrics.get("best_eval_loss", float("inf")))
+                if eval_loss < best_eval_loss:
+                    engine.set_metrics([("best_eval_loss", eval_loss)])
 
                 if self.wandb_logger:
                     self.wandb_logger.log(
+                        engine.get_metrics(
+                            [
+                                "loss",
+                                "mask_loss",
+                                "context_loss",
+                                "probe_loss",
+                                "decoder_loss",
+                                "decoder_loss_68d",
+                                "decoder_loss_vel",
+                                "decoder_loss_feet",
+                                "feet_miss_rate",
+                            ],
+                            prefix="val/",
+                        ),
+                        step=int(trainer.get_metric("global_step", 0)),
+                    )
+
+                    self.wandb_logger.log(
                         {
-                            "val/loss": val_loss,
-                            "val/epoch": int(trainer.state.epoch),
-                            "train/global_step": int(trainer.state.metrics.get("global_step", 0)),
+                            "epoch": int(trainer.state.epoch),
+                            "global_step": int(trainer.get_metric("global_step", 0)),
                         },
-                        step=int(trainer.state.metrics.get("global_step", 0)),
+                        step=int(trainer.get_metric("global_step", 0)),
                     )
 
                     if val_loss < best_val_loss:
                         self.wandb_logger.log(
-                            {"val/best_loss": val_loss}, step=int(trainer.state.metrics.get("global_step", 0))
+                            {"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0))
                         )
 
-            evaluator.add_event_handler(Events.COMPLETED, best_checkpoint)
+                    if eval_loss < best_eval_loss:
+                        self.wandb_logger.log(
+                            {"val/best_eval_loss": eval_loss}, step=int(trainer.get_metric("global_step", 0))
+                        )
+
+            evaluator.add_event_handler(Events.COMPLETED, val_best_checkpoint)
+            evaluator.add_event_handler(Events.COMPLETED, eval_best_checkpoint)
 
     def run(self, max_epochs: int | None = None) -> None:
         """Execute the pretraining loop."""
@@ -620,12 +812,9 @@ class PretrainTrainer:
 # Convenience function for notebook usage
 def train_pretrain(
     config: Config,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    normalizer: FeatureNormalizer,
     wandb_project: str | None = None,
     max_epochs: int | None = None,
-) -> Tuple[EMAModel, EMAModel, Path]:
+) -> Tuple[EMAModel, None, Path]:
     """
     Train encoder with JEPA objective in a single call.
 
@@ -646,7 +835,7 @@ def train_pretrain(
     )
     trainer.run(max_epochs=max_epochs)
     checkpoint_path = config.checkpoint_dir / "pretrain_latest.pt"
-    return trainer.ema_encoder, trainer.ema_jepa, checkpoint_path
+    return trainer.ema_encoder, None, checkpoint_path
 
 
 __all__ = ["EMAModel", "PretrainTrainer", "train_pretrain"]

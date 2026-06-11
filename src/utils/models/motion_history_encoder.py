@@ -131,8 +131,8 @@ class MotionHistoryEncoder(nn.Module):
                 f"{tuple(motion_seq.shape)} vs {tuple(text_emb.shape)}"
             )
 
-        if mask is not None:
-            if mask.ndim != 2 or mask.shape != motion_seq.shape[:2]:
+        if mask is not None and mask.shape != motion_seq.shape[:2]:
+            if mask.ndim != 2:
                 raise ValueError(
                     "Expected mask shape (B, T) matching motion_seq, got "
                     f"{tuple(mask.shape)} vs {tuple(motion_seq.shape[:2])}"
@@ -144,11 +144,13 @@ class MotionHistoryEncoder(nn.Module):
         if seq_len == 0:
             raise ValueError("Expected motion_seq with at least one timestep.")
 
-        hidden_states = self.frame_projection(motion_seq)
+        hidden_states: torch.Tensor = self.frame_projection(motion_seq)
 
         if mask is not None:
-            mask = mask.unsqueeze(-1)
-            hidden_states = torch.where(mask, self.mask_token, hidden_states)
+            mask_flat = mask.flatten()  # (B*T,)
+            hidden_states_flat = hidden_states.flatten(0, 1)  # (B*T, H)
+            hidden_states_flat[mask_flat] = self.mask_token
+            hidden_states = hidden_states_flat.view_as(hidden_states)  # (B, T, H)
 
         register_tokens = self.register_tokens.unsqueeze(0).expand(batch_size, -1, -1)
 
@@ -242,11 +244,11 @@ class JepaMLPBlock(nn.Module):
         super().__init__()
         self.config = config
 
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.norm = nn.LayerNorm(config.jp_config.hidden_size, eps=config.layer_norm_eps)
 
         self.mlp = GatedMLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.hidden_size * 2,
+            hidden_size=config.jp_config.hidden_size,
+            intermediate_size=config.jp_config.intermediate_size,
             bias=True,
             activation=config.hidden_act,
             dropout=config.dropout,
@@ -264,25 +266,40 @@ class JepaPredictor(nn.Module):
     def __init__(self, config: MotionHistoryEncoderConfig) -> None:
         super().__init__()
         self.config = config
+        self.hidden_size = config.jp_config.hidden_size
+        self.intermediate_size = config.jp_config.intermediate_size
+        self.num_layers = config.jp_config.num_hidden_layers
 
-        self.z_proj = nn.Linear(config.hidden_size // 4, config.hidden_size)
+        self.z_proj = nn.Linear(self.hidden_size // 4, self.hidden_size)
 
         self.input_mlp = GatedMLP(
             hidden_size=config.num_hidden_layers * config.hidden_size,
-            intermediate_size=4 * config.hidden_size,
-            output_size=config.hidden_size,
+            intermediate_size=2 * self.hidden_size,
+            output_size=self.hidden_size,
             bias=True,
             activation=config.hidden_act,
             dropout=config.dropout,
         )
 
-        self.input_proj = nn.Linear(2 * config.hidden_size, config.hidden_size)
+        self.input_proj = nn.Linear(2 * self.hidden_size, self.hidden_size)
 
-        self.blocks = nn.ModuleList([JepaMLPBlock(config) for _ in range(2)])
+        self.blocks = nn.ModuleList([JepaMLPBlock(config) for _ in range(self.num_layers)])
 
-        self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_norm = nn.LayerNorm(self.hidden_size, eps=config.layer_norm_eps)
 
-        self.output_head = nn.Linear(config.hidden_size, config.hidden_size * config.num_hidden_layers)
+        self.output_mlp = GatedMLP(
+            hidden_size=self.hidden_size,
+            intermediate_size=4 * self.hidden_size,
+            output_size=self.hidden_size * config.num_hidden_layers,
+            bias=True,
+            activation=config.hidden_act,
+            dropout=config.dropout,
+        )
+
+        self.output_proj = nn.ModuleList(
+            [nn.Linear(self.hidden_size, self.hidden_size) for _ in range(config.num_hidden_layers)]
+        )
+
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -311,10 +328,10 @@ class JepaPredictor(nn.Module):
                 f"(B, T, L, {self.config.hidden_size}), got {tuple(motion_history_emb.shape)}"
             )
 
-        B, T, L, H = motion_history_emb.shape
+        B, T, L, H_enc = motion_history_emb.shape
 
-        motion_history_emb = motion_history_emb.reshape(B, T, -1)  # (B, T, L*H)
-        motion_history_emb = self.input_mlp(motion_history_emb)  # (B, T, H)
+        motion_history_emb = motion_history_emb.reshape(B, T, -1)  # (B, T, L*H_enc)
+        motion_history_emb = self.input_mlp(motion_history_emb)  # (B, T, H_enc)
 
         z = torch.randn(B, self.z_proj.in_features, device=motion_history_emb.device)  # (B, H//4)
         # VJEPA-style latent noise — random noise injected as a learnable conditioning signal.
@@ -327,8 +344,15 @@ class JepaPredictor(nn.Module):
             x = block(x)
 
         x = self.final_norm(x)
-        output = self.output_head(x)
+        x = self.output_mlp(x)  # (B, T, L*H)
 
-        output = output.view(B, T, self.config.num_hidden_layers, self.config.hidden_size)
+        x = x.view(B, T, L, H_enc)  # (B, T, L, H_enc)
+
+        layer_outputs = []
+        for i in range(self.config.num_hidden_layers):
+            layer_output = self.output_proj[i](x[:, :, i, :])  # (B, T, H_enc)
+            layer_outputs.append(layer_output)
+
+        output = torch.stack(layer_outputs, dim=2)  # (B, T, L, H_enc)
 
         return output

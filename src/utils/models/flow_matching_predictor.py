@@ -5,7 +5,7 @@ from torch import nn
 
 from utils.config import Config, FlowMatchingPredictorConfig
 from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
-from utils.motion_utils import FeatureNormalizer, flow_output_to_positions
+from utils.motion_utils import FeatureNormalizer, x68_to_positions
 
 
 class SinusoidalEmbedder(nn.Module):
@@ -165,7 +165,7 @@ class PredictorLayer(nn.Module):
 class FlowMatchingPredictor(nn.Module):
     def __init__(
         self,
-        config: Config,  # Model configuration
+        config: Config,
         **kwargs,
     ):
         super().__init__()
@@ -197,33 +197,31 @@ class FlowMatchingPredictor(nn.Module):
 
     def forward(
         self,
-        noisy_states: torch.Tensor,  # (B, N, H_enc) - noised reduced-state features
-        timesteps: torch.Tensor,  # (B,) or (B, 1) - denoising timesteps in [0,1]
-        encoder_hidden_states: torch.Tensor,  # (B, M, H_enc) - from MotionHistoryEncoder
-        text_embedding: torch.Tensor,  # (B, F) - Text embedding for global conditioning
+        noisy_states: torch.Tensor,
+        timesteps: torch.Tensor,
+        track_features: torch.Tensor,
+        text_embedding: torch.Tensor,
+        current_frame_features: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        **kwargs,  # Ignore attention_mask, position_ids, etc.
+        **kwargs,
     ) -> tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
-        # Build static per-joint kinematic tokens once and reuse across layers.
         B, N, H = noisy_states.shape
 
-        text_cond = self.text_proj(text_embedding)  # (B, H)
-        time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)  # (B, H)
+        text_cond = self.text_proj(text_embedding)
+        time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)
 
-        adaln_cond = torch.cat([text_cond, time_cond], dim=-1)  # (B, 2H)
+        adaln_cond = torch.cat([text_cond, time_cond], dim=-1)
 
-        # 4. Transformer processing (NO ATTENTION MASKING)
         all_cross_attns: list[torch.Tensor] = []
 
-        hidden_states = self.latent_in_proj(noisy_states)  # (B, N, H) — projected into predictor hidden dim
+        hidden_states = self.latent_in_proj(noisy_states)
 
         for layer_idx, layer in enumerate(self.layers):
-            # Bounded signed gate allows add/subtract structural prior per layer.
             hidden_states = hidden_states
 
             hidden_states, attn_weights = layer(
                 hidden_states,
-                encoder_hidden_states,
+                track_features,
                 adaln_cond=adaln_cond,
                 output_attentions=output_attentions,
             )
@@ -231,11 +229,11 @@ class FlowMatchingPredictor(nn.Module):
             if output_attentions:
                 all_cross_attns.append(attn_weights)
 
-        hidden_states = self.latent_out_proj(hidden_states)  # (B, N, H_enc)
+        hidden_states = self.latent_out_proj(hidden_states)
 
         output_shift, output_scale = self.output_adaln(adaln_cond).chunk(2, dim=-1)
-        output_shift = output_shift.unsqueeze(1)  # (B, 1, H_enc)
-        output_scale = output_scale.unsqueeze(1)  # (B, 1, H_enc)
+        output_shift = output_shift.unsqueeze(1)
+        output_scale = output_scale.unsqueeze(1)
         flow_prediction = self.output_norm(output_shift + output_scale * hidden_states)
 
         return (
@@ -280,10 +278,10 @@ class LatentDecoder(nn.Module):
         """
 
         pred = self.forward(latent)
-        pred_raw = normalizer.denormalize_flow_output(pred)
+        pred_raw = normalizer.denormalize_x68(pred)
         prev_frame_raw = normalizer.denormalize(prev_frame)
 
-        new_pos = flow_output_to_positions(pred_raw, prev_pos[:, 0], prev_frame_raw[:, 69:75])
+        new_pos = x68_to_positions(pred_raw, prev_pos[:, 0], prev_frame_raw[:, 69:75])
 
         relative_shift = new_pos - prev_pos
 
