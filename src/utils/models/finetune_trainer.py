@@ -24,10 +24,7 @@ from utils.config import Config
 from utils.models import MotionHistoryEncoder, FlowMatchingPredictor
 from utils.motion_utils import (
     FeatureNormalizer,
-    extract_prev_frame_features,
-    subset_271d_to_68d,
-    wrap_angle,
-    sin_cos_to_yaw,
+    x271_to_x68,
 )
 from utils.wandb_logger import WandbLogger as _WandbLogger
 
@@ -238,11 +235,6 @@ class FiTrainer:
 
         # Forward pass
         track_features = self.encoder(history, text_emb, return_all=False).unsqueeze(1)
-        current_frame_features = extract_prev_frame_features(
-            current_frame,
-            normalizer=self.normalizer,
-            normalize_output=self.normalizer is not None,
-        )
 
         x1 = subset_271d_to_68d(target_motion, prev_frame=current_frame, normalizer=self.normalizer)
         x0 = torch.randn_like(x1)
@@ -251,10 +243,10 @@ class FiTrainer:
 
         predicted_flow, _, _ = self.predictor(
             track_features=track_features,
-            noisy_features=xt,
+            noisy_states=xt,
             timesteps=t,
             text_embedding=text_emb,
-            current_frame_features=current_frame_features,
+            current_frame_features=None,
             output_attentions=False,
             output_hidden_states=False,
         )
@@ -269,8 +261,8 @@ class FiTrainer:
             if t_thresh_mask.any():
                 pred_x1 = xt[t_thresh_mask] + predicted_flow[t_thresh_mask] * (1 - t.unsqueeze(1)[t_thresh_mask])
 
-                flow_raw = self.normalizer.denormalize_flow_output(pred_x1) if self.normalizer else pred_x1
-                x1_raw = self.normalizer.denormalize_flow_output(x1[t_thresh_mask]) if self.normalizer else x1[t_thresh_mask]
+                flow_raw = self.normalizer.denormalize_x68(pred_x1) if self.normalizer else pred_x1
+                x1_raw = self.normalizer.denormalize_x68(x1[t_thresh_mask]) if self.normalizer else x1[t_thresh_mask]
 
                 # Root loss
                 root_loss = F.mse_loss(flow_raw[:, :3], x1_raw[:, :3])
@@ -347,23 +339,18 @@ class FiTrainer:
             text_emb = text[:, 0, :] if text.ndim == 3 else text
 
             track_features = self.ema_encoder.model(history, text_emb, return_all=False).unsqueeze(1)
-            current_frame_features = extract_prev_frame_features(
-                current_frame,
-                normalizer=self.normalizer,
-                normalize_output=self.normalizer is not None,
-            )
 
-            x1 = subset_271d_to_68d(target_motion, prev_frame=current_frame, normalizer=self.normalizer)
+            x1 = x271_to_x68(target_motion, prev_frame=current_frame, normalizer=self.normalizer)
             t = torch.rand(target_motion.shape[0], device=self.device, dtype=torch.float32)
             x0 = torch.randn_like(x1)
             xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
 
             predicted_flow, _, _ = self.ema_predictor.model(
                 track_features=track_features,
-                noisy_features=xt,
+                noisy_states=xt,
                 timesteps=t,
                 text_embedding=text_emb,
-                current_frame_features=current_frame_features,
+                current_frame_features=None,
                 output_attentions=False,
                 output_hidden_states=False,
             )

@@ -5,7 +5,7 @@ from torch import nn
 
 from utils.config import Config, FlowMatchingPredictorConfig
 from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
-from utils.motion_utils import FeatureNormalizer, x68_to_positions
+from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
 
 
 class SinusoidalEmbedder(nn.Module):
@@ -248,12 +248,13 @@ class LatentDecoder(nn.Module):
         self.config = config
         self.decoder = GatedMLP(
             hidden_size=config.encoder_config.hidden_size,
-            intermediate_size=config.encoder_config.hidden_size * 4,
+            intermediate_size=config.decoder_config.intermediate_size,
+            output_size=config.decoder_config.hidden_size,
             bias=True,
             activation="silu",
             dropout=0.0,
         )
-        self.out_proj = nn.Linear(config.encoder_config.hidden_size, 68, bias=True)
+        self.out_proj = nn.Linear(config.decoder_config.hidden_size, 68, bias=True)
 
         self._initialize_weights()
 
@@ -267,22 +268,21 @@ class LatentDecoder(nn.Module):
 
     def decode(
         self, latent: torch.Tensor, prev_pos: torch.Tensor, prev_frame: torch.Tensor, normalizer: FeatureNormalizer
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Decodes the predicted flow output into new joint positions and relative shifts.
         Args:
             latent: The latent representation from the predictor (B, N, H_enc).
             prev_pos: The previous joint positions (B, 22, 3) - only the first joint is used for flow decoding.
-            prev_frame: The previous frame's full features (B, 271) - used for denormalization.
+            prev_frame: The previous frame's full features (B, 271) - normalized.
             normalizer: The feature normalizer to denormalize the outputs.
         """
 
         pred = self.forward(latent)
-        pred_raw = normalizer.denormalize_x68(pred)
-        prev_frame_raw = normalizer.denormalize(prev_frame)
 
-        new_pos = x68_to_positions(pred_raw, prev_pos[:, 0], prev_frame_raw[:, 69:75])
+        new_pos = x68_to_positions(pred, prev_positions=prev_pos, prev_x271=prev_frame, normalizer=normalizer)
+        new_frame, _ = positions_to_x271(new_pos, prev_positions=prev_pos, normalizer=normalizer)
 
         relative_shift = new_pos - prev_pos
 
-        return new_pos, relative_shift
+        return new_pos, relative_shift, new_frame

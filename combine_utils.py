@@ -100,10 +100,10 @@ FILE_ORDER = [
     "visualization.py",
     "wandb_logger.py",
     "models/__init__.py",
-    # "models/human_motion_generator.py",
     "models/motion_history_encoder.py",
-    # "models/flow_matching_predictor.py",
+    "models/flow_matching_predictor.py",
     "models/pretrain_trainer.py",
+    # "models/human_motion_generator.py",
     # "models/finetune_trainer.py",
 ]
 

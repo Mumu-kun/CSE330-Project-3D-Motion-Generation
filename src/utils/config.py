@@ -1,21 +1,21 @@
 """
-Configuration file for Human Motion Animation Generation Pipeline.
+Configuration for Human Motion Animation Generation Pipeline.
 
-This configuration uses the custom 271D feature format:
-- Input: 271D feature vectors from motion_utils.py
-- Output: Joint positions (nframe, 22, 3) → BVH files
+Uses the custom 271D feature format:
+  Input:  271D feature vectors from motion_utils.py
+  Output: Joint positions (nframe, 22, 3) → BVH files
 
-Feature Layout (271D) - Updated per normalization plan:
-- [0:3]   Root height Y, Root velocity X, Root velocity Z (velocity form)
-- [3:69]  22 RIC positions (22 * 3)
-- [69:201] 22 6D rotations (22 * 6)
-- [201:267] 22 local velocities (22 * 3)
-- [267:271] Foot contacts (4D)
+Feature Layout (271D):
+  [0:3]     Root height Y, Root velocity X, Root velocity Z
+  [3:69]    22 RIC positions (22 * 3)
+  [69:201]  22 6D rotations (22 * 6)
+  [201:267] 22 local velocities (22 * 3)
+  [267:271] Foot contacts (4D)
 
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
-from dataclasses import asdict, dataclass, field, is_dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,7 +32,7 @@ class FlowMatchingPredictorConfig:
     attention_dropout: float = 0.1
     mlp_bias: bool = True
     track_dimensionality: int = 3
-    global_cond_dim: int = 512  # clip embedding : 512D
+    global_cond_dim: int = 512  # CLIP embedding: 512D
     head_dim: Optional[int] = None
 
     def __post_init__(self) -> None:
@@ -42,9 +42,16 @@ class FlowMatchingPredictorConfig:
 
 @dataclass
 class JepaPredictorConfig:
-    hidden_size: int = 128
+    hidden_size: int = 192
     intermediate_size: int = 512
     num_hidden_layers: int = 2
+
+
+@dataclass
+class LatentDecoderConfig:
+    hidden_size: int = 256
+    intermediate_size: int = 768
+    # num_hidden_layers: int = 2
 
 
 @dataclass
@@ -52,7 +59,7 @@ class MotionHistoryEncoderConfig:
     frame_feature_dim: int = 271
     text_embedding_dim: int = 512
     hidden_size: int = 512
-    intermediate_size: int = 4 * 512
+    intermediate_size: int = 2 * 512
     num_hidden_layers: int = 4
     num_attention_heads: int = 16
     hidden_act: str = "silu"
@@ -63,72 +70,56 @@ class MotionHistoryEncoderConfig:
     dropout: float = 0.1
     joint_count: int = 22
     num_registers: int = 2
-
-    jp_config: JepaPredictorConfig = field(default_factory=lambda: JepaPredictorConfig())
+    jp_config: JepaPredictorConfig = field(default_factory=JepaPredictorConfig)
 
     def __post_init__(self) -> None:
         if self.hidden_size % self.num_attention_heads != 0:
             raise ValueError(
-                "MotionHistoryEncoderConfig.hidden_size must be divisible by "
-                f"num_attention_heads, got {self.hidden_size} and "
-                f"{self.num_attention_heads}."
+                f"hidden_size must be divisible by num_attention_heads, "
+                f"got {self.hidden_size} and {self.num_attention_heads}."
             )
         head_dim = self.hidden_size // self.num_attention_heads
         if head_dim % 2 != 0:
             raise ValueError(
-                "MotionHistoryEncoderConfig requires an even per-head dimension "
-                f"for RoPE, got hidden_size={self.hidden_size}, "
-                f"num_attention_heads={self.num_attention_heads}, head_dim={head_dim}."
+                f"Per-head dimension must be even for RoPE, got head_dim={head_dim} "
+                f"(hidden_size={self.hidden_size}, num_attention_heads={self.num_attention_heads})."
             )
         self.intermediate_size = max(int(self.intermediate_size), self.hidden_size)
 
 
 @dataclass
 class Config:
-    """Configuration class for the motion generation pipeline."""
+    """Configuration for the motion generation pipeline."""
 
-    # Device settings
-    device: Any = "cuda"  # "cuda" or "cpu" or torch.device
+    # --- Device ---
+    device: Any = "cuda"
     seed: int = 42
 
-    # Data paths and directories
+    # --- Paths ---
     dataset_path: Path = Path("./dataset/humanml3d-subset")
     output_path: Path = Path("./output")
     checkpoint_dir: Path = Path("./checkpoints")
+    checkpoint_interval: int = 50
 
-    checkpoint_interval: int = 50  # Save checkpoint every N epochs
+    # --- Motion format (271D) ---
+    motion_dim: int = 271
+    num_joints: int = 22
+    joint_dim: int = 3
+    max_motion_length: int = 200
+    fps: int = 20
 
-    # Motion format settings (271D custom format from motion_utils.py)
-    motion_dim: int = 271  # Custom 271D feature dimension
-    num_joints: int = 22  # Number of joints in skeleton
-    joint_dim: int = 3  # 3D coordinates per joint
-    max_motion_length: int = 200  # Maximum motion length in frames
-    fps: int = 20  # Frames per second
+    # --- Sub-configs ---
+    encoder_config: MotionHistoryEncoderConfig = field(default_factory=MotionHistoryEncoderConfig)
+    predictor_config: FlowMatchingPredictorConfig = field(default_factory=FlowMatchingPredictorConfig)
+    decoder_config: LatentDecoderConfig = field(default_factory=LatentDecoderConfig)
+    text_embedding_dim: int = 512
 
-    # Feature dimension subsetting for training
-    feature_dims: tuple = (
-        slice(0, 3),  # root height Y, velocity X, velocity Z (3D)
-        slice(3, 69),  # RIC positions (22*3 = 66D)
-        slice(69, 201),  # 6D rotations (22*6 = 132D)
-        slice(201, 267),  # local velocities (22*3 = 66D)
-        slice(267, 271),  # foot contacts (4D)
-    )
+    # --- Masking ---
+    mask_num_spans: int = 4
+    mask_min_span: int = 5
+    mask_max_span: int = 20
 
-    # =============================================================================
-    # MotionHistoryEncoder Configuration
-    # =============================================================================
-    encoder_config: MotionHistoryEncoderConfig = field(default_factory=lambda: MotionHistoryEncoderConfig())
-
-    # =============================================================================
-    # FlowMatchingPredictor Configuration (Spatial-Only with Flow Matching Timestep)
-    # =============================================================================
-    # Uses new FlowMatchingPredictorConfig dataclass for structured configuration
-    # Time embedding is handled internally via SinusoidalEmbedder(hidden_size)
-    predictor_config: FlowMatchingPredictorConfig = field(default_factory=lambda: FlowMatchingPredictorConfig())
-
-    text_embedding_dim = 512  # Dimension of text embeddings for conditioning
-
-    # Training settings
+    # --- Training ---
     effective_batch_size: int = 400
     batch_size: int = 200
     learning_rate: float = 0.5e-4
@@ -137,9 +128,11 @@ class Config:
     ema_decay: float = 0.999
     lr_warmup_epochs: int = 5
     lr_scheduler: str = "cosine"
+    jepa_ctx_weight: float = 0.2
+    cfg_dropout: float = 0.1
+    use_fk: bool = False
 
-    # Curriculum learning settings
-    # Set to None to disable curriculum (use fixed horizon from horizon field)
+    # --- Curriculum ---
     curriculum: Optional[list[dict[str, int]]] = field(
         default_factory=lambda: [
             {"horizon": 5, "epochs": 100},
@@ -148,113 +141,96 @@ class Config:
             {"horizon": 40, "epochs": 1000},
         ]
     )
-
-    horizon: int = 40  # Maximum/target horizon for training
+    horizon: int = 40
     _num_epochs: int = 2000
 
-    jepa_ctx_weight: float = 0.2
-
-    # CFG (Classifier-Free Guidance) settings
-    cfg_dropout: float = 0.1  # Dropout probability for CFG
-
-    # Training-time timestep sampling
+    # --- Timestep sampling ---
     t_sampling_mode: str = "power"  # "uniform" or "power"
-    t_sampling_power: float = 3.0  # Power-law exponent k in p(t)=(k+1)t^k
-    t_sampling_power_warmup_fraction: float = 1  # Fraction of training used to ramp k from 0 to target
+    t_sampling_power: float = 3.0
+    t_sampling_power_warmup_fraction: float = 1.0
 
-    use_fk: bool = False  # Whether to compute FK loss during training
-    # Rollout scheduling settings
-    rollout_prob_start: float = 0.1  # Rollout probability at first epoch
-    rollout_prob_end: float = 0.3  # Rollout probability at final epoch
-    rollout_warmup_fraction: float = 0.15  # Fraction of training with rollout disabled before schedule starts
-    rollout_block_len_start: int = 1  # Rollout block length at schedule start
-    rollout_block_len_end: int = 4  # Rollout block length at schedule end
-    rollout_integration_steps: int = 3  # Number of ODE integration steps for rollout branch
-    rollout_subset_fraction: float = 0.25  # Fraction of batch for rollout branch
-    rollout_loss_weight: float = 0.25  # Weight of rollout-conditioned loss branch
-    rollout_block_len_bias_power: float = 2.0  # Power > 1 biases sampled rollout lengths toward the scheduled max
+    # --- Rollout scheduling ---
+    rollout_prob_start: float = 0.1
+    rollout_prob_end: float = 0.3
+    rollout_warmup_fraction: float = 0.15
+    rollout_block_len_start: int = 1
+    rollout_block_len_end: int = 4
+    rollout_integration_steps: int = 3
+    rollout_subset_fraction: float = 0.25
+    rollout_loss_weight: float = 0.25
+    rollout_block_len_bias_power: float = 2.0
 
-    use_consistency_loss: bool = True  # Enable endpoint consistency loss after no-grad rollout
-    consistency_loss_t_threshold: float = 0.5  # Only apply consistency loss for t > threshold
-    consistency_loss_weight: float = 10  # Weight for consistency loss in total loss
+    # --- Consistency loss ---
+    use_consistency_loss: bool = True
+    consistency_loss_t_threshold: float = 0.5
+    consistency_loss_weight: float = 10.0
 
-    # Data loading
+    # --- Data loading ---
     num_workers: int = 4
     pin_memory: bool = True
 
-    # Inference settings
-    num_inference_steps: int = 20  # Number of flow matching steps
-    inference_t_schedule_power: float = 3.0  # End-bias power p in t=1-(1-s)^p for inference ODE time boundaries
-    guidance_scale: float = 1.0  # CFG scale for inference
+    # --- Inference ---
+    num_inference_steps: int = 20
+    inference_t_schedule_power: float = 3.0
+    guidance_scale: float = 1.0
 
-    # Validation settings
-    val_interval: int = 5  # Run validation every N epochs
-    val_batches: int = 20  # Number of validation batches per run (-1 for all)
-    val_use_ema: bool = True  # Use EMA models for validation
-    save_best_val: bool = True  # Save separate checkpoint for best validation loss
+    # --- Validation ---
+    val_interval: int = 5
+    val_batches: int = 20
+    val_use_ema: bool = True
+    save_best_val: bool = True
 
-    # Profiling settings
-    enable_profiling: bool = False  # Enable timing instrumentation
-    timing_log_interval: int = 100  # Log timings every N batches
-    tqdm_log_per_batch: bool = False  # Show per-batch tqdm progress during training
+    # --- Profiling ---
+    enable_profiling: bool = False
+    timing_log_interval: int = 100
 
-    unit_length = 5
-
-    enable_linear_probe: bool = True
-    probe_loss_weight: float = 1.0
-
-    def __post_init__(self):
+    def __post_init__(self) -> None:
+        # Timestep sampling
         self.t_sampling_mode = str(self.t_sampling_mode).lower()
         if self.t_sampling_mode not in {"uniform", "power"}:
             raise ValueError(f"t_sampling_mode must be 'uniform' or 'power', got {self.t_sampling_mode!r}")
         self.t_sampling_power = max(0.0, float(self.t_sampling_power))
-        self.t_sampling_power_warmup_fraction = min(
-            max(float(self.t_sampling_power_warmup_fraction), 0.0),
-            1.0,
-        )
-        self.tqdm_log_per_batch = bool(self.tqdm_log_per_batch)
-        self.rollout_warmup_fraction = min(
-            max(float(self.rollout_warmup_fraction), 0.0),
-            1.0 - 1e-6,
-        )
+        self.t_sampling_power_warmup_fraction = min(max(float(self.t_sampling_power_warmup_fraction), 0.0), 1.0)
+
+        # Rollout
+        self.rollout_warmup_fraction = min(max(float(self.rollout_warmup_fraction), 0.0), 1.0 - 1e-6)
         self.rollout_block_len_start = max(1, int(self.rollout_block_len_start))
-        self.rollout_block_len_end = max(
-            self.rollout_block_len_start,
-            int(self.rollout_block_len_end),
-        )
-        self.rollout_subset_fraction = min(
-            max(float(self.rollout_subset_fraction), 0.0),
-            1.0,
-        )
+        self.rollout_block_len_end = max(self.rollout_block_len_start, int(self.rollout_block_len_end))
+        self.rollout_subset_fraction = min(max(float(self.rollout_subset_fraction), 0.0), 1.0)
         self.rollout_loss_weight = max(float(self.rollout_loss_weight), 0.0)
         self.rollout_block_len_bias_power = float(self.rollout_block_len_bias_power)
         if self.rollout_block_len_bias_power <= 1.0:
-            raise ValueError(
-                f"rollout_block_len_bias_power must be greater than 1, got {self.rollout_block_len_bias_power}"
-            )
+            raise ValueError(f"rollout_block_len_bias_power must be > 1, got {self.rollout_block_len_bias_power}")
+
+        # Inference
         self.inference_t_schedule_power = float(self.inference_t_schedule_power)
         if self.inference_t_schedule_power <= 0.0:
             raise ValueError(f"inference_t_schedule_power must be positive, got {self.inference_t_schedule_power}")
+
+        # Ensure directories exist
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self.output_path.mkdir(parents=True, exist_ok=True)
         self.dataset_path.mkdir(parents=True, exist_ok=True)
 
     def get_num_epochs(self) -> int:
-        """Return the total number of training epochs, accounting for curriculum."""
+        """Return total training epochs, accounting for curriculum."""
         return self.curriculum[-1]["epochs"] if self.curriculum else self._num_epochs
 
     def to_dict(self) -> dict:
-        """Export the configuration as a serializable dictionary."""
+        """Export config as a serializable dictionary."""
+        d = asdict(self)
+        # Convert any remaining Path objects to strings
+        for k, v in d.items():
+            if isinstance(v, Path):
+                d[k] = str(v)
+        return d
 
-        def _convert(value: Any) -> Any:
-            if isinstance(value, Path):
-                return str(value)
-            if is_dataclass(value) and not isinstance(value, type):
-                return {k: _convert(v) for k, v in asdict(value).items()}
-            if isinstance(value, dict):
-                return {k: _convert(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [_convert(v) for v in value]
-            return value
+    def state_dict(self) -> dict:
+        """Serialize for Ignite's Checkpoint handler."""
+        return self.to_dict()
 
-        return {k: _convert(v) for k, v in self.__dict__.items()}
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restore from a state_dict. Unknown keys are silently ignored."""
+        for key, value in state_dict.items():
+            if hasattr(self, key):
+                setattr(self, key, value)

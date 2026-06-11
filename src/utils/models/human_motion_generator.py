@@ -1,6 +1,9 @@
 import os
 import pathlib
 from contextlib import contextmanager
+from typing import Optional, Tuple, Union
+
+import torch
 
 
 @contextmanager
@@ -32,9 +35,9 @@ def _build_inference_time_boundaries(
 
 def integrate_flow_ode(
     *,
-    predictor: FlowMatchingPredictor,
+    predictor,
     track_features: torch.Tensor,
-    current_frame_features: torch.Tensor,
+    current_frame_features: Optional[torch.Tensor] = None,
     text_embedding: torch.Tensor,
     num_steps: int,
     time_schedule_power: float = 2.0,
@@ -52,16 +55,17 @@ def integrate_flow_ode(
     if time_schedule_power <= 0.0:
         raise ValueError(f"time_schedule_power must be positive, got {time_schedule_power}")
 
+    flow_dim = 68
     if initial_state is None:
         x_t = torch.randn(
-            (batch_size, predictor.flow_dim),
+            (batch_size, flow_dim),
             device=device,
             dtype=dtype,
         )
     else:
-        if initial_state.shape != (batch_size, predictor.flow_dim):
+        if initial_state.shape != (batch_size, flow_dim):
             raise ValueError(
-                f"Expected initial_state shape ({batch_size}, {predictor.flow_dim}), got {tuple(initial_state.shape)}"
+                f"Expected initial_state shape ({batch_size}, {flow_dim}), got {tuple(initial_state.shape)}"
             )
         x_t = initial_state.to(device=device, dtype=dtype)
 
@@ -103,9 +107,9 @@ def integrate_flow_ode(
         timesteps_batch: torch.Tensor,
     ) -> torch.Tensor:
         cond_velocity = predictor(
-            track_features=track_features,
-            noisy_features=noisy_features,
+            noisy_states=noisy_features,
             timesteps=timesteps_batch,
+            track_features=track_features,
             current_frame_features=current_frame_features,
             text_embedding=text_embedding,
             output_attentions=False,
@@ -121,9 +125,9 @@ def integrate_flow_ode(
             unconditional_track_features if unconditional_track_features is not None else track_features
         )
         uncond_velocity = predictor(
-            track_features=cfg_track_features,
-            noisy_features=noisy_features,
+            noisy_states=noisy_features,
             timesteps=timesteps_batch,
+            track_features=cfg_track_features,
             current_frame_features=current_frame_features,
             text_embedding=cfg_text_embedding,
             output_attentions=False,
@@ -342,11 +346,6 @@ class HumanMotionGenerator:
                     cache_state=cache_state,
                 )
                 predictor_uncond_context = torch.zeros_like(context_cond) if use_cfg and guidance_drop_context else None
-                current_frame_features = extract_prev_frame_features(
-                    current_frame,
-                    normalizer=self.normalizer,
-                    normalize_output=self.normalizer is not None,
-                )
 
                 # ========================================
                 # Step C: Flow matching ODE loop
@@ -355,7 +354,7 @@ class HumanMotionGenerator:
                 x_t = integrate_flow_ode(
                     predictor=self.predictor,
                     track_features=context_cond,
-                    current_frame_features=current_frame_features,
+                    current_frame_features=None,
                     text_embedding=text_emb,
                     num_steps=num_steps,
                     time_schedule_power=self.config.inference_t_schedule_power,
@@ -367,17 +366,17 @@ class HumanMotionGenerator:
                 # ========================================
                 # Step E: Convert reduced-state prediction -> positions -> 271D (incremental)
                 # ========================================
-                flow_output_raw = self.normalizer.denormalize_flow_output(x_t) if self.normalizer is not None else x_t
+                flow_output_raw = self.normalizer.denormalize_x68(x_t) if self.normalizer is not None else x_t
                 current_frame_raw = (
                     self.normalizer.denormalize(current_frame) if self.normalizer is not None else current_frame
                 )
-                new_positions = flow_output_to_positions(
+                new_positions = x68_to_positions(
                     flow_output_raw,
                     prev_root_pos=current_positions[:, 0],
                     prev_root_rot_6d=current_frame_raw[:, 69:75],
                 )
                 relative_shift = new_positions - current_positions
-                new_frame, _, fk_positions = generated_positions_to_271d(
+                new_frame, _, fk_positions = generated_positions_to_x271(
                     new_positions=new_positions,
                     prev_positions=current_positions,
                     dataset_type=dataset_type,
@@ -400,6 +399,170 @@ class HumanMotionGenerator:
 
                 if (frame_idx + 1) % 50 == 0:
                     print(f"Generated {frame_idx + 1}/{num_frames} frames")
+
+            return position_history, feature_history, relative_shift_history
+
+    def generate_sequence_masked(
+        self,
+        text: Union[str, List[str], torch.Tensor],
+        input_positions: Optional[torch.Tensor] = None,
+        num_future_frames: int = 10,
+        num_steps: int = 10,
+        guidance_scale: float = 1.0,
+        guidance_drop_text: bool = True,
+        guidance_drop_context: bool = False,
+        dataset_type: str = "t2m",
+        use_fk: bool = True,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Generate multiple future frames using masked token prediction.
+
+        Appends mask tokens to the known history in a single encoder forward pass,
+        then predicts each masked frame sequentially (autoregressive over masked positions).
+
+        Args:
+            text: Text prompt(s) - str, List[str], or pre-encoded tensor (B, 1, 512)
+            input_positions: Optional initial global positions (B, N, 22, 3) or (B, 22, 3)
+            num_future_frames: Number of frames to predict
+            num_steps: Number of flow matching ODE steps per frame
+            guidance_scale: CFG strength
+            guidance_drop_text: Zero text embedding in CFG branch
+            guidance_drop_context: Zero encoder context in CFG branch
+            dataset_type: Dataset type for feature extraction
+            use_fk: Whether to use FK-corrected positions
+        Returns:
+            position_history: (B, N+num_future_frames, 22, 3)
+            feature_history: (B, N+num_future_frames, 271)
+            relative_shift_history: (B, N+num_future_frames, 22, 3)
+        """
+        self.eval()
+        with torch.no_grad():
+            if isinstance(text, str):
+                from utils.text_encoder import CLIPEncoder
+
+                clip_encoder = CLIPEncoder()
+                text = clip_encoder(text)
+                B = 1
+            elif isinstance(text, list):
+                from utils.text_encoder import CLIPEncoder
+
+                clip_encoder = CLIPEncoder()
+                text: torch.Tensor = clip_encoder(text)
+                B = text.shape[0]
+            else:
+                if text.ndim != 3 or text.shape[1] != 1:
+                    raise ValueError(f"Pre-encoded text must have shape (B, 1, 512); got {tuple(text.shape)}")
+                B = text.shape[0]
+            device = next(self.parameters()).device
+            text = text.to(device=device)
+
+            # ---- History initialization ----
+            if input_positions is None:
+                joint_count = int(self.config.num_joints)
+                joint_dim = int(self.config.joint_dim)
+                position_history = torch.zeros((B, 1, joint_count, joint_dim), device=device)
+                feature_history = sequence_joints_to_features(position_history, dataset_type=dataset_type)
+            else:
+                input_positions = input_positions.to(device=device)
+                if input_positions.ndim == 3:
+                    seed_positions = input_positions.unsqueeze(1).clone()
+                elif input_positions.ndim == 4:
+                    seed_positions = input_positions.clone()
+                else:
+                    raise ValueError("input_positions must be shape (B, N, 3) or (B, T, N, 3)")
+                position_history = seed_positions
+                feature_history = sequence_joints_to_features(seed_positions, dataset_type=dataset_type)
+
+            fk_offsets = get_fk_offsets(position_history) if use_fk else None
+
+            feature_history = (
+                self.normalizer.normalize(feature_history) if self.normalizer is not None else feature_history
+            )
+
+            relative_shift_history = torch.zeros(
+                (B, 1, self.config.num_joints, self.config.joint_dim),
+                device=device,
+            )
+            if position_history.shape[1] > 1:
+                relative_shift_history = torch.cat(
+                    [relative_shift_history, position_history[:, 1:] - position_history[:, :-1]],
+                    dim=1,
+                )
+
+            text_emb = text[:, 0, :]
+            use_cfg = float(guidance_scale) != 1.0
+            if use_cfg and not (guidance_drop_text or guidance_drop_context):
+                raise ValueError(
+                    "guidance_scale requires at least one unconditional branch input; "
+                    "set guidance_drop_text and/or guidance_drop_context."
+                )
+            predictor_uncond_text_emb = torch.zeros_like(text_emb) if use_cfg and guidance_drop_text else None
+
+            # ---- Build masked sequence: known frames + mask tokens ----
+            masked_feature_history = feature_history
+            for _ in range(num_future_frames):
+                masked_feature_history = torch.cat(
+                    [masked_feature_history, self.encoder.mask_token.unsqueeze(0).expand(B, -1, -1)],
+                    dim=1,
+                )
+
+            mask = torch.zeros(B, masked_feature_history.shape[1], dtype=torch.bool, device=device)
+            mask[:, -num_future_frames:] = True
+
+            # ---- Single encoder forward pass ----
+            encoded = self.encoder(masked_feature_history, text_emb, mask=mask)
+            predictor_uncond_context = torch.zeros_like(encoded) if use_cfg and guidance_drop_context else None
+
+            # ---- Predict each masked frame autoregressively ----
+            for frame_idx in range(num_future_frames):
+                hist_len = feature_history.shape[1]
+                current_positions = position_history[:, -1]
+                current_frame = feature_history[:, -1]
+
+                context_cond = encoded[:, hist_len + frame_idx, :]
+
+                x_t = integrate_flow_ode(
+                    predictor=self.predictor,
+                    track_features=context_cond,
+                    current_frame_features=None,
+                    text_embedding=text_emb,
+                    num_steps=num_steps,
+                    time_schedule_power=self.config.inference_t_schedule_power,
+                    guidance_scale=guidance_scale,
+                    unconditional_text_embedding=predictor_uncond_text_emb,
+                    unconditional_track_features=predictor_uncond_context[:, hist_len + frame_idx, :]
+                    if predictor_uncond_context is not None
+                    else None,
+                )
+
+                flow_output_raw = self.normalizer.denormalize_x68(x_t) if self.normalizer is not None else x_t
+                current_frame_raw = (
+                    self.normalizer.denormalize(current_frame) if self.normalizer is not None else current_frame
+                )
+                new_positions = x68_to_positions(
+                    flow_output_raw,
+                    prev_root_pos=current_positions[:, 0],
+                    prev_root_rot_6d=current_frame_raw[:, 69:75],
+                )
+                relative_shift = new_positions - current_positions
+                new_frame, _, fk_positions = generated_positions_to_x271(
+                    new_positions=new_positions,
+                    prev_positions=current_positions,
+                    dataset_type=dataset_type,
+                    normalizer=self.normalizer,
+                    fk_offsets=fk_offsets,
+                )
+
+                if fk_positions is not None:
+                    new_positions = fk_positions
+                    relative_shift = new_positions - current_positions
+
+                position_history = torch.cat([position_history, new_positions.unsqueeze(1)], dim=1)
+                feature_history = torch.cat([feature_history, new_frame.unsqueeze(1)], dim=1)
+                relative_shift_history = torch.cat(
+                    [relative_shift_history, relative_shift.unsqueeze(1)],
+                    dim=1,
+                )
 
             return position_history, feature_history, relative_shift_history
 

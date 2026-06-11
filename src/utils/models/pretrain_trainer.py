@@ -24,7 +24,6 @@ from ignite.handlers import (
     Checkpoint,
     DiskSaver,
     TerminateOnNan,
-    global_step_from_engine,
 )
 from ignite.handlers.tqdm_logger import ProgressBar
 from torch.amp.grad_scaler import GradScaler
@@ -33,8 +32,7 @@ from utils.config import Config
 from utils.dataset import create_dataloader
 from utils.models.flow_matching_predictor import LatentDecoder
 from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
-from utils.motion_utils import F as Features
-from utils.motion_utils import x68_to_x271, x271_to_x68
+from utils.motion_utils import Features, x68_to_x271, x271_to_x68
 from utils.wandb_logger import WandbLogger
 
 
@@ -153,7 +151,13 @@ def random_span_mask(
     num_spans: int = 2,
     min_span: int = 8,
     max_span: int = 20,
+    config: Config | None = None,
 ):
+    if config is not None:
+        num_spans = max(1, int(config.mask_num_spans))
+        min_span = max(1, int(config.mask_min_span))
+        max_span = max(min_span, int(config.mask_max_span))
+
     mask = torch.zeros(seq_len, dtype=torch.bool)
 
     for _ in range(num_spans):
@@ -482,9 +486,9 @@ class PretrainTrainer:
         batch_size, seq_len, _ = motion.shape
 
         # Build mask
-        mask_bool = (
-            random_span_mask(seq_len, num_spans=2, min_span=2, max_span=4).unsqueeze(0).expand(batch_size, -1)
-        ).to(self.device)  # (B, seq_len)
+        mask_bool = (random_span_mask(seq_len, 0, 0, 0, self.config).unsqueeze(0).expand(batch_size, -1)).to(
+            self.device
+        )  # (B, seq_len)
 
         with torch.amp.autocast(  # type: ignore
             device_type=self.device.type,
@@ -686,42 +690,53 @@ class PretrainTrainer:
             engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)  # type: ignore[attr-defined]
 
         checkpoint_mapping = {
+            "trainer": trainer,
             "encoder": self.encoder,
+            "linear_probe": self.linear_probe,
             "jepa_predictor": self.jepa_predictor,
             "encoder_ema": self.ema_encoder,
+            "decoder": self.decoder,
             "optimizer": self.optimizer,
             "scaler": self.scaler,
             "lr_scheduler": self.lr_scheduler,
             "aux_lr_scheduler": self.aux_lr_scheduler,
             "metadata": CheckpointMetadata({"session_id": self.pretraining_session_id, "resume_id": self.resume_id}),
+            "config": self.config,
         }
+
+        def global_step_transform(engine: PretrainEngine, _) -> int:
+            return trainer.get_metric("global_step", 0)
+
         # Best checkpoint handler
         val_best_checkpoint = Checkpoint(
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
-            filename_prefix="pretrain_best_val",
+            filename_prefix=f"pretrain_best_val_{self.pretraining_session_id}",
+            filename_pattern="{filename_prefix}_{global_step}.pt",
             score_function=lambda engine: -float(engine.state.metrics["loss"]),
             score_name="val_loss",
-            global_step_transform=global_step_from_engine(trainer),
+            global_step_transform=global_step_transform,
         )
 
         eval_best_checkpoint = Checkpoint(
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
-            filename_prefix="pretrain_best_eval",
+            filename_prefix=f"pretrain_best_eval_{self.pretraining_session_id}",
             score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
             score_name="eval_loss",
-            global_step_transform=global_step_from_engine(trainer),
+            filename_pattern="{filename_prefix}_{global_step}.pt",
+            global_step_transform=global_step_transform,
         )
 
         latest_checkpoint = Checkpoint(
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
-            filename_prefix="pretrain_latest",
-            filename_pattern="{filename_prefix}.pt",
+            filename_prefix=f"pretrain_latest_{self.pretraining_session_id}",
+            filename_pattern="{filename_prefix}_{global_step}.pt",
+            global_step_transform=global_step_transform,
         )
 
         trainer.add_event_handler(

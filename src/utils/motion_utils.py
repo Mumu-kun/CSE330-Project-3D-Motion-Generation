@@ -105,7 +105,7 @@ def get_dataset_config(dataset_type: str = "t2m") -> Dict[str, Any]:
 # ============================================================================
 
 
-class F:
+class Features:
     """Feature layout constants for the 271D format."""
 
     # 271D slices
@@ -477,11 +477,11 @@ class FeatureNormalizer:
         self._mean_263 = torch.cat(
             [
                 torch.zeros(1),
-                mean[F.ROOT_VX],
-                mean[F.ROOT_VZ],
-                mean[F.JOINT_RIC],
-                mean[F.JOINT_ROT6D],
-                mean[F.JOINT_VEL],
+                mean[Features.ROOT_VX],
+                mean[Features.ROOT_VZ],
+                mean[Features.JOINT_RIC],
+                mean[Features.JOINT_ROT6D],
+                mean[Features.JOINT_VEL],
                 torch.zeros(4),
             ],
             dim=0,
@@ -489,11 +489,11 @@ class FeatureNormalizer:
         self._std_263 = torch.cat(
             [
                 torch.ones(1),
-                std[F.ROOT_VX],
-                std[F.ROOT_VZ],
-                std[F.JOINT_RIC],
-                std[F.JOINT_ROT6D],
-                std[F.JOINT_VEL],
+                std[Features.ROOT_VX],
+                std[Features.ROOT_VZ],
+                std[Features.JOINT_RIC],
+                std[Features.JOINT_ROT6D],
+                std[Features.JOINT_VEL],
                 torch.ones(4),
             ],
             dim=0,
@@ -624,9 +624,9 @@ def x271_to_positions(
 
     raw = normalizer.denormalize(x271)
 
-    root_features = raw[..., F.ROOT]
-    ric = raw[..., F.RIC].reshape(B, T, 22, 3)
-    rotations_6d = raw[..., F.ROT6D].reshape(B, T, 22, 6)
+    root_features = raw[..., Features.ROOT]
+    ric = raw[..., Features.RIC].reshape(B, T, 22, 3)
+    rotations_6d = raw[..., Features.ROT6D].reshape(B, T, 22, 6)
 
     root_quat = cont6d_to_quaternion(rotations_6d[:, :, 0])
 
@@ -663,10 +663,10 @@ def x271_to_x68(
     root_y = raw[..., 0:1]
     root_v = raw[..., 1:3]
     delta_yaw = compute_root_delta_yaw_sin_cos(
-        raw[..., F.ROOT_ROT6D],
-        None if raw_prev is None else raw_prev[..., F.ROOT_ROT6D],
+        raw[..., Features.ROOT_ROT6D],
+        None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
     )
-    joint_ric = raw[..., F.JOINT_RIC]
+    joint_ric = raw[..., Features.JOINT_RIC]
 
     x68 = torch.cat([root_y, root_v, delta_yaw, joint_ric], dim=-1)
     x68 = normalizer.normalize_x68(x68)
@@ -691,7 +691,7 @@ def x68_to_positions(
     prev_x271 = normalizer.denormalize(prev_x271)
 
     prev_root_pos = prev_positions[:, 0]  # (B, 3)
-    prev_root_rot_6d = prev_x271[:, F.ROOT_ROT6D]  # (B, 6)
+    prev_root_rot_6d = prev_x271[:, Features.ROOT_ROT6D]  # (B, 6)
 
     root_y = x68[:, 0:1]
     root_vx = x68[:, 1:2]
@@ -733,18 +733,18 @@ def x271_to_x263(
     raw_prev = normalizer.denormalize(prev_x271) if prev_x271 is not None else None
 
     root_rot_vel = compute_root_delta_yaw(
-        raw[..., F.ROOT_ROT6D],
-        None if raw_prev is None else raw_prev[..., F.ROOT_ROT6D],
+        raw[..., Features.ROOT_ROT6D],
+        None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
     )
     root_block = torch.cat([root_rot_vel, raw[..., 1:3], raw[..., 0:1]], dim=-1)
 
     x263 = torch.cat(
         [
             root_block,  # 4D
-            raw[..., F.JOINT_RIC],  # 63D
-            raw[..., F.JOINT_ROT6D],  # 126D
-            raw[..., F.JOINT_VEL],  # 63D
-            raw[..., F.CONTACTS],  # 4D
+            raw[..., Features.JOINT_RIC],  # 63D
+            raw[..., Features.JOINT_ROT6D],  # 126D
+            raw[..., Features.JOINT_VEL],  # 63D
+            raw[..., Features.CONTACTS],  # 4D
         ],
         dim=-1,
     )
