@@ -50,14 +50,17 @@ def test_jepa_pretrain_basic():
     config.checkpoint_interval = 1
 
     # Reduce model size for faster testing
-    config.encoder_config.hidden_size = 16
-    config.encoder_config.intermediate_size = 16
-    config.encoder_config.num_hidden_layers = 2
+    config.encoder_config.hidden_size = 32
+    config.encoder_config.intermediate_size = 32
+    config.encoder_config.num_hidden_layers = 4
     config.encoder_config.num_attention_heads = 2
 
     config.encoder_config.jp_config.hidden_size = 16
     config.encoder_config.jp_config.intermediate_size = 16
     config.encoder_config.jp_config.num_hidden_layers = 2
+
+    config.decoder_config.hidden_size = 16
+    config.decoder_config.intermediate_size = 32
 
     config.num_workers = 0  # Set to 0 for testing to avoid multiprocessing issues
 
@@ -75,7 +78,7 @@ def test_jepa_pretrain_basic():
     print(f"Train batches: {len(train_dataloader)}")
     print(f"Val batches: {len(val_dataloader)}")
 
-    print(f"\nEncoder params: {sum(p.numel() for p in MotionHistoryEncoder(config.encoder_config).parameters()):,}")
+    print(f"\nEncoder params: {sum(p.numel() for p in MotionHistoryEncoder(config).parameters()):,}")
 
     # Run pretraining using convenience function
     print("\nRunning JEPA pretraining for 2 epochs...")

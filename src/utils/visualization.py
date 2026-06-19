@@ -7,6 +7,7 @@ Provides 3D animation and comparison visualization for motion sequences.
 from pathlib import Path
 from typing import Any, Optional
 
+import matplotlib.colors
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -180,18 +181,143 @@ def visualize_motion(
     return html
 
 
+def plot_3d_motion_comparison(
+    generated_joints: np.ndarray,
+    ground_truth_joints: np.ndarray,
+    fps: float = 20,
+    radius: float = 1.0,
+    title: str = "Generated vs Ground Truth",
+    probe: bool = False,
+    save_path: Optional[Path] = None,
+):
+    import base64
+    import io
+
+    import imageio
+    from IPython.display import HTML
+
+    gen_colors = ["#2980b9", "#c0392b", "#27ae60", "#f39c12", "#8e44ad"]
+    gt_color = matplotlib.colors.to_rgba("#aaaaaa", alpha=0.4)
+
+    n_frames = min(len(generated_joints), len(ground_truth_joints))
+
+    all_joints = np.concatenate([generated_joints[:n_frames], ground_truth_joints[:n_frames]], axis=1)
+    pos_min = all_joints.min(axis=(0, 1))
+    pos_max = all_joints.max(axis=(0, 1))
+
+    x_range = [pos_min[0] - radius, pos_max[0] + radius]
+    y_range = [pos_min[2] - radius, pos_max[2] + radius]
+    z_range = [pos_min[1], pos_max[1] + 0.5]
+
+    fig = plt.figure(figsize=(6, 6), dpi=120)
+    ax = fig.add_subplot(111, projection="3d")
+    ax.xaxis.pane.fill = False
+    ax.yaxis.pane.fill = False
+    ax.zaxis.pane.fill = False
+    ax.xaxis.pane.set_edgecolor("lightgray")
+    ax.yaxis.pane.set_edgecolor("lightgray")
+    ax.zaxis.pane.set_edgecolor("lightgray")
+    ax.grid(False)
+    ax.view_init(elev=15, azim=65)
+    ax.set_xlim3d(x_range)
+    ax.set_ylim3d(y_range)
+    ax.set_zlim3d(z_range)
+    ax.set_xlabel("X (Side)")
+    ax.set_ylabel("Z (Forward)")
+    ax.set_zlabel("Y (Height)")
+    ax.set_title(title)
+
+    if probe:
+        print(f"\n[probe] Matplotlib camera + scene state for '{title}':")
+        probe_camera_state(ax)
+
+    gt_lines = [
+        ax.plot([], [], [], color=gt_color, marker="o", ms=2, lw=2)[0]
+        for _ in range(len(T2M_KINEMATIC_CHAIN))
+    ]
+    gen_lines = [
+        ax.plot([], [], [], color=gen_colors[i % len(gen_colors)], marker="o", ms=2, lw=2)[0]
+        for i in range(len(T2M_KINEMATIC_CHAIN))
+    ]
+
+    gt_root_traj_color = matplotlib.colors.to_rgba("#aaaaaa", alpha=0.25)
+    gen_root_traj_color = matplotlib.colors.to_rgba("#2980b9", alpha=0.35)
+    gt_root_line = ax.plot([], [], [], color=gt_root_traj_color, lw=1.5, linestyle="--")[0]
+    gen_root_line = ax.plot([], [], [], color=gen_root_traj_color, lw=1.5, linestyle="--")[0]
+
+    gt_roots_x = ground_truth_joints[:n_frames, 0, 0]
+    gt_roots_z = ground_truth_joints[:n_frames, 0, 2]
+    gt_roots_y = ground_truth_joints[:n_frames, 0, 1]
+    gen_roots_x = generated_joints[:n_frames, 0, 0]
+    gen_roots_z = generated_joints[:n_frames, 0, 2]
+    gen_roots_y = generated_joints[:n_frames, 0, 1]
+
+    if save_path:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+    target = str(save_path) if save_path else io.BytesIO()
+
+    writer_kwargs = {
+        "fps": fps,
+        "codec": "libx264",
+        "output_params": ["-preset", "ultrafast", "-crf", "28"],
+    }
+    if save_path:
+        writer = imageio.get_writer(target, format="FFMPEG", **writer_kwargs)
+    else:
+        writer = imageio.get_writer(target, format="mp4", **writer_kwargs)
+
+    for frame_idx in range(n_frames):
+        for i, c_indices in enumerate(T2M_KINEMATIC_CHAIN):
+            gt_joints = ground_truth_joints[frame_idx, c_indices, :]
+            gt_lines[i].set_data(gt_joints[:, 0], gt_joints[:, 2])
+            gt_lines[i].set_3d_properties(gt_joints[:, 1])
+
+            gen_joints = generated_joints[frame_idx, c_indices, :]
+            gen_lines[i].set_data(gen_joints[:, 0], gen_joints[:, 2])
+            gen_lines[i].set_3d_properties(gen_joints[:, 1])
+
+        gt_root_line.set_data(gt_roots_x[:frame_idx + 1], gt_roots_z[:frame_idx + 1])
+        gt_root_line.set_3d_properties(gt_roots_y[:frame_idx + 1])
+        gen_root_line.set_data(gen_roots_x[:frame_idx + 1], gen_roots_z[:frame_idx + 1])
+        gen_root_line.set_3d_properties(gen_roots_y[:frame_idx + 1])
+
+        fig.canvas.draw()
+        img = np.asarray(fig.canvas.buffer_rgba())[..., :3]
+        writer.append_data(img)
+
+    writer.close()
+    plt.close(fig)
+
+    if save_path:
+        print(f"Saved animation to {save_path}")
+        return save_path
+
+    target.seek(0)
+    b64 = base64.b64encode(target.read()).decode()
+    return HTML(f'<video controls width="600"><source src="data:video/mp4;base64,{b64}"></video>')
+
+
 def compare_motions(
     generated_joints: np.ndarray,
     ground_truth_joints: np.ndarray,
     save_path: Optional[Path] = None,
+    fps: float = 20,
+    radius: float = 1.0,
     backend: str = "matplotlib",
-) -> None:
+    probe: bool = False,
+) -> Any:
     """
-    Compare generated motion with ground truth.
+    Compare generated motion with ground truth on the same 3D axes.
+
+    GT is rendered in light gray (#aaaaaa) with alpha=0.4.
+    Generated is rendered in original kinematic chain colors.
     """
-    visualize_motion(
+    return plot_3d_motion_comparison(
         generated_joints,
+        ground_truth_joints,
+        fps=fps,
+        radius=radius,
         title="Generated vs Ground Truth",
+        probe=probe,
         save_path=save_path,
-        backend=backend,
     )

@@ -103,8 +103,7 @@ FILE_ORDER = [
     "models/motion_history_encoder.py",
     "models/flow_matching_predictor.py",
     "models/pretrain_trainer.py",
-    # "models/human_motion_generator.py",
-    # "models/finetune_trainer.py",
+    "models/finetune_trainer.py",
 ]
 
 _IMPORT_RE = re.compile(r"^(\s*)(from\s+(?:utils\.[A-Za-z_.][\w.]*|\.+[\w.]*)\s+import)")

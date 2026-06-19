@@ -49,9 +49,10 @@ class JepaPredictorConfig:
 
 @dataclass
 class LatentDecoderConfig:
-    hidden_size: int = 256
-    intermediate_size: int = 768
-    # num_hidden_layers: int = 2
+    hidden_size: int = 512
+    intermediate_size: int = 2 * 512
+    dropout: float = 0.0
+    num_layers: int = 4
 
 
 @dataclass
@@ -88,6 +89,35 @@ class MotionHistoryEncoderConfig:
 
 
 @dataclass
+class PretrainConfig:
+    """Configuration for pretraining the motion predictor."""
+
+    effective_batch_size: int = 400
+    batch_size: int = 200
+    learning_rate: float = 0.5e-4
+    weight_decay: float = 1e-5
+    gradient_clip: float = 30.0
+    ema_decay: float = 0.999
+    lr_warmup_epochs: int = 5
+    lr_scheduler: str = "cosine"
+    jepa_ctx_weight: float = 0.2
+    cfg_dropout: float = 0.1
+
+    schedules: dict[str, list[tuple[float, float]]] = field(
+        default_factory=lambda: {
+            "mask_num_spans": [
+                (0, 2),
+                (1, 6),
+            ],
+        }
+    )
+
+    # --- Masking ---
+    mask_min_span: int = 5
+    mask_max_span: int = 10
+
+
+@dataclass
 class Config:
     """Configuration for the motion generation pipeline."""
 
@@ -114,12 +144,8 @@ class Config:
     decoder_config: LatentDecoderConfig = field(default_factory=LatentDecoderConfig)
     text_embedding_dim: int = 512
 
-    # --- Masking ---
-    mask_num_spans: int = 4
-    mask_min_span: int = 5
-    mask_max_span: int = 20
-
-    # --- Training ---
+    # --- PreTraining ---
+    pre_conf: PretrainConfig = field(default_factory=PretrainConfig)
     effective_batch_size: int = 400
     batch_size: int = 200
     learning_rate: float = 0.5e-4
@@ -230,7 +256,22 @@ class Config:
         return self.to_dict()
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Restore from a state_dict. Unknown keys are silently ignored."""
+        """Restore from a state_dict. Reconstructs nested dataclass objects."""
+        from dataclasses import fields, is_dataclass
+
         for key, value in state_dict.items():
             if hasattr(self, key):
+                field_type = None
+                for f in fields(self):
+                    if f.name == key:
+                        field_type = f.type
+                        break
+                if field_type and isinstance(value, dict):
+                    # Try to reconstruct nested dataclass
+                    try:
+                        # For dataclass types, field.type is the class itself
+                        if isinstance(field_type, type) and is_dataclass(field_type):
+                            value = field_type(**value)
+                    except Exception:
+                        pass
                 setattr(self, key, value)

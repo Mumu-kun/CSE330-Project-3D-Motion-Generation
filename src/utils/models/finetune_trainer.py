@@ -1,480 +1,616 @@
-"""
-Flow Matching Fine-tuning Trainer for Motion Generation.
+"""Decoder-only finetuning trainer for motion latent reconstruction.
 
-Standalone, self-contained trainer using PyTorch Ignite.
-Handles all model building, training loop configuration, and execution.
-Designed for direct use in Kaggle notebooks with minimal boilerplate.
+Loads a pretrained MotionHistoryEncoder and its EMA copy from checkpoint,
+freezes them, and trains a fresh LatentDecoder on the same reconstruction loss
+used during pretraining.
 """
 
 from __future__ import annotations
 
-import copy
-from typing import Any, Dict, Tuple
+import os
+import pathlib
+import sys
+from contextlib import contextmanager
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from math import ceil
+from pathlib import Path
+from typing import Dict, Tuple, cast
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
-from torch.utils.data import DataLoader
-from ignite.engine import Engine, Events
-from ignite.handlers import Checkpoint, DiskSaver, TerminateOnNan, global_step_from_engine
+from ignite.engine import Events
+from ignite.handlers import (
+    Checkpoint,
+    DiskSaver,
+    TerminateOnNan,
+    Timer,
+)
+from ignite.handlers.tqdm_logger import ProgressBar
 from ignite.metrics import RunningAverage
+from torch.amp.grad_scaler import GradScaler
 
 from utils.config import Config
-from utils.models import MotionHistoryEncoder, FlowMatchingPredictor
-from utils.motion_utils import (
-    FeatureNormalizer,
-    x271_to_x68,
-)
-from utils.wandb_logger import WandbLogger as _WandbLogger
-
-T = torch.Tensor
-
-# Constants for flow diagnostics
-LOSS_VS_T_NUM_BINS = 100
+from utils.dataset import create_dataloader
+from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, estimate_time_remaining
+from utils.models.flow_matching_predictor import LatentDecoder
+from utils.models.motion_history_encoder import MotionHistoryEncoder
+from utils.motion_utils import Features, x68_to_x271, x271_to_x68
+from utils.wandb_logger import WandbLogger
 
 
-def _compute_per_sample_flow_loss(pred: T, target_flow: T) -> T:
-    """Compute one mean-MSE flow loss value per flattened training sample."""
-    if pred.shape != target_flow.shape:
-        raise ValueError(f"Shape mismatch: {tuple(pred.shape)} vs {tuple(target_flow.shape)}")
-    if pred.ndim < 2:
-        raise ValueError(f"Expected at least 2D, got {tuple(pred.shape)}")
-    return F.mse_loss(pred, target_flow, reduction="none").mean(dim=-1)
+@contextmanager
+def _windows_checkpoint_path_compat():
+    """Allow checkpoints pickled with PosixPath to load on Windows."""
+    original_posix_path = pathlib.PosixPath
+    should_patch_posix = os.name == "nt"
+    if should_patch_posix:
+        pathlib.PosixPath = pathlib.WindowsPath
+    try:
+        yield
+    finally:
+        if should_patch_posix:
+            pathlib.PosixPath = original_posix_path
 
 
-def _aggregate_loss_vs_t_bins(
-    t_values: T,
-    per_sample_flow_loss: T,
-    num_bins: int = LOSS_VS_T_NUM_BINS,
-) -> Dict[str, T]:
-    """Aggregate per-sample flow loss into fixed bins over t in [0, 1]."""
-    if num_bins <= 0:
-        raise ValueError(f"num_bins must be positive, got {num_bins}")
-    if t_values.ndim != 1 or per_sample_flow_loss.ndim != 1:
-        raise ValueError(f"Expected 1D tensors, got {tuple(t_values.shape)} and {tuple(per_sample_flow_loss.shape)}")
+def _torch_load_with_compat(path, map_location, weights_only):
+    """Load checkpoint with Windows path and module path compatibility."""
+    with _windows_checkpoint_path_compat():
+        import utils.config
 
-    bin_edges = torch.linspace(0.0, 1.0, steps=num_bins + 1, dtype=torch.float64)
-    bin_centers = (bin_edges[:-1] + bin_edges[1:]) * 0.5
-    counts = torch.zeros(num_bins, dtype=torch.long)
-    mean_losses = torch.full((num_bins,), float("nan"), dtype=torch.float64)
-
-    t_cpu = t_values.detach().to(dtype=torch.float64, device="cpu").clamp_(0.0, 1.0)
-    loss_cpu = per_sample_flow_loss.detach().to(dtype=torch.float64, device="cpu")
-    bin_indices = torch.clamp((t_cpu * num_bins).to(torch.long), max=num_bins - 1)
-
-    counts = torch.bincount(bin_indices, minlength=num_bins)
-    sums = torch.bincount(bin_indices, weights=loss_cpu, minlength=num_bins)
-    nonempty = counts > 0
-    mean_losses[nonempty] = sums[nonempty] / counts[nonempty].to(torch.float64)
-
-    return {
-        "bin_edges": bin_edges,
-        "bin_centers": bin_centers,
-        "counts": counts,
-        "mean_flow_loss": mean_losses,
-    }
+        original_config = sys.modules.get("config")
+        sys.modules["config"] = utils.config
+        try:
+            checkpoint = torch.load(path, map_location=map_location, weights_only=weights_only)
+        finally:
+            if original_config is not None:
+                sys.modules["config"] = original_config
+            else:
+                sys.modules.pop("config", None)
+    return checkpoint
 
 
-class EMAModel(nn.Module):
-    """Exponential Moving Average model wrapper for stable evaluation."""
-
-    def __init__(self, model: nn.Module, decay: float = 0.999):
-        super().__init__()
-        self.decay = decay
-        self.model = copy.deepcopy(model)
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        self.model.eval()
-
-    def update(self, model: nn.Module) -> None:
-        """Update EMA weights from source model."""
-        with torch.no_grad():
-            for ema_p, p in zip(self.model.parameters(), model.parameters()):
-                ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
-
-    def to(self, device: torch.device) -> "EMAModel":
-        self.model.to(device)
-        return self
-
-    def state_dict(self) -> Dict[str, Any]:
-        return self.model.state_dict()
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        self.model.load_state_dict(state_dict)
-
-
-class FiTrainer:
-    """
-    Flow matching fine-tuning trainer with curriculum support.
-    
-    Fully self-contained: builds models, optimizer, and Ignite engine.
-    Usage:
-        trainer = FiTrainer(config=config, train_loader=train_loader, val_loader=val_loader)
-        trainer.run()
-    """
+class FinetuneTrainer:
+    """Decoder-only finetuning trainer."""
 
     def __init__(
         self,
         config: Config,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        normalizer: FeatureNormalizer | None = None,
+        pretrained_checkpoint_path: str | Path,
         wandb_project: str | None = None,
     ) -> None:
         self.config = config
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.normalizer = normalizer
+        self.pretrained_checkpoint_path = Path(pretrained_checkpoint_path)
         self.wandb_project = wandb_project
 
-        # Device and AMP setup
-        self.device = torch.device(config.device)
+        self.device = torch.device(config.device) if torch.cuda.is_available() else torch.device("cpu")
         self.use_amp = self.device.type == "cuda"
-        self.amp_dtype = (
-            torch.bfloat16
-            if self.use_amp and torch.cuda.is_bf16_supported()
-            else torch.float16
+        self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
+        self.scaler = GradScaler(self.device.type, enabled=self.use_amp)
+
+        self.session_id = datetime.now(timezone(timedelta(hours=6))).strftime("%Y%m%d_%H%M%S")
+        self.finetuning_session_id = self.session_id
+        self.resume_id: str | None = None
+
+        self._load_pretrained_encoder_state()
+
+        self.decoder = LatentDecoder(config).to(self.device)
+        self.ema_decoder: EMAModel[LatentDecoder] = EMAModel(self.decoder, decay=float(config.ema_decay)).to(
+            self.device
         )
-
-        # Models - built internally
-        self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config.encoder_config)
-        self.predictor: FlowMatchingPredictor = FlowMatchingPredictor(
-            feature_size=config.get_predictor_feature_size(),
-            config=config.predictor_config,
-        )
-
-        # EMA models
-        self.ema_encoder: EMAModel = EMAModel(self.encoder, decay=float(config.ema_decay))
-        self.ema_predictor: EMAModel = EMAModel(self.predictor, decay=float(config.ema_decay))
-
-        # Optimizer and scaler
-        self.optimizer: torch.optim.Optimizer = torch.optim.AdamW(
-            list(self.encoder.parameters()) + list(self.predictor.parameters()),
-            lr=float(config.learning_rate),
-            weight_decay=float(config.weight_decay),
-        )
-        self.scaler: GradScaler = GradScaler("cuda", enabled=self.use_amp)
-
-        # Ignite engines
-        self.trainer: Engine | None = None
-        self.evaluator: Engine | None = None
-
-        # W&B logger
-        self.wandb_logger: _WandbLogger | None = None
-
-        # State tracking
-        self.global_step = 0
-        self.best_train_loss = float("inf")
-        self.best_val_loss = float("inf")
-
-        # Initialize all objects
-        self._initialize()
-
-    def _initialize(self) -> None:
-        """Initialize all components: models, optimizer, W&B."""
-        # Create checkpoint directory
-        self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Move to device
         self.encoder.to(self.device)
-        self.predictor.to(self.device)
         self.ema_encoder.to(self.device)
-        self.ema_predictor.to(self.device)
+        self.decoder.to(self.device)
 
-        # Setup W&B
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.ema_encoder.model.parameters():
+            parameter.requires_grad_(False)
+        self.encoder.eval()
+        self.ema_encoder.model.eval()
+
+        self._log_model_parameters()
+
+        self.wandb_logger: WandbLogger | None = None
+
+        self._initialize()
+
+    def _initialize(self) -> None:
+        config = self.config
+        self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        self.train_loader, self.normalizer = create_dataloader(self.config, "train", shuffle=True)
+        self.val_loader, _ = create_dataloader(self.config, "val", shuffle=False)
+
+        self.accumulation_steps = ceil(config.effective_batch_size / config.batch_size) or 1
+
+        self.optimizer = torch.optim.AdamW(
+            self.decoder.parameters(),
+            lr=float(self.config.learning_rate),
+            weight_decay=float(self.config.weight_decay),
+        )
+        self._setup_scheduler(num_epochs=int(config.get_num_epochs()))
+
         if self.wandb_project:
-            self.wandb_logger = _WandbLogger(
+            self.wandb_logger = WandbLogger(
                 project=self.wandb_project,
+                name=self.finetuning_session_id,
                 config={
                     "lr": float(self.config.learning_rate),
                     "weight_decay": float(self.config.weight_decay),
                     "ema_decay": float(self.config.ema_decay),
-                    "batch_size": self.train_loader.batch_size,
+                    "batch_size": getattr(self.train_loader, "batch_size", self.config.batch_size),
+                    "effective_batch_size": self.config.effective_batch_size,
                     "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
-                    "predictor_params": sum(p.numel() for p in self.predictor.parameters()),
-                    "phase": "finetune",
+                    "decoder_params": sum(p.numel() for p in self.decoder.parameters()),
+                    "phase": "finetune_decoder",
+                    "session_id": self.session_id,
+                    "pretrained_checkpoint": str(self.pretrained_checkpoint_path),
                 },
+                resume_id=self.resume_id,
+            )
+            self.resume_id = self.wandb_logger.run.id if self.wandb_logger.run else None
+
+    def _load_pretrained_encoder_state(self) -> None:
+        if not self.pretrained_checkpoint_path.exists():
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {self.pretrained_checkpoint_path}")
+
+        checkpoint = _torch_load_with_compat(self.pretrained_checkpoint_path, self.device, weights_only=False)
+
+        # Handle both wrapped and unwrapped metadata/config
+        metadata = checkpoint.get("metadata")
+        if isinstance(metadata, CheckpointMetadata):
+            metadata = metadata.state_dict()
+        self.pretraining_session_id = metadata.get("session_id", "unknown") if metadata else "unknown"
+
+        config_raw = checkpoint.get("config")
+        config: Config = Config()
+        if isinstance(config_raw, CheckpointMetadata):
+            config_raw = config_raw.state_dict()
+        if isinstance(config_raw, dict):
+            # Reconstruct config from dict - Config.load_state_dict handles nested dataclasses
+            config.load_state_dict(config_raw)
+
+        encoder_state = checkpoint.get("encoder")
+        encoder_ema_state = checkpoint.get("encoder_ema")
+        if encoder_state is None and encoder_ema_state is None:
+            raise KeyError(
+                f"Checkpoint {self.pretrained_checkpoint_path} does not contain encoder or encoder_ema weights"
             )
 
-    def _sample_timesteps(self, batch_size: int, epoch: int) -> T:
-        """Sample training timesteps according to config (power or uniform)."""
-        u = torch.rand(batch_size, device=self.device, dtype=torch.float32)
+        primary_state = encoder_state if encoder_state is not None else encoder_ema_state
+        ema_state = encoder_ema_state if encoder_ema_state is not None else encoder_state
+        assert primary_state is not None
 
-        if self.config.t_sampling_mode == "uniform":
-            return u
+        self.encoder = MotionHistoryEncoder(config).to(self.device)
+        self.ema_encoder = EMAModel(self.encoder, decay=float(config.ema_decay)).to(self.device)
 
-        if self.config.t_sampling_power <= 0 or self.config.get_num_epochs <= 1:
-            return u
+        self.encoder.load_state_dict(primary_state)
+        self.ema_encoder.load_state_dict(ema_state)
 
-        return u.pow(1.0 / (float(self.config.t_sampling_power) + 1.0))
+    def _log_model_parameters(self) -> None:
+        def _summary(name: str, module: nn.Module) -> None:
+            total = sum(param.numel() for param in module.parameters())
+            trainable = sum(param.numel() for param in module.parameters() if param.requires_grad)
+            frozen = total - trainable
+            print(f"\n{'=' * 60}")
+            print(f"Model: {name}")
+            print(f"{'=' * 60}")
+            print(f"Total parameters     : {total:,}")
+            print(f"Trainable parameters : {trainable:,}")
+            print(f"Frozen parameters    : {frozen:,}")
 
-    def _compute_losses(self, batch: Dict[str, T], epoch: int) -> Tuple[T, T, T]:
-        """Compute flow and consistency losses."""
-        motion = batch["motion"].to(self.device)
-        text = batch["text_clip"].to(self.device)
+        _summary("MotionHistoryEncoder", self.encoder)
+        _summary("LatentDecoder", self.decoder)
 
-        if self.normalizer is not None:
-            motion = self.normalizer.normalize(motion)
+    def _set_dataset_horizon(self) -> None:
+        horizon = int(self.config.horizon)
+        if hasattr(self.train_loader, "dataset") and hasattr(self.train_loader.dataset, "set_horizon"):
+            self.train_loader.dataset.set_horizon(horizon)  # type: ignore[attr-defined]
+        if hasattr(self.val_loader, "dataset") and hasattr(self.val_loader.dataset, "set_horizon"):
+            self.val_loader.dataset.set_horizon(horizon)  # type: ignore[attr-defined]
 
-        # History and target
-        history = motion[:, :-1]
-        target_motion = motion[:, -1]
-        current_frame = history[:, -1]
-
-        # Text embedding with CFG dropout
-        if self.config.cfg_dropout > 0.0 and torch.rand(1, device=self.device).item() <= self.config.cfg_dropout:
-            text_emb = torch.zeros(
-                motion.shape[0],
-                self.config.encoder_config.text_embedding_dim,
-                device=self.device,
-                dtype=text.dtype,
-            )
-        else:
-            text_emb = text[:, 0, :] if text.ndim == 3 else text
-
-        # Forward pass
-        track_features = self.encoder(history, text_emb, return_all=False).unsqueeze(1)
-
-        x1 = subset_271d_to_68d(target_motion, prev_frame=current_frame, normalizer=self.normalizer)
-        x0 = torch.randn_like(x1)
-        t = self._sample_timesteps(target_motion.shape[0], epoch)
-        xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
-
-        predicted_flow, _, _ = self.predictor(
-            track_features=track_features,
-            noisy_states=xt,
-            timesteps=t,
-            text_embedding=text_emb,
-            current_frame_features=None,
-            output_attentions=False,
-            output_hidden_states=False,
+    def _setup_scheduler(self, num_epochs: int) -> None:
+        assert self.optimizer is not None
+        steps_per_epoch = max(ceil(len(self.train_loader) / self.accumulation_steps), 1)
+        total_steps = max(num_epochs * steps_per_epoch, 1)
+        warmup_epochs = int(self.config.lr_warmup_epochs)
+        pct_start = min(max(warmup_epochs / num_epochs, 0.0), 1.0) if num_epochs > 0 else 0.0
+        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=float(self.config.learning_rate),
+            total_steps=total_steps,
+            pct_start=pct_start,
+            anneal_strategy="cos",
         )
 
-        flow_loss = F.mse_loss(predicted_flow, x1 - x0)
-        per_sample_loss = _compute_per_sample_flow_loss(predicted_flow, x1 - x0)
+    @staticmethod
+    def _prepare_text_embedding(text: torch.Tensor) -> torch.Tensor:
+        return text[:, -1, :] if text.ndim == 3 else text
 
-        # Consistency loss
-        consistency_loss = predicted_flow.new_zeros(())
-        if self.config.use_consistency_loss:
-            t_thresh_mask = t > self.config.consistency_loss_t_threshold
-            if t_thresh_mask.any():
-                pred_x1 = xt[t_thresh_mask] + predicted_flow[t_thresh_mask] * (1 - t.unsqueeze(1)[t_thresh_mask])
+    def _train_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Execute one pretraining step."""
+        self._decoder = self.decoder
+        # Forward pass
+        self._decoder.train()
 
-                flow_raw = self.normalizer.denormalize_x68(pred_x1) if self.normalizer else pred_x1
-                x1_raw = self.normalizer.denormalize_x68(x1[t_thresh_mask]) if self.normalizer else x1[t_thresh_mask]
+        # Prepare batch
+        motion = batch["motion"].to(self.device)
+        motion = self.normalizer.normalize(motion)
+        text = batch["text_clip"].to(self.device)
+        joints = batch["joints"].to(self.device)
 
-                # Root loss
-                root_loss = F.mse_loss(flow_raw[:, :3], x1_raw[:, :3])
+        if motion.ndim != 3 or motion.shape[1] < 2:
+            raise ValueError(f"Expected motion (B, T, 271), got {tuple(motion.shape)}")
 
-                # Yaw loss
-                x1_dyaw = sin_cos_to_yaw(x1_raw[:, 3:5])
-                pred_dyaw = sin_cos_to_yaw(flow_raw[:, 3:5])
-                yaw_error = wrap_angle(pred_dyaw - x1_dyaw)
-                yaw_loss = yaw_error.pow(2).mean()
+        losses = self._compute_loss(engine, motion, joints, text)
 
-                # RIC loss
-                ric_loss = F.mse_loss(flow_raw[:, 5:], x1_raw[:, 5:])
+        loss = losses["loss"]
 
-                consistency_loss = ric_loss * 3 + root_loss * 20 + yaw_loss * 10
+        self.scaler.scale(loss / self.accumulation_steps).backward()
 
-        total_loss = flow_loss + self.config.consistency_loss_weight * consistency_loss
-        return total_loss, flow_loss, consistency_loss
+        if engine.state.iteration % self.accumulation_steps == 0:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
 
-    def _train_step(self, engine: Engine, batch: Dict[str, T]) -> Dict[str, T]:
-        """Execute one training step."""
-        self.encoder.train()
-        self.predictor.train()
+            self.ema_decoder.update(self.decoder)
+            self.lr_scheduler.step()
 
-        self.optimizer.zero_grad(set_to_none=True)
+            engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
 
-        with torch.amp.autocast(
+        return {
+            "loss": loss.detach(),
+            "lr": losses["lr"],
+        }
+
+    def _val_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        """Execute one validation step."""
+        self._encoder = self.ema_encoder.model
+        self._encoder.eval()
+        self._decoder = self.ema_decoder.model
+        self._decoder.eval()
+
+        motion = batch["motion"].to(self.device)
+        motion = self.normalizer.normalize(motion)
+        text = batch["text_clip"].to(self.device)
+        joints = batch["joints"].to(self.device)
+
+        with torch.no_grad():
+            losses = self._compute_loss(engine, motion, joints, text)
+
+        return {
+            "lr": losses["lr"],
+            "val_loss": losses["loss"],
+        }
+
+    def _compute_loss(
+        self, engine: PretrainEngine, motion: torch.Tensor, joints: torch.Tensor, text: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        batch_size, seq_len, _ = motion.shape
+
+        with torch.amp.autocast(  # type: ignore
             device_type=self.device.type,
             dtype=self.amp_dtype,
             enabled=self.use_amp,
         ):
-            loss, flow_loss, consistency_loss = self._compute_losses(batch, epoch=int(engine.state.epoch))
+            text_emb = text[:, -1, :] if text.ndim == 3 else text
 
-        self.scaler.scale(loss).backward()
+            with torch.no_grad():
+                target_encoder = self.ema_encoder.model
+                target_encoder.eval()
+                target_context = target_encoder(
+                    motion, torch.zeros_like(text_emb), mask=None, return_layer_outputs=True
+                ).detach()  # (B, seq_len, L, H)
 
-        # Gradient clipping
-        self.scaler.unscale_(self.optimizer)
-        torch.nn.utils.clip_grad_norm_(
-            list(self.encoder.parameters()) + list(self.predictor.parameters()),
-            float(self.config.gradient_clip),
+            latent = target_context[:, 1:, -1, :]  # (B, seq_len-1, H_enc)
+            decoded = self._decoder(latent)  # (B, seq_len-1, 68)
+
+            decoder_losses = self._decoder_loss(engine, motion, joints, decoded)
+            loss = decoder_losses["decoder_loss"]
+            decoder_loss = decoder_losses["decoder_loss"]
+
+        engine.csa_op_metrics(
+            [
+                ("loss", loss.detach().item()),
+            ],
+            1.0 / self.accumulation_steps,
+            engine.state.iteration % self.accumulation_steps == 1,  # Clear on first step of accumulation
         )
 
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
-
-        # EMA update
-        self.ema_encoder.update(self.encoder)
-        self.ema_predictor.update(self.predictor)
-
-        # Update state
-        self.global_step = int(engine.state.iteration)
-        self.best_train_loss = min(self.best_train_loss, float(loss.detach().item()))
-
         return {
-            "loss": loss.detach(),
-            "flow_loss": torch.tensor(flow_loss.detach().item(), device=self.device),
-            "consistency_loss": torch.tensor(consistency_loss.detach().item(), device=self.device),
-            "lr": torch.tensor(float(self.config.learning_rate), device=self.device),
+            "loss": loss,
+            "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
         }
 
-    def _val_step(self, engine: Engine, batch: Dict[str, T]) -> Dict[str, T]:
-        """Execute one validation step."""
-        motion = batch["motion"].to(self.device)
-        if self.normalizer is not None:
-            motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
+    def _decoder_loss(
+        self,
+        engine: PretrainEngine,
+        motion: torch.Tensor,
+        joints: torch.Tensor,
+        decoded: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        prev_positions = joints[:, :-1, :].flatten(0, 1)
+        prev_frames = motion[:, :-1, :].flatten(0, 1)
+        y_frames = motion[:, 1:, :].flatten(0, 1)
+        decoded = decoded.flatten(0, 1)
 
-        with torch.no_grad():
-            self.ema_encoder.model.eval()
-            self.ema_predictor.model.eval()
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_frames)
+        y_vel = y_frames[..., Features.VEL]
+        y_feet = y_frames[..., Features.CONTACTS]
 
-            history = motion[:, :-1]
-            target_motion = motion[:, -1]
-            current_frame = history[:, -1]
-            text_emb = text[:, 0, :] if text.ndim == 3 else text
+        dec_271d = x68_to_x271(decoded, self.normalizer, prev_positions, prev_frames)
+        dec_vel = dec_271d[..., Features.VEL]
+        dec_feet = dec_271d[..., Features.CONTACTS]
+        dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
 
-            track_features = self.ema_encoder.model(history, text_emb, return_all=False).unsqueeze(1)
+        loss_68d = F.mse_loss(decoded, y_68d, reduction="mean")
+        loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
 
-            x1 = x271_to_x68(target_motion, prev_frame=current_frame, normalizer=self.normalizer)
-            t = torch.rand(target_motion.shape[0], device=self.device, dtype=torch.float32)
-            x0 = torch.randn_like(x1)
-            xt = t.unsqueeze(1) * x1 + (1 - t.unsqueeze(1)) * x0
+        mask_feet_4d = y_feet.bool() & ~dec_feet.bool()
+        mask_feet_miss = mask_feet_4d.any(dim=-1)
+        loss_feet = (
+            dec_foot_vel[mask_feet_miss].square().mean()
+            if mask_feet_miss.any()
+            else torch.tensor(0.0, device=self.device)
+        )
 
-            predicted_flow, _, _ = self.ema_predictor.model(
-                track_features=track_features,
-                noisy_states=xt,
-                timesteps=t,
-                text_embedding=text_emb,
-                current_frame_features=None,
-                output_attentions=False,
-                output_hidden_states=False,
-            )
+        decoder_loss = loss_68d + loss_vel * 0.5 + loss_feet * 0.5
+        feet_miss_rate = (
+            mask_feet_4d.sum().float() / y_feet.bool().sum().float()
+            if y_feet.bool().sum() > 0
+            else torch.tensor(0.0, device=self.device)
+        )
 
-            loss = F.mse_loss(predicted_flow, x1 - x0)
+        engine.set_metrics(
+            [
+                ("decoder_loss", decoder_loss.detach().item()),
+                ("loss_68d", loss_68d.detach().item()),
+                ("loss_vel", loss_vel.detach().item()),
+                ("loss_feet", loss_feet.detach().item()),
+                ("feet_miss_rate", feet_miss_rate.detach().item()),
+            ],
+        )
 
-        return {"val_loss": loss.detach()}
+        return {
+            "decoder_loss": decoder_loss,
+            "loss_68d": loss_68d.detach(),
+            "loss_vel": loss_vel.detach(),
+            "loss_feet": loss_feet.detach(),
+            "feet_miss_rate": feet_miss_rate.detach(),
+        }
 
-    def _attach_handlers(self, trainer: Engine, evaluator: Engine) -> None:
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         """Attach Ignite event handlers for training orchestration."""
-        # Running averages
-        RunningAverage(output_transform=lambda o: o["loss"]).attach(trainer, "loss")
-        RunningAverage(output_transform=lambda o: o["val_loss"]).attach(evaluator, "val_loss")
 
         # NaN termination
         trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
 
+        # Progress bar for console display
+        pbar = ProgressBar(
+            mininterval=10.0,
+        )
+        pbar.attach(trainer, ["loss"])
+
+        trainer.state.horizon = self.config.horizon
+
+        timer = Timer(average=False)
+
+        timer.attach(trainer, start=Events.STARTED, resume=Events.ITERATION_STARTED, pause=Events.ITERATION_COMPLETED)
+
+        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0))
+
         # Step logging
-        @trainer.on(Events.ITERATION_COMPLETED(every=50))
-        def _log_train_step(engine: Engine) -> None:
+        @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _log_train_step(engine: PretrainEngine) -> None:
             if not self.wandb_logger:
                 return
-            output = engine.state.output
-            if not isinstance(output, dict):
-                return
-            metrics = {
-                "train/loss": float(output.get("loss", 0.0)),
-                "train/loss_avg": float(engine.state.metrics.get("loss", 0.0)),
-                "train/lr": float(output.get("lr", 0.0)),
-                "train/loss_flow": float(output.get("flow_loss", 0.0)),
-                "train/loss_consistency": float(output.get("consistency_loss", 0.0)),
-            }
-            self.wandb_logger.log(metrics, step=int(engine.state.iteration))
 
-        # Latest checkpoint
-        latest_checkpoint = Checkpoint(
-            {
-                "encoder": self.encoder,
-                "predictor": self.predictor,
-                "encoder_ema": self.ema_encoder,
-                "predictor_ema": self.ema_predictor,
-                "optimizer": self.optimizer,
-                "scaler": self.scaler,
-            },
+            step_time = timer.value() if timer.value() is not None else 0.0
+            timer.reset()
+
+            _step_time_avg = cast(float, step_time_avg.compute())
+            remaining_time = estimate_time_remaining(engine, _step_time_avg, self.config)
+
+            engine.set_metrics(
+                [
+                    ("step_time", step_time),
+                    ("remaining_time", remaining_time),
+                ]
+            )
+
+            metrics = engine.get_metrics(
+                [
+                    "decoder_loss",
+                    "loss_68d",
+                    "loss_vel",
+                    "loss_feet",
+                    "feet_miss_rate",
+                    "lr",
+                ],
+                prefix="train/",
+            )
+            self.wandb_logger.log(metrics, step=engine.get_metric("global_step", 0))
+            self.wandb_logger.log(
+                {
+                    "train/horizon": engine.state.horizon,
+                    "epoch": int(engine.state.epoch),
+                    "global_step": int(engine.get_metric("global_step", 0)),
+                    "step_time": step_time,
+                    "remaining_time": remaining_time,
+                },
+                step=engine.get_metric("global_step", 0),
+            )
+
+        @trainer.on(Events.GET_BATCH_STARTED)
+        def _set_horizon(engine: PretrainEngine) -> None:
+            engine.state.dataloader.dataset.set_horizon(engine.state.horizon)  # type: ignore[attr-defined]
+
+        @evaluator.on(Events.GET_BATCH_STARTED)
+        def _set_horizon_eval(engine: PretrainEngine) -> None:
+            engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)  # type: ignore[attr-defined]
+
+        checkpoint_mapping = {
+            "trainer": trainer,
+            "encoder": self.encoder,
+            "encoder_ema": self.ema_encoder,
+            "decoder": self.decoder,
+            "decoder_ema": self.ema_decoder,
+            "optimizer": self.optimizer,
+            "scaler": self.scaler,
+            "lr_scheduler": self.lr_scheduler,
+            "metadata": CheckpointMetadata(
+                {"pretrain_id": self.pretraining_session_id, "session_id": self.session_id, "resume_id": self.resume_id}
+            ),
+            "config": CheckpointMetadata(asdict(self.config)),
+        }
+
+        def global_step_transform(engine: PretrainEngine, _) -> int:
+            return trainer.get_metric("global_step", 0)
+
+        # Best checkpoint handler
+        val_best_checkpoint = Checkpoint(
+            checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
-            filename_prefix="finetune_latest",
-            global_step_transform=global_step_from_engine(trainer),
-        )
-
-        # Best checkpoint
-        best_checkpoint = Checkpoint(
-            {
-                "encoder": self.encoder,
-                "predictor": self.predictor,
-                "encoder_ema": self.ema_encoder,
-                "predictor_ema": self.ema_predictor,
-                "optimizer": self.optimizer,
-                "scaler": self.scaler,
-            },
-            DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
-            n_saved=1,
-            filename_prefix="finetune_best",
-            score_function=lambda e: -float(e.state.metrics["val_loss"]),
+            filename_prefix=f"pretrain_best_val_{self.pretraining_session_id}",
+            filename_pattern="{filename_prefix}_{global_step}.pt",
+            score_function=lambda engine: -float(engine.state.metrics["loss"]),
             score_name="val_loss",
-            global_step_transform=global_step_from_engine(trainer),
+            global_step_transform=global_step_transform,
+        )
+        self.val_best_checkpoint = val_best_checkpoint
+
+        # eval_best_checkpoint = Checkpoint(
+        #     checkpoint_mapping,
+        #     DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
+        #     n_saved=1,
+        #     filename_prefix=f"pretrain_best_eval_{self.pretraining_session_id}",
+        #     score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
+        #     score_name="eval_loss",
+        #     filename_pattern="{filename_prefix}_{global_step}.pt",
+        #     global_step_transform=global_step_transform,
+        # )
+
+        latest_checkpoint = Checkpoint(
+            checkpoint_mapping,
+            DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
+            n_saved=1,
+            filename_prefix=f"pretrain_latest_{self.pretraining_session_id}",
+            filename_pattern="{filename_prefix}_{global_step}.pt",
+            global_step_transform=global_step_transform,
         )
 
-        trainer.add_event_handler(Events.EPOCH_COMPLETED, latest_checkpoint)
+        self.latest_checkpoint = latest_checkpoint
+
+        trainer.add_event_handler(
+            Events.EPOCH_COMPLETED(every=self.config.checkpoint_interval),
+            latest_checkpoint,
+        )
+
+        @trainer.on(Events.EPOCH_COMPLETED(every=self.config.val_interval))
+        def _run_validation(engine: PretrainEngine) -> None:
+            evaluator.run(self.val_loader)
+
+        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def track_batch_loss(engine: PretrainEngine) -> None:
+            engine.csa_op_metrics(
+                [
+                    ("val_loss", engine.get_metric("val_loss", 0.0)),
+                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
+                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
+                ],
+                1.0,
+            )
+
+        val_batches = self.config.val_batches
+        if val_batches > 0:
+
+            @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+            def _limit_val_batches(engine: PretrainEngine) -> None:
+                if engine.state.iteration // self.accumulation_steps >= val_batches:
+                    engine.terminate()
 
         @evaluator.on(Events.COMPLETED)
-        def _log_val(engine: Engine) -> None:
-            val_loss = float(engine.state.metrics.get("val_loss", float("nan")))
-            if self.wandb_logger:
-                self.wandb_logger.log({"val/loss": val_loss}, step=int(self.global_step))
+        def _log_best_validation(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
 
-        evaluator.add_event_handler(Events.COMPLETED, best_checkpoint)
+            batch_count = engine.state.iteration // self.accumulation_steps
+
+            engine.scale_metrics(
+                ["val_decoder_loss", "val_feet_miss_rate"],
+                1.0 / batch_count if batch_count > 0 else 1.0,
+            )
+
+            self.wandb_logger.log(
+                engine.get_metrics(
+                    [
+                        "val_decoder_loss",
+                        "val_feet_miss_rate",
+                        "decoder_loss",
+                    ],
+                    prefix="val/",
+                ),
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+
+            self.wandb_logger.log(
+                {
+                    "epoch": int(trainer.state.epoch),
+                    "global_step": int(trainer.get_metric("global_step", 0)),
+                },
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+
+            val_loss = float(engine.get_metric("val_loss", float("inf")))
+            best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
+            if val_loss < best_val_loss:
+                engine.set_metrics([("best_val_loss", val_loss)])
+                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
+
+            eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
+            best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
+            if eval_loss < best_eval_loss:
+                engine.set_metrics([("best_eval_loss", eval_loss)])
+                self.wandb_logger.log({"val/best_eval_loss": eval_loss}, step=int(trainer.get_metric("global_step", 0)))
+
+        evaluator.add_event_handler(Events.COMPLETED, val_best_checkpoint)
 
     def run(self, max_epochs: int | None = None) -> None:
-        """Execute the fine-tuning loop."""
-        if self.trainer is None:
-            self.trainer = Engine(self._train_step)
-            self.evaluator = Engine(self._val_step)
-            self._attach_handlers(self.trainer, self.evaluator)
+        """Execute the finetuning loop."""
+        print(f"Starting finetuning session: {self.session_id}")
+        trainer = PretrainEngine(lambda engine, batch: self._train_step(engine, batch), self.config)
+        self.evaluator = PretrainEngine(lambda engine, batch: self._val_step(engine, batch), self.config)
+        self._attach_handlers(trainer, self.evaluator)
 
-        epochs = max_epochs or int(self.config.get_num_epochs)
-        self.trainer.run(self.train_loader, max_epochs=epochs)
+        epochs = max_epochs or int(self.config.get_num_epochs())
+        trainer.run(self.train_loader, max_epochs=epochs)
 
         if self.wandb_logger:
             self.wandb_logger.finish()
 
 
-# Convenience function for notebook usage
 def train_finetune(
     config: Config,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
-    normalizer: FeatureNormalizer | None = None,
+    pretrained_checkpoint_path: str | Path,
     wandb_project: str | None = None,
     max_epochs: int | None = None,
-) -> Tuple[EMAModel, EMAModel]:
-    """
-    Fine-tune with flow matching objective in a single call.
-    
-    Args:
-        config: Training configuration
-        train_loader: Training data loader
-        val_loader: Validation data loader
-        normalizer: Optional feature normalizer
-        wandb_project: Optional W&B project name
-        max_epochs: Override number of epochs (uses config default if None)
-    
-    Returns:
-        Tuple of (ema_encoder, ema_predictor)
-    """
-    trainer = FiTrainer(
+) -> Tuple[EMAModel[MotionHistoryEncoder], EMAModel[LatentDecoder], Path]:
+    """Train the decoder while reusing a pretrained encoder checkpoint."""
+
+    trainer = FinetuneTrainer(
         config=config,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        normalizer=normalizer,
+        pretrained_checkpoint_path=pretrained_checkpoint_path,
         wandb_project=wandb_project,
     )
     trainer.run(max_epochs=max_epochs)
-    return trainer.ema_encoder, trainer.ema_predictor
+    checkpoint_path = trainer.val_best_checkpoint.last_checkpoint
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else Path()
+    return trainer.ema_encoder, trainer.ema_decoder, checkpoint_path
 
 
-__all__ = ["EMAModel", "FiTrainer", "train_finetune", "_compute_per_sample_flow_loss", "_aggregate_loss_vs_t_bins"]
+__all__ = ["FinetuneTrainer", "train_finetune"]

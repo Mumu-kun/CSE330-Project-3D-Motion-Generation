@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.config import MotionHistoryEncoderConfig
+from utils.config import Config, MotionHistoryEncoderConfig
 from utils.models import AdaLN, GatedMLP, TemporalCacheState, TemporalLayerCache, TemporalRoPEAttention, init_weights
 
 
@@ -86,18 +86,20 @@ class EncoderLayer(nn.Module):
 
 
 class MotionHistoryEncoder(nn.Module):
-    def __init__(self, config: MotionHistoryEncoderConfig) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.config = config
+        self._config = config
+        self.config = config.encoder_config
+        enc_config = config.encoder_config
 
-        self.frame_projection = nn.Linear(config.frame_feature_dim, config.hidden_size, bias=True)
+        self.frame_projection = nn.Linear(config.motion_dim, enc_config.hidden_size, bias=True)
 
-        self.layers = nn.ModuleList([EncoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([EncoderLayer(enc_config) for _ in range(enc_config.num_hidden_layers)])
 
-        self.final_norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.final_norm = nn.LayerNorm(enc_config.hidden_size, eps=enc_config.layer_norm_eps)
 
-        self.register_tokens = nn.Parameter(torch.empty(config.num_registers, config.hidden_size))
-        self.mask_token = nn.Parameter(torch.empty(1, config.hidden_size))
+        self.register_tokens = nn.Parameter(torch.empty(enc_config.num_registers, enc_config.hidden_size))
+        self.mask_token = nn.Parameter(torch.empty(1, enc_config.hidden_size))
 
         self._init_weights()
 
@@ -117,13 +119,13 @@ class MotionHistoryEncoder(nn.Module):
         return_layer_outputs: bool = False,
         is_causal: bool = False,
     ) -> torch.Tensor:
-        if motion_seq.ndim != 3 or motion_seq.shape[-1] != self.config.frame_feature_dim:
+        if motion_seq.ndim != 3 or motion_seq.shape[-1] != self._config.motion_dim:
             raise ValueError(
-                f"Expected motion_seq shape (B, T, {self.config.frame_feature_dim}), got {tuple(motion_seq.shape)}"
+                f"Expected motion_seq shape (B, T, {self._config.motion_dim}), got {tuple(motion_seq.shape)}"
             )
-        if text_emb.ndim != 2 or text_emb.shape[-1] != self.config.text_embedding_dim:
+        if text_emb.ndim != 2 or text_emb.shape[-1] != self._config.text_embedding_dim:
             raise ValueError(
-                f"Expected text_emb shape (B, {self.config.text_embedding_dim}), got {tuple(text_emb.shape)}"
+                f"Expected text_emb shape (B, {self._config.text_embedding_dim}), got {tuple(text_emb.shape)}"
             )
         if text_emb.shape[0] != motion_seq.shape[0]:
             raise ValueError(
@@ -149,7 +151,7 @@ class MotionHistoryEncoder(nn.Module):
         if mask is not None:
             mask_flat = mask.flatten()  # (B*T,)
             hidden_states_flat = hidden_states.flatten(0, 1)  # (B*T, H)
-            hidden_states_flat[mask_flat] = self.mask_token
+            hidden_states_flat[mask_flat] = self.mask_token.to(hidden_states_flat)
             hidden_states = hidden_states_flat.view_as(hidden_states)  # (B, T, H)
 
         register_tokens = self.register_tokens.unsqueeze(0).expand(batch_size, -1, -1)
@@ -180,16 +182,15 @@ class MotionHistoryEncoder(nn.Module):
         frame_buffer: Optional[torch.Tensor],
         cache_state: Optional[TemporalCacheState] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, TemporalCacheState]:
-        if x_t.ndim != 2 or x_t.shape[-1] != self.config.frame_feature_dim:
-            raise ValueError(f"Expected x_t shape (B, {self.config.frame_feature_dim}), got {tuple(x_t.shape)}")
+        if x_t.ndim != 2 or x_t.shape[-1] != self._config.motion_dim:
+            raise ValueError(f"Expected x_t shape (B, {self._config.motion_dim}), got {tuple(x_t.shape)}")
 
         if frame_buffer is None:
             next_frame_buffer = x_t.unsqueeze(1)
         else:
-            if frame_buffer.ndim != 3 or frame_buffer.shape[-1] != self.config.frame_feature_dim:
+            if frame_buffer.ndim != 3 or frame_buffer.shape[-1] != self._config.motion_dim:
                 raise ValueError(
-                    "Expected frame_buffer shape "
-                    f"(B, T, {self.config.frame_feature_dim}), got {tuple(frame_buffer.shape)}"
+                    f"Expected frame_buffer shape (B, T, {self._config.motion_dim}), got {tuple(frame_buffer.shape)}"
                 )
             if frame_buffer.shape[0] != x_t.shape[0]:
                 raise ValueError(
@@ -297,7 +298,7 @@ class JepaPredictor(nn.Module):
         )
 
         self.output_proj = nn.ModuleList(
-            [nn.Linear(self.hidden_size, self.hidden_size) for _ in range(config.num_hidden_layers)]
+            [nn.Linear(self.hidden_size, config.hidden_size) for _ in range(config.num_hidden_layers)]
         )
 
         self._init_weights()
@@ -346,7 +347,7 @@ class JepaPredictor(nn.Module):
         x = self.final_norm(x)
         x = self.output_mlp(x)  # (B, T, L*H)
 
-        x = x.view(B, T, L, H_enc)  # (B, T, L, H_enc)
+        x = x.view(B, T, L, -1)  # (B, T, L, H)
 
         layer_outputs = []
         for i in range(self.config.num_hidden_layers):

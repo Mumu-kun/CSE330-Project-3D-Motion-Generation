@@ -12,8 +12,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from utils.config import Config
-from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
 from utils.models.flow_matching_predictor import LatentDecoder
+from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
 
 
 def _count_parameters(module) -> dict[str, int]:
@@ -106,7 +106,7 @@ def main() -> None:
     config = _load_config(args.checkpoint)
 
     # Instantiate models directly without full trainer overhead (avoid EMA deepcopy OOM)
-    encoder = MotionHistoryEncoder(config.encoder_config)
+    encoder = MotionHistoryEncoder(config)
     jepa_predictor = JepaPredictor(config.encoder_config)
     linear_probe = LinearProbe(
         hidden_size=config.encoder_config.hidden_size,

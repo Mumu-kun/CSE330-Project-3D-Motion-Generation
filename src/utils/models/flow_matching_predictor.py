@@ -242,18 +242,34 @@ class FlowMatchingPredictor(nn.Module):
         )
 
 
+class DecoderMLP(nn.Module):
+    def __init__(self, config: Config):
+        super().__init__()
+        self.norm = nn.RMSNorm(config.decoder_config.hidden_size, eps=config.predictor_config.rms_norm_eps)
+
+        self.mlp = nn.Sequential(
+            nn.Linear(config.decoder_config.hidden_size, config.decoder_config.intermediate_size, bias=True),
+            nn.GELU(),
+            nn.Dropout(config.decoder_config.dropout),
+            nn.Linear(config.decoder_config.intermediate_size, config.decoder_config.hidden_size, bias=True),
+            nn.Dropout(config.decoder_config.dropout),
+        )
+        self._initialize_weights()
+
+    def _initialize_weights(self) -> None:
+        init_weights(self, linear_init="xavier_normal")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.mlp(self.norm(x))
+
+
 class LatentDecoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.decoder = GatedMLP(
-            hidden_size=config.encoder_config.hidden_size,
-            intermediate_size=config.decoder_config.intermediate_size,
-            output_size=config.decoder_config.hidden_size,
-            bias=True,
-            activation="silu",
-            dropout=0.0,
-        )
+
+        self.down_proj = nn.Linear(config.encoder_config.hidden_size, config.decoder_config.hidden_size, bias=True)
+        self.blocks = nn.Sequential(*[DecoderMLP(config) for _ in range(config.decoder_config.num_layers)])
         self.out_proj = nn.Linear(config.decoder_config.hidden_size, 68, bias=True)
 
         self._initialize_weights()
@@ -262,9 +278,14 @@ class LatentDecoder(nn.Module):
         init_weights(self, linear_init="xavier_normal")
 
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        pred = self.decoder(latent)
-        pred = self.out_proj(pred)
-        return pred
+        """
+        latent: (B, H_encoder) - the latent representation from the predictor
+        output: (B, 68) - the predicted reduced features (root_y, root_vxz, delta_yaw, joint_ric)
+        """
+        x = self.down_proj(latent)
+        x = self.blocks(x)
+        x = self.out_proj(x)
+        return x
 
     def decode(
         self, latent: torch.Tensor, prev_pos: torch.Tensor, prev_frame: torch.Tensor, normalizer: FeatureNormalizer
@@ -272,7 +293,7 @@ class LatentDecoder(nn.Module):
         """
         Decodes the predicted flow output into new joint positions and relative shifts.
         Args:
-            latent: The latent representation from the predictor (B, N, H_enc).
+            latent: The latent representation from the predictor (B, H_enc).
             prev_pos: The previous joint positions (B, 22, 3) - only the first joint is used for flow decoding.
             prev_frame: The previous frame's full features (B, 271) - normalized.
             normalizer: The feature normalizer to denormalize the outputs.

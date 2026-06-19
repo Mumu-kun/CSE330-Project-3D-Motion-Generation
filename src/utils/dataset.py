@@ -4,14 +4,16 @@ Dataset loading and Text2Motion dataset implementation.
 Handles loading HumanML3D dataset with text-motion pairs.
 """
 
-import torch
-import numpy as np
-from os.path import join as pjoin
 import random
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from os.path import join as pjoin
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
 from utils.config import Config
 from utils.motion_utils import FeatureNormalizer
 
@@ -62,9 +64,7 @@ class Text2MotionDataset(Dataset):
 
                 text_data = []
                 flag = False
-                with open(
-                    pjoin(str(text_dir), name + ".txt"), "r", encoding="utf-8"
-                ) as f:
+                with open(pjoin(str(text_dir), name + ".txt"), "r", encoding="utf-8") as f:
                     for line in f.readlines():
                         text_dict: Dict[str, Optional[Any]] = {}
                         line_split = line.strip().split("#")
@@ -83,21 +83,11 @@ class Text2MotionDataset(Dataset):
                         else:
                             try:
                                 n_motion = motion[int(f_tag * 20) : int(to_tag * 20)]
-                                if (len(n_motion)) < min_motion_len or (
-                                    len(n_motion) >= 200
-                                ):
+                                if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
                                     continue
-                                new_name = (
-                                    random.choice("ABCDEFGHIJKLMNOPQRSTUVW")
-                                    + "_"
-                                    + name
-                                )
+                                new_name = random.choice("ABCDEFGHIJKLMNOPQRSTUVW") + "_" + name
                                 while new_name in data_dict:
-                                    new_name = (
-                                        random.choice("ABCDEFGHIJKLMNOPQRSTUVW")
-                                        + "_"
-                                        + name
-                                    )
+                                    new_name = random.choice("ABCDEFGHIJKLMNOPQRSTUVW") + "_" + name
                                 n_joints = joints[int(f_tag * 20) : int(to_tag * 20)]
                                 data_dict[new_name] = {
                                     "motion": n_motion,
@@ -120,7 +110,7 @@ class Text2MotionDataset(Dataset):
                     }
                     new_name_list.append(name)
                     length_list.append(len(motion))
-            except Exception as e:
+            except Exception:
                 pass
 
         name_length_pairs = list(zip(new_name_list, length_list))
@@ -162,9 +152,7 @@ class Text2MotionDataset(Dataset):
             clip_encoder.to(config.device)
 
             batch_size = 32
-            for i in tqdm(
-                range(0, len(missing_captions), batch_size), desc="Encoding Texts"
-            ):
+            for i in tqdm(range(0, len(missing_captions), batch_size), desc="Encoding Texts"):
                 batch_caps = missing_captions[i : i + batch_size]
                 with torch.no_grad():
                     # (B, 1, 512) - pooled CLIP embeddings
@@ -195,7 +183,7 @@ class Text2MotionDataset(Dataset):
     This is the ONLY version that works - replace everything else
     """
 
-    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str]:
+    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]:
         """
         Returns a single sample from the dataset.
         GUARANTEES: All returned tensors have shape (max_motion_length, features)
@@ -215,6 +203,7 @@ class Text2MotionDataset(Dataset):
         # Choose random text
         text_data = random.choice(text_list)
         caption = text_data["caption"]
+        tokens: list[str] = text_data["tokens"]
 
         # ===== CONVERT TO TENSORS =====
         motion = torch.from_numpy(motion.copy()).float()  # (T, 271) - RAW features
@@ -302,7 +291,7 @@ class Text2MotionDataset(Dataset):
         # valid_length is the number of real frames before zero-padding, capped at target_len.
         sample_id = self.name_list[idx]
 
-        return caption, motion, joints, valid_length, text_embedding, sample_id
+        return caption, motion, joints, valid_length, text_embedding, sample_id, tokens
 
     def reset_min_len(self, length: int | None = None):
         if length is None:
@@ -335,7 +324,7 @@ CLIP_EMBED_DIM = 512
 
 
 def text2motion_collate_fn(
-    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str]],
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
@@ -354,6 +343,7 @@ def text2motion_collate_fn(
     lengths = [b[3] for b in batch]
     text_embs_list = [b[4] for b in batch]
     sample_ids = [b[5] for b in batch]
+    tokens_list = [b[6] for b in batch]
 
     # Stack tensors directly
     motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)
@@ -369,6 +359,7 @@ def text2motion_collate_fn(
         "joints": joints_batch,
         "lengths": length_batch,
         "text_clip": text_emb_batch,
+        "tokens": tokens_list,
     }
 
 

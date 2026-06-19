@@ -4,6 +4,7 @@ torchvision
 numpy
 scipy
 transformers
+AdamWClip
 
 # Data processing
 pandas

@@ -169,6 +169,57 @@ class Features:
         return mask
 
 
+class Features263:
+    """Extended feature layout for the 263D legacy evaluator format."""
+
+    # 263D slices
+    ROOT_ROTVEL = slice(0, 1)  # root angular velocity around Y (for legacy compatibility)
+    ROOT_VEL = slice(1, 3)  # root velocity XZ (for legacy compatibility)
+    RIC = slice(4, 67)  # 21 non-root joints * 3
+    ROT6D = slice(67, 193)  # 21 non-root joints * 6
+    VEL = slice(193, 259)  # 22 non-root joints * 3
+    CONTACTS = slice(259, 263)  # 4 foot contacts
+
+    JOINT_VEL = slice(196, 259)  # 21 non-root joints * 3
+
+    @staticmethod
+    def calc_mean_std(
+        data: torch.Tensor,  # (B, N, 263)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Calculate mean and std with optional masking of specified joint collections."""
+        root_rotvel = data[:, :, Features263.ROOT_ROTVEL]
+        root_vel = data[:, :, Features263.ROOT_VEL]
+        ric = data[:, :, Features263.RIC]
+        rot6d = data[:, :, Features263.ROT6D]
+        vel = data[:, :, Features263.VEL]
+
+        mean = torch.cat(
+            [
+                root_rotvel.mean(dim=(0, 1)),
+                root_vel.mean(dim=(0, 1)),
+                ric.mean(dim=(0, 1)),
+                rot6d.mean(dim=(0, 1)),
+                vel.mean(dim=(0, 1)),
+                torch.zeros(4),  # contacts are binary, so we set mean to 0 for stability
+            ],
+            dim=0,
+        )
+
+        std = torch.cat(
+            [
+                root_rotvel.std(dim=(0, 1)),
+                root_vel.std(dim=(0, 1)),
+                ric.std(dim=(0, 1)),
+                rot6d.std(dim=(0, 1)),
+                vel.std(dim=(0, 1)),
+                torch.ones(4),  # contacts are binary, so we set std to 1 for stability
+            ],
+            dim=0,
+        )
+
+        return mean, std
+
+
 # ============================================================================
 # Internal Math Helpers
 # ============================================================================
@@ -472,16 +523,17 @@ class FeatureNormalizer:
         self._std_68d = torch.cat([std[0:3], torch.ones(2), std[6:69]], dim=0)
         # Precompute derived stats for 263D
         # 263D layout: [
-        #   root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(63) + contacts(4)
+        #   root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
         # ]
         self._mean_263 = torch.cat(
             [
                 torch.zeros(1),
                 mean[Features.ROOT_VX],
                 mean[Features.ROOT_VZ],
+                mean[Features.ROOT_Y],
                 mean[Features.JOINT_RIC],
                 mean[Features.JOINT_ROT6D],
-                mean[Features.JOINT_VEL],
+                mean[Features.VEL],
                 torch.zeros(4),
             ],
             dim=0,
@@ -491,9 +543,10 @@ class FeatureNormalizer:
                 torch.ones(1),
                 std[Features.ROOT_VX],
                 std[Features.ROOT_VZ],
+                std[Features.ROOT_Y],
                 std[Features.JOINT_RIC],
                 std[Features.JOINT_ROT6D],
-                std[Features.JOINT_VEL],
+                std[Features.VEL],
                 torch.ones(4),
             ],
             dim=0,
@@ -725,7 +778,7 @@ def x271_to_x263(
     Convert normalized 271D -> legacy 263D evaluator layout.
 
     263D layout: [
-        root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(63) + contacts(4)
+        root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
     ]
     """
     assert x271.shape[-1] == 271
@@ -743,7 +796,7 @@ def x271_to_x263(
             root_block,  # 4D
             raw[..., Features.JOINT_RIC],  # 63D
             raw[..., Features.JOINT_ROT6D],  # 126D
-            raw[..., Features.JOINT_VEL],  # 63D
+            raw[..., Features.VEL],  # 66D
             raw[..., Features.CONTACTS],  # 4D
         ],
         dim=-1,
