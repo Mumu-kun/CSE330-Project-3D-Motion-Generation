@@ -9,13 +9,12 @@ from __future__ import annotations
 
 import os
 import pathlib
-import sys
 from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from math import ceil
 from pathlib import Path
-from typing import Dict, Tuple, cast
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -57,17 +56,10 @@ def _windows_checkpoint_path_compat():
 def _torch_load_with_compat(path, map_location, weights_only):
     """Load checkpoint with Windows path and module path compatibility."""
     with _windows_checkpoint_path_compat():
-        import utils.config
-
-        original_config = sys.modules.get("config")
-        sys.modules["config"] = utils.config
         try:
             checkpoint = torch.load(path, map_location=map_location, weights_only=weights_only)
         finally:
-            if original_config is not None:
-                sys.modules["config"] = original_config
-            else:
-                sys.modules.pop("config", None)
+            pass
     return checkpoint
 
 
@@ -401,7 +393,9 @@ class FinetuneTrainer:
 
         timer.attach(trainer, start=Events.STARTED, resume=Events.ITERATION_STARTED, pause=Events.ITERATION_COMPLETED)
 
-        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0))
+        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0)).attach(
+            trainer, "step_time_avg"
+        )
 
         # Step logging
         @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
@@ -412,7 +406,9 @@ class FinetuneTrainer:
             step_time = timer.value() if timer.value() is not None else 0.0
             timer.reset()
 
-            _step_time_avg = cast(float, step_time_avg.compute())
+            _step_time_avg = (
+                trainer.state.metrics["step_time_avg"] if "step_time_avg" in trainer.state.metrics else step_time
+            )
             remaining_time = estimate_time_remaining(engine, _step_time_avg, self.config)
 
             engine.set_metrics(
@@ -476,7 +472,7 @@ class FinetuneTrainer:
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
-            filename_prefix=f"pretrain_best_val_{self.pretraining_session_id}",
+            filename_prefix=f"finetune_best_val_{self.finetuning_session_id}",
             filename_pattern="{filename_prefix}_{global_step}.pt",
             score_function=lambda engine: -float(engine.state.metrics["loss"]),
             score_name="val_loss",
@@ -488,7 +484,7 @@ class FinetuneTrainer:
         #     checkpoint_mapping,
         #     DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
         #     n_saved=1,
-        #     filename_prefix=f"pretrain_best_eval_{self.pretraining_session_id}",
+        #    filename_prefix=f"finetune_best_eval_{self.finetuning_session_id}",
         #     score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
         #     score_name="eval_loss",
         #     filename_pattern="{filename_prefix}_{global_step}.pt",
@@ -499,7 +495,7 @@ class FinetuneTrainer:
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
-            filename_prefix=f"pretrain_latest_{self.pretraining_session_id}",
+            filename_prefix=f"finetune_latest_{self.finetuning_session_id}",
             filename_pattern="{filename_prefix}_{global_step}.pt",
             global_step_transform=global_step_transform,
         )

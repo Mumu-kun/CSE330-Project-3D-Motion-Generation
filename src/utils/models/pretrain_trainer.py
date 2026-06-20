@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from math import ceil
 from pathlib import Path
-from typing import Dict, Tuple, cast
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
@@ -335,17 +335,17 @@ class PretrainTrainer:
         self.scaler.scale(loss / self.accumulation_steps).backward()
         self.scaler.scale(probe_loss / self.accumulation_steps).backward()
         self.scaler.scale(decoder_loss / self.accumulation_steps).backward()
-        self.scaler.step(self.aux_optimizer)
-        self.aux_optimizer.zero_grad(set_to_none=True)
-        self.aux_lr_scheduler.step()
 
         if engine.state.iteration % self.accumulation_steps == 0:
             self.scaler.step(self.optimizer)
+            self.scaler.step(self.aux_optimizer)
             self.scaler.update()
+            self.aux_optimizer.zero_grad(set_to_none=True)
             self.optimizer.zero_grad(set_to_none=True)
 
             self.ema_encoder.update(self.encoder)
             self.lr_scheduler.step()
+            self.aux_lr_scheduler.step()
 
             engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
 
@@ -555,7 +555,9 @@ class PretrainTrainer:
 
         timer.attach(trainer, start=Events.STARTED, resume=Events.ITERATION_STARTED, pause=Events.ITERATION_COMPLETED)
 
-        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0))
+        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0)).attach(
+            trainer, "step_time_avg"
+        )
 
         # Step logging
         @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
@@ -566,7 +568,9 @@ class PretrainTrainer:
             step_time = timer.value() if timer.value() is not None else 0.0
             timer.reset()
 
-            _step_time_avg = cast(float, step_time_avg.compute())
+            _step_time_avg = (
+                trainer.state.metrics["step_time_avg"] if "step_time_avg" in trainer.state.metrics else step_time
+            )
             remaining_time = estimate_time_remaining(engine, _step_time_avg, self.config)
 
             engine.set_metrics(

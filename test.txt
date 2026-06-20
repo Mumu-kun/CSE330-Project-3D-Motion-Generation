@@ -1,0 +1,126 @@
+============================================================
+Testing Finetune Trainer
+============================================================
+Device: cpu
+Dataset path: E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini
+Checkpoint dir: E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\checkpoints\test_finetune_trainer
+
+============================================================
+Model: MotionHistoryEncoder
+============================================================
+Total parameters     : 432,416
+Trainable parameters : 432,416
+Frozen parameters    : 0
+------------------------------------------------------------
+Category                             Params       %
+------------------------------------------------------------
+learnable_tokens                         96   0.02%
+linear_proj                           8,704   2.01%
+self_attn                           213,888  49.46%
+mlp                                 209,664  48.49%
+layer_norm                               64   0.01%
+------------------------------------------------------------
+
+============================================================
+Model: JepaPredictor
+============================================================
+Total parameters     : 19,632
+Trainable parameters : 19,632
+Frozen parameters    : 0
+------------------------------------------------------------
+Category                             Params       %
+------------------------------------------------------------
+linear_proj                           2,784  14.18%
+mlp                                  16,752  85.33%
+layer_norm                               96   0.49%
+------------------------------------------------------------
+
+============================================================
+Model: LinearProbe
+============================================================
+Total parameters     : 16,960
+Trainable parameters : 16,960
+Frozen parameters    : 0
+------------------------------------------------------------
+Category                             Params       %
+------------------------------------------------------------
+layer_norm                               64   0.38%
+linear_proj                          16,896  99.62%
+------------------------------------------------------------
+
+============================================================
+Model: LatentDecoder
+============================================================
+Total parameters     : 6,036
+Trainable parameters : 6,036
+Frozen parameters    : 0
+------------------------------------------------------------
+Category                             Params       %
+------------------------------------------------------------
+linear_proj                           1,684  27.90%
+layer_norm                               64   1.06%
+mlp                                   4,288  71.04%
+------------------------------------------------------------
+  0%|          | 0/32 [00:00<?, ?it/s]100%|##########| 32/32 [00:00<00:00, 1684.31it/s]
+Loading text embedding cache from E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini\text_embeddings_cache.pt...
+All text embeddings are cached.
+  0%|          | 0/8 [00:00<?, ?it/s]100%|##########| 8/8 [00:00<00:00, 2000.26it/s]
+Loading text embedding cache from E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini\text_embeddings_cache.pt...
+All text embeddings are cached.
+Starting pretraining session: 20260620_043415
+E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\.venv\Lib\site-packages\torch\utils\data\dataloader.py:775: UserWarning: 'pin_memory' argument is set as true but no accelerator is found, then device pinned memory won't be used.
+  super().__init__(loader)
+[1/9]  11%|#1         [00:00<?]Iteration: [1/9]  11%|#1         [00:00<?]Iteration: [1/9]  11%|#1        , loss=0.0829 [00:00<?]Iteration: [1/9]  11%|#1        , loss=0.0829 [00:00<?]Iteration: [1/9]  11%|#1        , loss=0.178 [00:00<?] Iteration: [2/9]  22%|##2       , loss=0.178 [00:00<00:01]Iteration: [2/9]  22%|##2       , loss=0.147 [00:00<00:01]Iteration: [3/9]  33%|###3      , loss=0.147 [00:00<00:00]Iteration: [3/9]  33%|###3      , loss=0.244 [00:00<00:00]Iteration: [4/9]  44%|####4     , loss=0.244 [00:00<00:00]Iteration: [4/9]  44%|####4     , loss=0.091 [00:00<00:00]Iteration: [5/9]  56%|#####5    , loss=0.091 [00:00<00:00]Iteration: [5/9]  56%|#####5    , loss=0.195 [00:00<00:00]Iteration: [6/9]  67%|######6   , loss=0.195 [00:00<00:00]Iteration: [6/9]  67%|######6   , loss=0.0788 [00:00<00:00]Iteration: [7/9]  78%|#######7  , loss=0.0788 [00:00<00:00]Iteration: [7/9]  78%|#######7  , loss=0.182 [00:00<00:00] Iteration: [8/9]  89%|########8 , loss=0.182 [00:00<00:00]Iteration: [8/9]  89%|########8 , loss=0.0995 [00:00<00:00]                                                           Using pretrain checkpoint: E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\checkpoints\test_finetune_trainer\pretrain_best_eval_20260620_043415_4.pt
+
+Loading dataset...
+  0%|          | 0/32 [00:00<?, ?it/s]100%|##########| 32/32 [00:00<00:00, 1684.44it/s]
+Loading text embedding cache from E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini\text_embeddings_cache.pt...
+All text embeddings are cached.
+  0%|          | 0/8 [00:00<?, ?it/s]100%|##########| 8/8 [00:00<00:00, 2000.03it/s]
+Loading text embedding cache from E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini\text_embeddings_cache.pt...
+All text embeddings are cached.
+Train batches: 9
+Val batches: 3
+
+Running finetuning for 2 epochs...
+
+============================================================
+Model: MotionHistoryEncoder
+============================================================
+Total parameters     : 432,416
+Trainable parameters : 0
+Frozen parameters    : 432,416
+
+============================================================
+Model: LatentDecoder
+============================================================
+Total parameters     : 6,036
+Trainable parameters : 6,036
+Frozen parameters    : 0
+  0%|          | 0/32 [00:00<?, ?it/s]100%|##########| 32/32 [00:00<00:00, 1882.28it/s]
+Loading text embedding cache from E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini\text_embeddings_cache.pt...
+All text embeddings are cached.
+  0%|          | 0/8 [00:00<?, ?it/s]100%|##########| 8/8 [00:00<00:00, 1998.48it/s]
+Loading text embedding cache from E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\tests\dataset\humanml3d-subset-mini\text_embeddings_cache.pt...
+All text embeddings are cached.
+Starting finetuning session: 20260620_043418
+[1/9]  11%|#1         [00:00<?]Epoch [1/2]: [1/9]  11%|#1         [00:00<?]Epoch [1/2]: [1/9]  11%|#1        , loss=86.6 [00:00<?]Epoch [1/2]: [1/9]  11%|#1        , loss=86.6 [00:00<?]Epoch [1/2]: [1/9]  11%|#1        , loss=149 [00:00<?] Epoch [1/2]: [2/9]  22%|##2       , loss=149 [00:00<00:00]Epoch [1/2]: [2/9]  22%|##2       , loss=61.7 [00:00<00:00]Epoch [1/2]: [3/9]  33%|###3      , loss=61.7 [00:00<00:00]Epoch [1/2]: [3/9]  33%|###3      , loss=124 [00:00<00:00] Epoch [1/2]: [4/9]  44%|####4     , loss=124 [00:00<00:00]Epoch [1/2]: [4/9]  44%|####4     , loss=76.7 [00:00<00:00]Epoch [1/2]: [5/9]  56%|#####5    , loss=76.7 [00:00<00:00]Epoch [1/2]: [5/9]  56%|#####5    , loss=137 [00:00<00:00] Epoch [1/2]: [6/9]  67%|######6   , loss=137 [00:00<00:00]Epoch [1/2]: [6/9]  67%|######6   , loss=55 [00:00<00:00] Epoch [1/2]: [7/9]  78%|#######7  , loss=55 [00:00<00:00]Epoch [1/2]: [7/9]  78%|#######7  , loss=295 [00:00<00:00]Epoch [1/2]: [8/9]  89%|########8 , loss=295 [00:00<00:00]Epoch [1/2]: [8/9]  89%|########8 , loss=45.8 [00:00<00:00]                                                           [1/9]  11%|#1         [00:00<?]Epoch [2/2]: [1/9]  11%|#1         [00:00<?]Epoch [2/2]: [1/9]  11%|#1        , loss=123 [00:00<?]Epoch [2/2]: [1/9]  11%|#1        , loss=123 [00:00<?]Epoch [2/2]: [1/9]  11%|#1        , loss=43.4 [00:00<?]Epoch [2/2]: [2/9]  22%|##2       , loss=43.4 [00:00<00:00]Epoch [2/2]: [2/9]  22%|##2       , loss=132 [00:00<00:00] Epoch [2/2]: [3/9]  33%|###3      , loss=132 [00:00<00:00]Epoch [2/2]: [3/9]  33%|###3      , loss=147 [00:00<00:00]Epoch [2/2]: [4/9]  44%|####4     , loss=147 [00:00<00:00]Epoch [2/2]: [4/9]  44%|####4     , loss=199 [00:00<00:00]Epoch [2/2]: [5/9]  56%|#####5    , loss=199 [00:00<00:00]Epoch [2/2]: [5/9]  56%|#####5    , loss=67.4 [00:00<00:00]Epoch [2/2]: [6/9]  67%|######6   , loss=67.4 [00:00<00:00]Epoch [2/2]: [6/9]  67%|######6   , loss=143 [00:00<00:00] Epoch [2/2]: [7/9]  78%|#######7  , loss=143 [00:00<00:00]Epoch [2/2]: [7/9]  78%|#######7  , loss=68.4 [00:00<00:00]Epoch [2/2]: [8/9]  89%|########8 , loss=68.4 [00:00<00:00]Epoch [2/2]: [8/9]  89%|########8 , loss=128 [00:00<00:00]                                                           
+Finetuning complete!
+EMA encoder type: <class 'utils.models.EMAModel'>
+EMA decoder type: <class 'utils.models.EMAModel'>
+
+Verifying encoder is frozen...
+EMA encoder parameters are frozen (requires_grad=False)
+
+Verifying decoder is created and updated...
+EMA decoder has 6,036 parameters
+Checkpoint saved at: E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\checkpoints\test_finetune_trainer\pretrain_best_val_20260620_043415_4.pt
+
+============================================================
+Testing Finetune Checkpoint Loading
+============================================================
+No checkpoint found in E:\FahadProject\BUET Lab\3-2\CSE330\ML-Project\checkpoints\test_finetune_trainer, skipping load test
+
+============================================================
+All Finetune Trainer tests passed!
+============================================================
