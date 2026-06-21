@@ -14,6 +14,17 @@ import numpy as np
 from utils.motion_utils import T2M_KINEMATIC_CHAIN
 
 
+def compute_forward_direction(joints: np.ndarray) -> np.ndarray:
+    """Compute forward direction vector from joint positions using face joints."""
+    l_hip, r_hip, sdr_r, sdr_l = 2, 1, 17, 16
+    across = joints[r_hip] - joints[l_hip] + joints[sdr_r] - joints[sdr_l]
+    norm = np.linalg.norm(across)
+    if norm < 1e-10:
+        return np.array([0.0, 0.0, 1.0])
+    across = across / norm
+    return np.array([across[2], 0.0, -across[0]])
+
+
 def probe_camera_state(ax) -> dict:
     """
     Print and return matplotlib 3D camera + scene state.
@@ -62,6 +73,7 @@ def plot_3d_motion(
     follow_root: bool = False,
     probe: bool = False,
     save_path: Optional[Path] = None,
+    show_forward_vector: bool = False,
 ):
     import base64
     import io
@@ -106,6 +118,10 @@ def plot_3d_motion(
         for i in range(len(T2M_KINEMATIC_CHAIN))
     ]
 
+    forward_quiver = None
+    if show_forward_vector:
+        forward_quiver = ax.quiver(0, 0, 0, 0, 0, 1, color="red", alpha=0.8, normalize=True)
+
     if save_path:
         save_path.parent.mkdir(parents=True, exist_ok=True)
     target = str(save_path) if save_path else io.BytesIO()
@@ -131,6 +147,17 @@ def plot_3d_motion(
             joints = motion[frame_idx, c_indices, :]
             lines[i].set_data(joints[:, 0], joints[:, 2])
             lines[i].set_3d_properties(joints[:, 1])
+
+        if show_forward_vector:
+            root = motion[frame_idx, 0, :]
+            forward = compute_forward_direction(motion[frame_idx])
+            if forward_quiver is not None:
+                forward_quiver.remove()
+            forward_quiver = ax.quiver(
+                root[0], root[2], root[1],
+                forward[0], forward[2], forward[1],
+                length=radius * 0.5, normalize=True, color="red", alpha=0.8
+            )
 
         fig.canvas.draw()
         img = np.asarray(fig.canvas.buffer_rgba())[..., :3]
@@ -158,6 +185,7 @@ def visualize_motion(
     notebook: bool = True,
     probe: bool = False,
     backend: str = "matplotlib",
+    show_forward_vector: bool = False,
 ) -> Any:
     """
     Visualize motion from joint positions.
@@ -172,12 +200,15 @@ def visualize_motion(
         notebook: Whether to return visualization for notebook display
         probe: If True, print camera + scene state
         backend: Visualization backend - only "matplotlib" is supported
+        show_forward_vector: If True, draw forward direction vector from root joint
     """
     if backend != "matplotlib":
         print(f"Backend '{backend}' is not supported. Using matplotlib.")
     fps = fps / skip_frames
     motion_subsampled = joint_positions[::skip_frames]
-    html = plot_3d_motion(motion_subsampled, radius=radius, fps=fps, title=title, probe=probe)
+    html = plot_3d_motion(
+        motion_subsampled, radius=radius, fps=fps, title=title, probe=probe, show_forward_vector=show_forward_vector
+    )
     return html
 
 
@@ -189,6 +220,7 @@ def plot_3d_motion_comparison(
     title: str = "Generated vs Ground Truth",
     probe: bool = False,
     save_path: Optional[Path] = None,
+    show_forward_vector: bool = False,
 ):
     import base64
     import io
@@ -245,6 +277,12 @@ def plot_3d_motion_comparison(
     gt_root_line = ax.plot([], [], [], color=gt_root_traj_color, lw=1.5, linestyle="--")[0]
     gen_root_line = ax.plot([], [], [], color=gen_root_traj_color, lw=1.5, linestyle="--")[0]
 
+    gt_forward_quiver = None
+    gen_forward_quiver = None
+    if show_forward_vector:
+        gt_forward_quiver = ax.quiver(0, 0, 0, 0, 0, 1, color="red", alpha=0.8, normalize=True)
+        gen_forward_quiver = ax.quiver(0, 0, 0, 0, 0, 1, color="red", alpha=0.8, normalize=True)
+
     gt_roots_x = ground_truth_joints[:n_frames, 0, 0]
     gt_roots_z = ground_truth_joints[:n_frames, 0, 2]
     gt_roots_y = ground_truth_joints[:n_frames, 0, 1]
@@ -281,6 +319,27 @@ def plot_3d_motion_comparison(
         gen_root_line.set_data(gen_roots_x[:frame_idx + 1], gen_roots_z[:frame_idx + 1])
         gen_root_line.set_3d_properties(gen_roots_y[:frame_idx + 1])
 
+        if show_forward_vector:
+            gt_root = ground_truth_joints[frame_idx, 0, :]
+            gt_forward = compute_forward_direction(ground_truth_joints[frame_idx])
+            if gt_forward_quiver is not None:
+                gt_forward_quiver.remove()
+            gt_forward_quiver = ax.quiver(
+                gt_root[0], gt_root[2], gt_root[1],
+                gt_forward[0], gt_forward[2], gt_forward[1],
+                length=radius * 0.5, normalize=True, color="red", alpha=0.8
+            )
+
+            gen_root = generated_joints[frame_idx, 0, :]
+            gen_forward = compute_forward_direction(generated_joints[frame_idx])
+            if gen_forward_quiver is not None:
+                gen_forward_quiver.remove()
+            gen_forward_quiver = ax.quiver(
+                gen_root[0], gen_root[2], gen_root[1],
+                gen_forward[0], gen_forward[2], gen_forward[1],
+                length=radius * 0.5, normalize=True, color="red", alpha=0.8
+            )
+
         fig.canvas.draw()
         img = np.asarray(fig.canvas.buffer_rgba())[..., :3]
         writer.append_data(img)
@@ -305,6 +364,7 @@ def compare_motions(
     radius: float = 1.0,
     backend: str = "matplotlib",
     probe: bool = False,
+    show_forward_vector: bool = False,
 ) -> Any:
     """
     Compare generated motion with ground truth on the same 3D axes.
@@ -320,4 +380,5 @@ def compare_motions(
         title="Generated vs Ground Truth",
         probe=probe,
         save_path=save_path,
+        show_forward_vector=show_forward_vector,
     )

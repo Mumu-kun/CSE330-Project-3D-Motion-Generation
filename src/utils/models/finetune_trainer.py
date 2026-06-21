@@ -35,7 +35,7 @@ from utils.dataset import create_dataloader
 from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, estimate_time_remaining
 from utils.models.flow_matching_predictor import LatentDecoder
 from utils.models.motion_history_encoder import MotionHistoryEncoder
-from utils.motion_utils import Features, x68_to_x271, x271_to_x68
+from utils.motion_utils import Features, positions_to_x271, x68_to_positions, x271_to_x68
 from utils.wandb_logger import WandbLogger
 
 
@@ -318,61 +318,63 @@ class FinetuneTrainer:
             "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
         }
 
-    def _decoder_loss(
-        self,
-        engine: PretrainEngine,
-        motion: torch.Tensor,
-        joints: torch.Tensor,
-        decoded: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        prev_positions = joints[:, :-1, :].flatten(0, 1)
-        prev_frames = motion[:, :-1, :].flatten(0, 1)
-        y_frames = motion[:, 1:, :].flatten(0, 1)
-        decoded = decoded.flatten(0, 1)
+    def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
+        prev_positions = joints[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 22, 3)
+        prev_frames = motion[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 271)
+        y_frames = motion[:, 1:, :].flatten(0, 1)  # (B * (seq_len-1), 271)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_frames)
-        y_vel = y_frames[..., Features.VEL]
-        y_feet = y_frames[..., Features.CONTACTS]
+        decoded = decoded.flatten(0, 1)  # (B * (seq_len-1), 68)
+        decoded = self.normalizer.denormalize_x68(decoded)  # Denormalize for loss computation
 
-        dec_271d = x68_to_x271(decoded, self.normalizer, prev_positions, prev_frames)
-        dec_vel = dec_271d[..., Features.VEL]
-        dec_feet = dec_271d[..., Features.CONTACTS]
-        dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)  # (B * (seq_len-1), 68)
+        y_68d = self.normalizer.denormalize_x68(y_68d)  # Denormalize for loss computation
+        y_vel = y_frames[..., Features.VEL]  # (B * (seq_len-1), 66)
+        # y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
 
-        loss_68d = F.mse_loss(decoded, y_68d, reduction="mean")
+        dec_positions = x68_to_positions(decoded, self.normalizer, prev_positions)  # (B * (seq_len-1), 22, 3)
+        dec_271d, _ = positions_to_x271(dec_positions, prev_positions, self.normalizer)  # (B * (seq_len-1), 271)
+        dec_vel = dec_271d[..., Features.VEL]  # (B * (seq_len-1), 66)
+        # dec_feet = dec_271d[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
+        # dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
+
+        loss_root = F.mse_loss(decoded[:, :3], y_68d[:, :3], reduction="mean")
+        loss_yaw = F.mse_loss(decoded[:, 3:5], y_68d[:, 3:5], reduction="mean")
+        loss_ric = F.mse_loss(decoded[:, 5:], y_68d[:, 5:], reduction="mean")
         loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
+        loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
 
-        mask_feet_4d = y_feet.bool() & ~dec_feet.bool()
-        mask_feet_miss = mask_feet_4d.any(dim=-1)
-        loss_feet = (
-            dec_foot_vel[mask_feet_miss].square().mean()
-            if mask_feet_miss.any()
-            else torch.tensor(0.0, device=self.device)
-        )
+        # mask_feet_4d = (
+        #     y_feet.bool() & ~dec_feet.bool()
+        # )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
+        # mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
+        # feet_miss_rate = (
+        #     mask_feet_4d.sum().float() / y_feet.bool().sum().float()
+        #     if y_feet.bool().sum() > 0
+        #     else torch.tensor(0.0, device=self.device)
+        # )
+        # loss_feet = (
+        #     dec_foot_vel[mask_feet_miss].square().mean()
+        #     if mask_feet_miss.any()
+        #     else torch.tensor(0.0, device=self.device)
+        # )
 
-        decoder_loss = loss_68d + loss_vel * 0.5 + loss_feet * 0.5
-        feet_miss_rate = (
-            mask_feet_4d.sum().float() / y_feet.bool().sum().float()
-            if y_feet.bool().sum() > 0
-            else torch.tensor(0.0, device=self.device)
-        )
+        decoder_loss = 0.2 * loss_root + 1.0 * loss_yaw + 1.0 * loss_ric + 0.5 * loss_vel + 1.0 * loss_joint
 
         engine.set_metrics(
             [
                 ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_68d", loss_68d.detach().item()),
+                ("loss_root", loss_root.detach().item()),
+                ("loss_yaw", loss_yaw.detach().item()),
+                ("loss_ric", loss_ric.detach().item()),
                 ("loss_vel", loss_vel.detach().item()),
-                ("loss_feet", loss_feet.detach().item()),
-                ("feet_miss_rate", feet_miss_rate.detach().item()),
+                ("loss_joint", loss_joint.detach().item()),
+                # ("loss_feet", loss_feet.detach().item()),
+                # ("feet_miss_rate", feet_miss_rate.detach().item()),
             ],
         )
 
         return {
             "decoder_loss": decoder_loss,
-            "loss_68d": loss_68d.detach(),
-            "loss_vel": loss_vel.detach(),
-            "loss_feet": loss_feet.detach(),
-            "feet_miss_rate": feet_miss_rate.detach(),
         }
 
     def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
@@ -421,10 +423,11 @@ class FinetuneTrainer:
             metrics = engine.get_metrics(
                 [
                     "decoder_loss",
-                    "loss_68d",
+                    "loss_root",
+                    "loss_yaw",
+                    "loss_ric",
                     "loss_vel",
-                    "loss_feet",
-                    "feet_miss_rate",
+                    "loss_joint",
                     "lr",
                 ],
                 prefix="train/",
@@ -517,7 +520,7 @@ class FinetuneTrainer:
                 [
                     ("val_loss", engine.get_metric("val_loss", 0.0)),
                     ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
-                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
+                    # ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
                 ],
                 1.0,
             )
@@ -538,15 +541,18 @@ class FinetuneTrainer:
             batch_count = engine.state.iteration // self.accumulation_steps
 
             engine.scale_metrics(
-                ["val_decoder_loss", "val_feet_miss_rate"],
+                [
+                    "val_loss",
+                    "val_decoder_loss",
+                ],
                 1.0 / batch_count if batch_count > 0 else 1.0,
             )
 
             self.wandb_logger.log(
                 engine.get_metrics(
                     [
+                        "val_loss",
                         "val_decoder_loss",
-                        "val_feet_miss_rate",
                         "decoder_loss",
                     ],
                     prefix="val/",

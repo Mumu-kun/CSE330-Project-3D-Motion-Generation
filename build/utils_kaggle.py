@@ -451,9 +451,13 @@ class Features:
     JOINT_ROT6D = slice(75, 201)  # 21 non-root joints * 6
     JOINT_VEL = slice(204, 267)  # 21 non-root joints * 3
 
-    # 68D layout: [root_y(1) + root_vx(1) + root_vz(1) + yaw_sin_cos(2) + joint_ric(63)]
-    D68_ROOT = slice(0, 5)
-    D68_JOINTS = slice(5, 68)
+    # 68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric(63)]
+    D68_ROOT_Y = slice(0, 1)        # root_y (1)
+    D68_ROOT_X = slice(1, 2)        # root_x (1)
+    D68_ROOT_Z = slice(2, 3)        # root_z (1)
+    D68_YAW_SIN = slice(3, 4)       # sin(yaw) (1)
+    D68_YAW_COS = slice(4, 5)       # cos(yaw) (1)
+    D68_JOINTS = slice(5, 68)       # 21 joints * 3 (63)
 
     @staticmethod
     def joint_mask(collection: list[str | int], sl: slice) -> torch.Tensor:
@@ -846,8 +850,20 @@ class FeatureNormalizer:
         self.mean = mean
         self.std = std
         # Precompute derived stats for 68D
-        self._mean_68d = torch.cat([mean[0:3], torch.zeros(2), mean[6:69]], dim=0)
-        self._std_68d = torch.cat([std[0:3], torch.ones(2), std[6:69]], dim=0)
+        self._mean_68d = torch.cat([
+            mean[Features.ROOT_Y],           # root_y (position)
+            mean[Features.ROOT_VX],          # root_x position std estimate (using velocity std as proxy)
+            mean[Features.ROOT_VZ],          # root_z position std estimate (using velocity std as proxy)
+            torch.zeros(2),                  # yaw sin/cos mean
+            mean[Features.JOINT_RIC],          # joint_ric (63)
+        ], dim=0)
+        self._std_68d = torch.cat([
+            std[Features.ROOT_Y],            # root_y std
+            std[Features.ROOT_VX],           # root_x std (position)
+            std[Features.ROOT_VZ],           # root_z std (position)
+            torch.ones(2),                   # yaw sin/cos std (unit variance)
+            std[Features.JOINT_RIC],         # joint_ric std
+        ], dim=0)
         # Precompute derived stats for 263D
         # 263D layout: [
         #   root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
@@ -1028,27 +1044,34 @@ def x271_to_positions(
 def x271_to_x68(
     x271: torch.Tensor,  # (B, 271) normalized
     normalizer: FeatureNormalizer,
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized
+    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) - for root_x/z integration from velocities
+    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized - no longer needed for delta-yaw
 ) -> torch.Tensor:
     """
     Convert normalized 271D -> reduced 68D predictor state.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + yaw_sin_cos(2) + joint_ric_21(63)]
+    68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric_21(63)]
     Output is in the same normalized space as the predictor expects.
     """
     assert x271.shape[-1] == 271
     raw = normalizer.denormalize(x271)
-    raw_prev = normalizer.denormalize(prev_x271) if prev_x271 is not None else None
 
-    root_y = raw[..., 0:1]
-    root_v = raw[..., 1:3]
-    delta_yaw = compute_root_delta_yaw_sin_cos(
-        raw[..., Features.ROOT_ROT6D],
-        None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
-    )
+    root_y = raw[..., Features.ROOT_Y]
+    root_vx = raw[..., Features.ROOT_VX]
+    root_vz = raw[..., Features.ROOT_VZ]
+
+    if prev_positions is not None:
+        root_x = prev_positions[:, 0:1] + root_vx
+        root_z = prev_positions[:, 0, 2:3] + root_vz
+    else:
+        root_x = torch.zeros_like(root_vx)
+        root_z = torch.zeros_like(root_vz)
+
+    yaw = root_rot6d_to_yaw(raw[..., Features.ROOT_ROT6D])
+    yaw_sin_cos = yaw_to_sin_cos(yaw)
     joint_ric = raw[..., Features.JOINT_RIC]
 
-    x68 = torch.cat([root_y, root_v, delta_yaw, joint_ric], dim=-1)
+    x68 = torch.cat([root_y, root_x, root_z, yaw_sin_cos, joint_ric], dim=-1)
     x68 = normalizer.normalize_x68(x68)
 
     return x68
@@ -1056,39 +1079,32 @@ def x271_to_x68(
 
 def x68_to_positions(
     x68: torch.Tensor,  # (B, 68) normalized predictor output
-    prev_positions: torch.Tensor,  # (B, 22, 3) previous frame's absolute joint positions
-    prev_x271: torch.Tensor,  # (B, 271) normalized — previous frame for delta-yaw computation
-    normalizer: FeatureNormalizer,
+    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous frame (now optional, not used for root)
+    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized (now optional)
+    normalizer: FeatureNormalizer = None,
 ) -> torch.Tensor:
     """
     Reconstruct global joint positions from denormalized 68D predictor output.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + yaw_sin_cos(2) + joint_ric_21(63)]
+    68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric_21(63)]
     """
     B = x68.shape[0]
 
-    x68 = normalizer.denormalize_x68(x68)
-    prev_x271 = normalizer.denormalize(prev_x271)
+    x68_denorm = normalizer.denormalize_x68(x68)
 
-    prev_root_pos = prev_positions[:, 0]  # (B, 3)
-    prev_root_rot_6d = prev_x271[:, Features.ROOT_ROT6D]  # (B, 6)
+    root_y = x68_denorm[:, Features.D68_ROOT_Y]
+    root_x = x68_denorm[:, Features.D68_ROOT_X]
+    root_z = x68_denorm[:, Features.D68_ROOT_Z]
+    root_pos = torch.cat([root_x, root_y, root_z], dim=-1)
 
-    root_y = x68[:, 0:1]
-    root_vx = x68[:, 1:2]
-    root_vz = x68[:, 2:3]
-    delta_yaw = sin_cos_to_yaw(x68[:, 3:5])
-    joint_ric_21 = x68[:, 5:68].reshape(B, 21, 3)
+    yaw = sin_cos_to_yaw(x68_denorm[:, Features.D68_YAW_SIN])
+    root_quat = cont6d_to_quaternion(yaw_to_root_rot6d(yaw))
 
-    new_root_x = prev_root_pos[:, 0:1] + root_vx
-    new_root_z = prev_root_pos[:, 2:3] + root_vz
-    new_root_pos = torch.cat([new_root_x, root_y, new_root_z], dim=-1)
+    joint_ric_21 = x68_denorm[:, Features.D68_JOINTS].reshape(B, 21, 3)
 
-    prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
-    root_quat = cont6d_to_quaternion(yaw_to_root_rot6d(wrap_angle(prev_yaw + delta_yaw)))
-
-    global_offsets = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric_21)
-    new_joint_pos = new_root_pos.unsqueeze(1) + global_offsets
-    return torch.cat([new_root_pos.unsqueeze(1), new_joint_pos], dim=1)
+    global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric_21)
+    new_joint_pos = root_pos.unsqueeze(1) + global_joints
+    return torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
 
 
 # ============================================================================
@@ -1155,8 +1171,8 @@ def x271_seq_to_x263(
 def x68_to_x271(
     x68: torch.Tensor,  # (B, 68) normalized predictor output
     normalizer: FeatureNormalizer,
-    prev_positions: torch.Tensor,  # (B, 22, 3) previous frame's absolute joint positions
-    prev_x271: torch.Tensor,  # (B, 271) normalized — previous frame for delta-yaw computation
+    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous frame's absolute joint positions
+    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized — previous frame for delta-yaw computation
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
@@ -1166,7 +1182,7 @@ def x68_to_x271(
     Simple path: x68 -> positions (via x68_to_positions), then positions + prev_positions -> x271
     (via positions_to_x271). No expensive round-trip through x271_to_positions.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + yaw_sin_cos(2) + joint_ric_21(63)]
+    68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric_21(63)]
     """
 
     positions = x68_to_positions(x68, prev_positions, prev_x271, normalizer)
@@ -1176,9 +1192,9 @@ def x68_to_x271(
 
 def x68_to_x263(
     x68: torch.Tensor,  # (B, 68) normalized predictor output
-    prev_positions: torch.Tensor,  # (B, 22, 3) previous frame's absolute joint positions
-    prev_x271: torch.Tensor,  # (B, 271) normalized — previous frame for delta-yaw computation
-    normalizer: FeatureNormalizer,
+    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous frame's absolute joint positions
+    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized — previous frame for delta-yaw computation
+    normalizer: FeatureNormalizer = None,
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
@@ -1207,7 +1223,8 @@ Feature Layout (271D):
   [201:267] 22 local velocities (22 * 3)
   [267:271] Foot contacts (4D)
 
-Note: Root X,Z are stored as velocities for autoregressive stability.
+Note: Root X,Z are stored as velocities for 271D format.
+68D predictor format uses absolute root positions instead of velocities.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -4236,7 +4253,7 @@ class PretrainTrainer:
         y_frames = motion[:, 1:, :].flatten(0, 1)  # (B * (seq_len-1), 271)
         decoded = decoded.flatten(0, 1)  # (B * (seq_len-1), 68)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_frames)  # (B * (seq_len-1), 68)
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)  # (B * (seq_len-1), 68)
         y_vel = y_frames[..., Features.VEL]  # (B * (seq_len-1), 66)
         y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
 
@@ -4868,7 +4885,7 @@ class FinetuneTrainer:
         y_frames = motion[:, 1:, :].flatten(0, 1)
         decoded = decoded.flatten(0, 1)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_frames)
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)
         y_vel = y_frames[..., Features.VEL]
         y_feet = y_frames[..., Features.CONTACTS]
 

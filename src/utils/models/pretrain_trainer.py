@@ -489,52 +489,51 @@ class PretrainTrainer:
         y_frames = motion[:, 1:, :].flatten(0, 1)  # (B * (seq_len-1), 271)
         decoded = decoded.flatten(0, 1)  # (B * (seq_len-1), 68)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_frames)  # (B * (seq_len-1), 68)
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)  # (B * (seq_len-1), 68)
         y_vel = y_frames[..., Features.VEL]  # (B * (seq_len-1), 66)
-        y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
+        # y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
 
         dec_271d = x68_to_x271(decoded, self.normalizer, prev_positions, prev_frames)  # (B * (seq_len-1), 271)
         dec_vel = dec_271d[..., Features.VEL]  # (B * (seq_len-1), 66)
-        dec_feet = dec_271d[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
-        dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
+        # dec_feet = dec_271d[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
+        # dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
 
-        loss_68d = F.mse_loss(decoded, y_68d, reduction="mean")
+        loss_root = F.mse_loss(decoded[:, :3], y_68d[:, :3], reduction="mean")
+        loss_yaw = F.mse_loss(decoded[:, 3:5], y_68d[:, 3:5], reduction="mean")
+        loss_ric = F.mse_loss(decoded[:, 5:], y_68d[:, 5:], reduction="mean")
         loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
 
-        mask_feet_4d = (
-            y_feet.bool() & ~dec_feet.bool()
-        )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
-        mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
-        loss_feet = (
-            dec_foot_vel[mask_feet_miss].square().mean()
-            if mask_feet_miss.any()
-            else torch.tensor(0.0, device=self.device)
-        )
+        # mask_feet_4d = (
+        #     y_feet.bool() & ~dec_feet.bool()
+        # )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
+        # mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
+        # feet_miss_rate = (
+        #     mask_feet_4d.sum().float() / y_feet.bool().sum().float()
+        #     if y_feet.bool().sum() > 0
+        #     else torch.tensor(0.0, device=self.device)
+        # )
+        # loss_feet = (
+        #     dec_foot_vel[mask_feet_miss].square().mean()
+        #     if mask_feet_miss.any()
+        #     else torch.tensor(0.0, device=self.device)
+        # )
 
-        decoder_loss = loss_68d + loss_vel * 0.5 + loss_feet * 0.5
-
-        feet_miss_rate = (
-            mask_feet_4d.sum().float() / y_feet.bool().sum().float()
-            if y_feet.bool().sum() > 0
-            else torch.tensor(0.0, device=self.device)
-        )
+        decoder_loss = 2.0 * loss_root + 2.0 * loss_yaw + 1.0 * loss_ric + 0.5 * loss_vel
 
         engine.set_metrics(
             [
                 ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_68d", loss_68d.detach().item()),
+                ("loss_root", loss_root.detach().item()),
+                ("loss_yaw", loss_yaw.detach().item()),
+                ("loss_ric", loss_ric.detach().item()),
                 ("loss_vel", loss_vel.detach().item()),
-                ("loss_feet", loss_feet.detach().item()),
-                ("feet_miss_rate", feet_miss_rate.detach().item()),
+                # ("loss_feet", loss_feet.detach().item()),
+                # ("feet_miss_rate", feet_miss_rate.detach().item()),
             ],
         )
 
         return {
             "decoder_loss": decoder_loss,
-            "loss_68d": loss_68d.detach(),
-            "loss_vel": loss_vel.detach(),
-            "loss_feet": loss_feet.detach(),
-            "feet_miss_rate": feet_miss_rate.detach(),
         }
 
     def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:

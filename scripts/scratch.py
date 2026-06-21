@@ -21,4 +21,9 @@ for i, d in enumerate(data2):
     data2[i] = d * std + mean
 
 
-print(data2[0, -4:])
+# print(mean[4:67])
+
+file3 = PROJECT_ROOT / "sample_data" / "000000_joint.npy"
+joint_data: np.ndarray = np.load(file3)
+print(f"Joint data shape: {joint_data.shape}")
+print(joint_data.mean(axis=0)[0])

@@ -270,7 +270,10 @@ class LatentDecoder(nn.Module):
 
         self.down_proj = nn.Linear(config.encoder_config.hidden_size, config.decoder_config.hidden_size, bias=True)
         self.blocks = nn.Sequential(*[DecoderMLP(config) for _ in range(config.decoder_config.num_layers)])
-        self.out_proj = nn.Linear(config.decoder_config.hidden_size, 68, bias=True)
+
+        self.root_head = nn.Linear(config.decoder_config.hidden_size, 3, bias=True)  # root_y, root_x, root_z
+        self.yaw_head = nn.Linear(config.decoder_config.hidden_size, 2, bias=True)  # yaw sin, cos
+        self.ric_head = nn.Linear(config.decoder_config.hidden_size, 63, bias=True)  # 21 joints * 3
 
         self._initialize_weights()
 
@@ -280,12 +283,16 @@ class LatentDecoder(nn.Module):
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """
         latent: (B, H_encoder) - the latent representation from the predictor
-        output: (B, 68) - the predicted reduced features (root_y, root_vxz, delta_yaw, joint_ric)
+        output: (B, 68) - the predicted reduced features (root_y, root_x, root_z, yaw_sin_cos, joint_ric)
         """
         x = self.down_proj(latent)
         x = self.blocks(x)
-        x = self.out_proj(x)
-        return x
+
+        root = self.root_head(x)
+        yaw = self.yaw_head(x)
+        ric = self.ric_head(x)
+
+        return torch.cat([root, yaw, ric], dim=-1)
 
     def decode(
         self, latent: torch.Tensor, prev_pos: torch.Tensor, prev_frame: torch.Tensor, normalizer: FeatureNormalizer

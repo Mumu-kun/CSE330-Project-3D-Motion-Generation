@@ -32,6 +32,7 @@ from utils.models.motion_history_encoder import JepaPredictor
 from utils.motion_utils import (
     FeatureNormalizer,
     x271_to_x68,
+    x271_to_positions,
 )
 from utils.wandb_logger import WandbLogger
 
@@ -241,6 +242,10 @@ class IgniteMotionTrainer:
         self.trainer: Optional[Engine] = None
         self.evaluator: Optional[Engine] = None
 
+    def _get_positions_from_motion(self, motion: torch.Tensor) -> torch.Tensor:
+        """Extract joint positions from motion features using x271_to_positions."""
+        return x271_to_positions(motion, self.normalizer)
+
     def _initialize_engine_state(self, engine_state: Any) -> None:
         """Initialize engine state with default values for training."""
         engine_state.global_step = _ENGINE_STATE_DEFAULTS["global_step"]
@@ -291,7 +296,7 @@ class IgniteMotionTrainer:
         track_features = encoder(history, text_embedding, return_all=False)
         target_flow = x271_to_x68(
             target_frame,
-            prev_frame=current_frame,
+            prev_positions=self._get_positions_from_motion(current_frame),
             normalizer=self.normalizer,
         )
         noise = torch.randn_like(target_flow)

@@ -43,6 +43,7 @@ from utils.motion_utils import (
     FeatureNormalizer,
     generated_positions_to_x271,
     x271_to_x68,
+    x271_to_positions,
     x68_to_positions,
 )
 
@@ -550,9 +551,10 @@ class Trainer:
         batch_size, pred_steps = current_frames.shape[:2]
         current_frames_flat = current_frames.flatten(0, 1)
         target_motion_flat = target_motion.flatten(0, 1)
+        current_positions = x271_to_positions(current_frames_flat, self.normalizer)
         x1 = x271_to_x68(
             target_motion_flat,
-            prev_frame=current_frames_flat,
+            prev_positions=current_positions,
             normalizer=self.normalizer,
         )
         x0 = torch.randn_like(x1)
