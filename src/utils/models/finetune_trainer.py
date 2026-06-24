@@ -319,28 +319,26 @@ class FinetuneTrainer:
         }
 
     def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
-        prev_positions = joints[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 22, 3)
-        prev_frames = motion[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 271)
-        y_frames = motion[:, 1:, :].flatten(0, 1)  # (B * (seq_len-1), 271)
+        prev_positions = joints[:, :-1, :].flatten(0, 1)
+        prev_frames = motion[:, :-1, :].flatten(0, 1)
+        y_frames = motion[:, 1:, :].flatten(0, 1)
 
-        decoded = decoded.flatten(0, 1)  # (B * (seq_len-1), 68)
-        decoded = self.normalizer.denormalize_x68(decoded)  # Denormalize for loss computation
+        decoded = decoded.flatten(0, 1)
+        decoded = self.normalizer.denormalize_x68(decoded)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)  # (B * (seq_len-1), 68)
-        y_68d = self.normalizer.denormalize_x68(y_68d)  # Denormalize for loss computation
-        y_vel = y_frames[..., Features.VEL]  # (B * (seq_len-1), 66)
-        # y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
 
-        dec_positions = x68_to_positions(decoded, self.normalizer, prev_positions)  # (B * (seq_len-1), 22, 3)
-        dec_271d, _ = positions_to_x271(dec_positions, prev_positions, self.normalizer)  # (B * (seq_len-1), 271)
-        dec_vel = dec_271d[..., Features.VEL]  # (B * (seq_len-1), 66)
-        # dec_feet = dec_271d[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
-        # dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
+        y_68d = self.normalizer.denormalize_x68(y_68d)
+
+        dec_positions = x68_to_positions(
+            decoded, self.normalizer,
+            prev_x271=prev_frames,
+            prev_positions=prev_positions,
+        )
 
         loss_root = F.mse_loss(decoded[:, :3], y_68d[:, :3], reduction="mean")
         loss_yaw = F.mse_loss(decoded[:, 3:5], y_68d[:, 3:5], reduction="mean")
-        loss_ric = F.mse_loss(decoded[:, 5:], y_68d[:, 5:], reduction="mean")
-        loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
+        loss_vel = F.smooth_l1_loss(decoded[:, 5:], y_68d[:, 5:], reduction="mean")
         loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
 
         # mask_feet_4d = (
@@ -358,14 +356,13 @@ class FinetuneTrainer:
         #     else torch.tensor(0.0, device=self.device)
         # )
 
-        decoder_loss = 0.2 * loss_root + 1.0 * loss_yaw + 1.0 * loss_ric + 0.5 * loss_vel + 1.0 * loss_joint
+        decoder_loss = 0.2 * loss_root + 1.0 * loss_yaw  + 0.5 * loss_vel + 1.0 * loss_joint
 
         engine.set_metrics(
             [
                 ("decoder_loss", decoder_loss.detach().item()),
                 ("loss_root", loss_root.detach().item()),
                 ("loss_yaw", loss_yaw.detach().item()),
-                ("loss_ric", loss_ric.detach().item()),
                 ("loss_vel", loss_vel.detach().item()),
                 ("loss_joint", loss_joint.detach().item()),
                 # ("loss_feet", loss_feet.detach().item()),
@@ -425,7 +422,6 @@ class FinetuneTrainer:
                     "decoder_loss",
                     "loss_root",
                     "loss_yaw",
-                    "loss_ric",
                     "loss_vel",
                     "loss_joint",
                     "lr",

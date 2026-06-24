@@ -245,33 +245,34 @@ class Config:
     def to_dict(self) -> dict:
         """Export config as a serializable dictionary."""
         d = asdict(self)
-        # Convert any remaining Path objects to strings
         for k, v in d.items():
             if isinstance(v, Path):
                 d[k] = str(v)
+            elif isinstance(v, dict):
+                self._convert_paths_to_strings(v)
         return d
+
+    def _convert_paths_to_strings(self, d: dict) -> None:
+        """Recursively convert Path objects to strings in a dict."""
+        for k, v in list(d.items()):
+            if isinstance(v, Path):
+                d[k] = str(v)
+            elif isinstance(v, dict):
+                self._convert_paths_to_strings(v)
 
     def state_dict(self) -> dict:
         """Serialize for Ignite's Checkpoint handler."""
         return self.to_dict()
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Restore from a state_dict. Reconstructs nested dataclass objects."""
-        from dataclasses import fields, is_dataclass
+        from dataclasses import fields
+        from pathlib import Path
 
-        for key, value in state_dict.items():
-            if hasattr(self, key):
-                field_type = None
-                for f in fields(self):
-                    if f.name == key:
-                        field_type = f.type
-                        break
-                if field_type and isinstance(value, dict):
-                    # Try to reconstruct nested dataclass
-                    try:
-                        # For dataclass types, field.type is the class itself
-                        if isinstance(field_type, type) and is_dataclass(field_type):
-                            value = field_type(**value)
-                    except Exception:
-                        pass
-                setattr(self, key, value)
+        from cattrs import Converter
+
+        converter = Converter()
+        converter.register_structure_hook(Path, lambda d, _: Path(d) if isinstance(d, str) else d)
+
+        loaded = converter.structure(state_dict, Config)
+        for f in fields(loaded):
+            setattr(self, f.name, getattr(loaded, f.name))
