@@ -15,20 +15,14 @@ Compatible with 271D custom feature format from motion_utils.py:
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
-import copy
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, OrderedDict, Tuple, TypeVar, Union
-from typing import Mapping as MappingABC
+from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
-from ignite.engine import Engine, State
-from scipy import interpolate as Interp
 from transformers.activations import ACT2FN
 
-from utils.config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
+from utils.config import FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
 
 
 class KinematicChainEncoder(nn.Module):
@@ -255,196 +249,12 @@ def init_weights(module: nn.Module, linear_init: str = "xavier_normal", linear_s
                 nn.init.zeros_(m.bias)
 
 
-class PretrainState(State):
-    """Custom Ignite State for JEPA pretraining."""
-
-    def __init__(self, *args: Any, config: Config, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.horizon = 40
-        self.metrics: Dict[str, Any] = {
-            "global_step": 0,
-            "best_train_loss": float("inf"),
-        }
-        self.schedules = config.pre_conf.schedules
-        self.num_epochs = config.get_num_epochs()
-
-    def epoch_progress(self) -> float:
-        """Return progress through current epoch as a float in [0, 1]."""
-        return self.epoch / self.num_epochs if self.num_epochs > 0 else 0.0
-
-    def get_schedule_value(self, name: str, default: float, interp: str = "previous") -> float:
-        """Get current value of a scheduled parameter based on epoch progress."""
-        schedule = self.schedules.get(name)
-
-        if not schedule:
-            return default
-
-        t = self.epoch_progress()
-        t_list, v_list = zip(*schedule)
-        t_list = np.array(t_list)
-        v_list = np.array(v_list)
-        t_list = t_list / np.max(t_list)  # Normalize to [0, 1]
-
-        f = Interp.interp1d(t_list, v_list, kind=interp, assume_sorted=True)
-
-        return float(f(t))
-
-    def state_dict(self) -> dict:
-        """Return a dictionary containing the state of the trainer."""
-        super_dict: OrderedDict = super().state_dict()
-        super_dict.update(
-            {
-                "epoch": self.epoch,
-                "iteration": self.iteration,
-                "metrics": self.metrics,
-                "schedules": self.schedules,
-                "num_epochs": self.num_epochs,
-                "horizon": self.horizon,
-            }
-        )
-        return super_dict
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        """Load the state of the trainer from a dictionary."""
-        super().load_state_dict(state_dict)
-        self.epoch = state_dict.get("epoch", 0)
-        self.iteration = state_dict.get("iteration", 0)
-        self.metrics = state_dict.get("metrics", {})
-        self.schedules = state_dict.get("schedules", {})
-        self.num_epochs = state_dict.get("num_epochs", 0)
-        self.horizon = state_dict.get("horizon", 40)
-
-
-class PretrainEngine(Engine):
-    """Custom Ignite Engine for JEPA pretraining."""
-
-    def __init__(self, process_function: Any, config: Config) -> None:
-        super().__init__(process_function)
-        self.state = PretrainState(config=config)
-        self.config = config
-
-    def get_metric(self, name: str, *args, **kwargs):
-        """Get a metric value by name."""
-        return self.state.metrics.get(name, *args, **kwargs)
-
-    def get_metrics(self, names: list[str], prefix: str = "") -> dict[str, Any]:
-        """Get specified metrics as a dict."""
-        return {f"{prefix}{name}": self.state.metrics.get(name) for name in names}
-
-    def set_metrics(self, pairs: list[tuple[str, Any]]) -> None:
-        """Set multiple metrics at once."""
-        for name, value in pairs:
-            self.state.metrics[name] = value
-
-    def clear_metrics(self, names: list[str]) -> None:
-        """Clear specified metrics."""
-        for name in names:
-            self.state.metrics.pop(name, None)
-
-    def scale_metrics(self, names: list[str], scaler: float) -> None:
-        """Scale specified metrics by a factor."""
-        for name in names:
-            self.state.metrics[name] *= scaler
-
-    def csa_op_metrics(self, pairs: list[tuple[str, float]], scalers: float | list[float], clear: bool = False) -> None:
-        """Add a value to an existing metric (useful for running totals)."""
-        if clear:
-            self.clear_metrics([name for name, _ in pairs])
-        if not isinstance(scalers, list):
-            scalers = [scalers for _ in pairs]
-        for (name, value), scaler in zip(pairs, scalers):
-            self.state.metrics[name] = self.state.metrics.get(name, 0.0) + value * scaler
-
-
-def estimate_time_remaining(engine: PretrainEngine, step_time: float, config: Config) -> float:
-    """Estimate remaining training time based on current progress and elapsed time."""
-    curriculum = config.curriculum
-    num_epochs = config.get_num_epochs()
-    epoch = engine.state.epoch
-    global_step = engine.get_metric("global_step")
-    steps_per_epoch = global_step / epoch
-    total_steps = num_epochs * steps_per_epoch
-    remaining_steps = total_steps - global_step
-
-    remaining_time = remaining_steps * step_time
-    return remaining_time
-
-
-T = TypeVar("T", bound=nn.Module)
-
-
-class EMAModel(Generic[T]):
-    """
-    Exponential Moving Average model wrapper.
-
-    Maintains an EMA copy of a model for more stable evaluation.
-    EMA is used for validation, sampling, and checkpointing.
-    """
-
-    def __init__(self, model: T, decay: float = 0.999):
-        """
-        Initialize EMA model.
-
-        Args:
-            model: The model to create EMA copy of
-            decay: EMA decay rate (default: 0.999)
-        """
-        self.decay = decay
-        self.model: T = copy.deepcopy(model)
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        self.model.eval()
-
-    def update(self, model: T) -> None:
-        """
-        Update EMA weights.
-
-        Args:
-            model: The source model to update from
-        """
-        with torch.no_grad():
-            for ema_p, p in zip(self.model.parameters(), model.parameters()):
-                ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
-
-    def to(self, device: Union[str, torch.device]) -> "EMAModel[T]":
-        """Move EMA model to device."""
-        self.model.to(device)
-        return self
-
-    def state_dict(self) -> dict[str, Any]:
-        """Return state dict of wrapped model for checkpointing."""
-        return self.model.state_dict()
-
-    def load_state_dict(self, state_dict: MappingABC) -> None:
-        """Load state dict into wrapped model."""
-        self.model.load_state_dict(state_dict)
-
-
-class CheckpointMetadata:
-    """Wrapper for non-stateful metadata to be saved with checkpoints.
-
-    Ignite's Checkpoint handler requires all values in the to_save dict to have
-    ``state_dict`` / ``load_state_dict`` methods. This wrapper lets us store
-    simple metadata (like session_id) alongside model checkpoints without
-    triggering infinite recursion in ignite's _tree_map (which would happen
-    with bare strings since they are Sequences of single-char strings).
-    """
-
-    def __init__(self, data: dict[str, Any]) -> None:
-        self.data = data
-
-    def state_dict(self) -> dict[str, Any]:
-        return self.data
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.data = state_dict
-
-
-def _find_latest_checkpoint(checkpoint_dir: Path, prefix: str) -> Path | None:
-    """Find the latest checkpoint file with given prefix."""
-    if not checkpoint_dir.exists():
-        return None
-    checkpoints = list(checkpoint_dir.glob(f"{prefix}_*.pt"))
-    if not checkpoints:
-        return None
-    return max(checkpoints, key=lambda p: p.stat().st_mtime)
+from utils.models._base_trainer import (
+    _BaseTrainer,
+    CheckpointMetadata,
+    EMAModel,
+    PretrainEngine,
+    PretrainState,
+    estimate_time_remaining,
+    _find_latest_checkpoint,
+)

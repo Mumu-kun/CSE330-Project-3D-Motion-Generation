@@ -344,6 +344,16 @@ Motion Processing and Feature Conversion Utilities for Human Motion Animation Ge
 
 Total: 271D per frame
 
+68D Feature Format (Predictor state) - Delta/Velocity representation:
+- [0:1]   root_y (absolute height)
+- [1:2]   root_vx (velocity X)
+- [2:3]   root_vz (velocity Z)
+- [3:4]   delta_yaw_sin
+- [4:5]   delta_yaw_cos
+- [5:68]  21 joint velocities * 3 (63)
+
+Total: 68D
+
 Naming convention:
   x271  = 271-dimensional feature vector (normalized)
   x68   = 68-dimensional reduced predictor state (normalized)
@@ -400,12 +410,6 @@ T2M_KINEMATIC_CHAIN = [
     [9, 13, 16, 18, 20],  # Left arm
 ]
 
-# Precompute parent/child index pairs for FK edge-length computation
-_PARENT_INDICES, _CHILD_INDICES = zip(
-    *[(parent, child) for chain in T2M_KINEMATIC_CHAIN for parent, child in zip(chain[:-1], chain[1:])]
-)
-_PARENT_INDICES = torch.tensor(_PARENT_INDICES, dtype=torch.long)
-_CHILD_INDICES = torch.tensor(_CHILD_INDICES, dtype=torch.long)
 
 DATASET_CONFIGS = {
     "t2m": {
@@ -435,29 +439,27 @@ def get_dataset_config(dataset_type: str = "t2m") -> Dict[str, Any]:
 class Features:
     """Feature layout constants for the 271D format."""
 
-    # 271D slices
-    ROOT = slice(0, 3)  # height Y, vel X, vel Z
-    RIC = slice(3, 69)  # 22 * 3
-    ROT6D = slice(69, 201)  # 22 * 6
-    VEL = slice(201, 267)  # 22 * 3
-    CONTACTS = slice(267, 271)  # 4
+    ROOT = slice(0, 3)
+    RIC = slice(3, 69)
+    ROT6D = slice(69, 201)
+    VEL = slice(201, 267)
+    CONTACTS = slice(267, 271)
 
-    # Sub-slices within the above
     ROOT_Y = slice(0, 1)
     ROOT_VX = slice(1, 2)
     ROOT_VZ = slice(2, 3)
-    ROOT_ROT6D = slice(69, 75)  # root joint's 6D rotation
-    JOINT_RIC = slice(6, 69)  # 21 non-root joints * 3
-    JOINT_ROT6D = slice(75, 201)  # 21 non-root joints * 6
-    JOINT_VEL = slice(204, 267)  # 21 non-root joints * 3
+    ROOT_ROT6D = slice(69, 75)
+    JOINT_RIC = slice(6, 69)
+    JOINT_ROT6D = slice(75, 201)
+    JOINT_VEL = slice(204, 267)
 
-    # 68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric(63)]
-    D68_ROOT_Y = slice(0, 1)        # root_y (1)
-    D68_ROOT_X = slice(1, 2)        # root_x (1)
-    D68_ROOT_Z = slice(2, 3)        # root_z (1)
-    D68_YAW_SIN = slice(3, 4)       # sin(yaw) (1)
-    D68_YAW_COS = slice(4, 5)       # cos(yaw) (1)
-    D68_JOINTS = slice(5, 68)       # 21 joints * 3 (63)
+    D68_ROOT_Y = slice(0, 1)
+    D68_ROOT_VX = slice(1, 2)
+    D68_ROOT_VZ = slice(2, 3)
+    D68_YAW_SIN = slice(3, 4)
+    D68_YAW_COS = slice(4, 5)
+    D68_JOINTS_VEL = slice(5, 68)
+    D68_YAW_SINCOS = slice(3, 5)
 
     @staticmethod
     def joint_mask(collection: list[str | int], sl: slice) -> torch.Tensor:
@@ -849,21 +851,26 @@ class FeatureNormalizer:
     def __init__(self, mean: torch.Tensor, std: torch.Tensor):
         self.mean = mean
         self.std = std
-        # Precompute derived stats for 68D
-        self._mean_68d = torch.cat([
-            mean[Features.ROOT_Y],           # root_y (position)
-            mean[Features.ROOT_VX],          # root_x position std estimate (using velocity std as proxy)
-            mean[Features.ROOT_VZ],          # root_z position std estimate (using velocity std as proxy)
-            torch.zeros(2),                  # yaw sin/cos mean
-            mean[Features.JOINT_RIC],          # joint_ric (63)
-        ], dim=0)
-        self._std_68d = torch.cat([
-            std[Features.ROOT_Y],            # root_y std
-            std[Features.ROOT_VX],           # root_x std (position)
-            std[Features.ROOT_VZ],           # root_z std (position)
-            torch.ones(2),                   # yaw sin/cos std (unit variance)
-            std[Features.JOINT_RIC],         # joint_ric std
-        ], dim=0)
+        self._mean_68d = torch.cat(
+            [
+                mean[Features.ROOT_Y],
+                mean[Features.ROOT_VX],
+                mean[Features.ROOT_VZ],
+                torch.zeros(2),
+                mean[Features.JOINT_VEL],
+            ],
+            dim=0,
+        )
+        self._std_68d = torch.cat(
+            [
+                std[Features.ROOT_Y],
+                std[Features.ROOT_VX],
+                std[Features.ROOT_VZ],
+                torch.ones(2),
+                std[Features.JOINT_VEL],
+            ],
+            dim=0,
+        )
         # Precompute derived stats for 263D
         # 263D layout: [
         #   root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
@@ -1042,67 +1049,82 @@ def x271_to_positions(
 
 
 def x271_to_x68(
-    x271: torch.Tensor,  # (B, 271) normalized
+    x271: torch.Tensor,
     normalizer: FeatureNormalizer,
-    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) - for root_x/z integration from velocities
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized - no longer needed for delta-yaw
+    prev_positions: Optional[torch.Tensor] = None,
+    prev_x271: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Convert normalized 271D -> reduced 68D predictor state.
 
-    68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric_21(63)]
+    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
     Output is in the same normalized space as the predictor expects.
     """
     assert x271.shape[-1] == 271
     raw = normalizer.denormalize(x271)
+    raw_prev = normalizer.denormalize(prev_x271) if prev_x271 is not None else None
 
     root_y = raw[..., Features.ROOT_Y]
     root_vx = raw[..., Features.ROOT_VX]
     root_vz = raw[..., Features.ROOT_VZ]
 
-    if prev_positions is not None:
-        root_x = prev_positions[:, 0:1] + root_vx
-        root_z = prev_positions[:, 0, 2:3] + root_vz
-    else:
-        root_x = torch.zeros_like(root_vx)
-        root_z = torch.zeros_like(root_vz)
+    delta_yaw_sin_cos = compute_root_delta_yaw_sin_cos(
+        raw[..., Features.ROOT_ROT6D],
+        None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
+    )
+    joint_vel = raw[..., Features.JOINT_VEL]
 
-    yaw = root_rot6d_to_yaw(raw[..., Features.ROOT_ROT6D])
-    yaw_sin_cos = yaw_to_sin_cos(yaw)
-    joint_ric = raw[..., Features.JOINT_RIC]
-
-    x68 = torch.cat([root_y, root_x, root_z, yaw_sin_cos, joint_ric], dim=-1)
+    x68 = torch.cat([root_y, root_vx, root_vz, delta_yaw_sin_cos, joint_vel], dim=-1)
     x68 = normalizer.normalize_x68(x68)
 
     return x68
 
 
 def x68_to_positions(
-    x68: torch.Tensor,  # (B, 68) normalized predictor output
-    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous frame (now optional, not used for root)
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized (now optional)
-    normalizer: FeatureNormalizer = None,
+    x68: torch.Tensor,
+    normalizer: FeatureNormalizer,
+    prev_x271: torch.Tensor,
+    prev_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Reconstruct global joint positions from denormalized 68D predictor output.
 
-    68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric_21(63)]
+    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
+    prev_x271: normalized 271D feature vector for previous frame
     """
     B = x68.shape[0]
 
     x68_denorm = normalizer.denormalize_x68(x68)
+    prev_x271_raw = normalizer.denormalize(prev_x271)
 
     root_y = x68_denorm[:, Features.D68_ROOT_Y]
-    root_x = x68_denorm[:, Features.D68_ROOT_X]
-    root_z = x68_denorm[:, Features.D68_ROOT_Z]
+    root_vx = x68_denorm[:, Features.D68_ROOT_VX]
+    root_vz = x68_denorm[:, Features.D68_ROOT_VZ]
+
+    prev_root_pos = prev_positions[:, 0] if prev_positions is not None else torch.zeros(B, 3, device=x68.device, dtype=x68.dtype)
+    root_x = prev_root_pos[:, 0:1] + root_vx
+    root_z = prev_root_pos[:, 2:3] + root_vz
     root_pos = torch.cat([root_x, root_y, root_z], dim=-1)
 
-    yaw = sin_cos_to_yaw(x68_denorm[:, Features.D68_YAW_SIN])
-    root_quat = cont6d_to_quaternion(yaw_to_root_rot6d(yaw))
+    delta_yaw_sin_cos = x68_denorm[:, Features.D68_YAW_SINCOS]
+    prev_root_rot_6d = prev_x271_raw[:, Features.ROOT_ROT6D]
+    prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
+    delta_yaw = sin_cos_to_yaw(delta_yaw_sin_cos)
+    yaw = wrap_angle(prev_yaw + delta_yaw)
+    root_quat = yaw_to_root_rot6d(yaw)
+    root_quat = cont6d_to_quaternion(root_quat)
 
-    joint_ric_21 = x68_denorm[:, Features.D68_JOINTS].reshape(B, 21, 3)
+    joint_vel = x68_denorm[:, Features.D68_JOINTS_VEL].reshape(B, 21, 3)
 
-    global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric_21)
+    if prev_positions is not None:
+        prev_root_quat = cont6d_to_quaternion(prev_root_rot_6d)
+        prev_ric_full = _compute_ric(prev_positions, prev_root_quat)
+        prev_ric = prev_ric_full[:, 1:]
+    else:
+        prev_ric = torch.zeros(B, 21, 3, device=x68.device, dtype=x68.dtype)
+    joint_ric = prev_ric + joint_vel
+
+    global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric)
     new_joint_pos = root_pos.unsqueeze(1) + global_joints
     return torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
 
@@ -1169,10 +1191,10 @@ def x271_seq_to_x263(
 
 
 def x68_to_x271(
-    x68: torch.Tensor,  # (B, 68) normalized predictor output
+    x68: torch.Tensor,
     normalizer: FeatureNormalizer,
-    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous frame's absolute joint positions
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized — previous frame for delta-yaw computation
+    prev_x271: torch.Tensor,
+    prev_positions: Optional[torch.Tensor] = None,
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
@@ -1182,19 +1204,18 @@ def x68_to_x271(
     Simple path: x68 -> positions (via x68_to_positions), then positions + prev_positions -> x271
     (via positions_to_x271). No expensive round-trip through x271_to_positions.
 
-    68D layout: [root_y(1) + root_x(1) + root_z(1) + sin(yaw)(1) + cos(yaw)(1) + joint_ric_21(63)]
+    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
     """
-
-    positions = x68_to_positions(x68, prev_positions, prev_x271, normalizer)
+    positions = x68_to_positions(x68, normalizer, prev_x271, prev_positions)
     x271, _ = positions_to_x271(positions, prev_positions, normalizer, dataset_type, feet_thre)
     return x271
 
 
 def x68_to_x263(
-    x68: torch.Tensor,  # (B, 68) normalized predictor output
-    prev_positions: Optional[torch.Tensor] = None,  # (B, 22, 3) previous frame's absolute joint positions
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized — previous frame for delta-yaw computation
-    normalizer: FeatureNormalizer = None,
+    x68: torch.Tensor,
+    normalizer: FeatureNormalizer,
+    prev_x271: torch.Tensor,
+    prev_positions: Optional[torch.Tensor] = None,
     dataset_type: str = "t2m",
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
@@ -1203,8 +1224,9 @@ def x68_to_x263(
 
     Route: x68 -> positions -> x271 -> x263
     """
-    x271 = x68_to_x271(x68, normalizer, prev_positions, prev_x271, dataset_type, feet_thre)
-    return x271_to_x263(x271, normalizer, prev_x271)
+    x271 = x68_to_x271(x68, normalizer, prev_x271, prev_positions, dataset_type, feet_thre)
+    prev_x271_raw = normalizer.denormalize(prev_x271)
+    return x271_to_x263(x271, normalizer, prev_x271_raw[:, Features.ROOT_ROT6D])
 
 
 # ========== config.py ==========
@@ -1223,8 +1245,7 @@ Feature Layout (271D):
   [201:267] 22 local velocities (22 * 3)
   [267:271] Foot contacts (4D)
 
-Note: Root X,Z are stored as velocities for 271D format.
-68D predictor format uses absolute root positions instead of velocities.
+Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
 from dataclasses import asdict, dataclass, field
@@ -1457,36 +1478,37 @@ class Config:
     def to_dict(self) -> dict:
         """Export config as a serializable dictionary."""
         d = asdict(self)
-        # Convert any remaining Path objects to strings
         for k, v in d.items():
             if isinstance(v, Path):
                 d[k] = str(v)
+            elif isinstance(v, dict):
+                self._convert_paths_to_strings(v)
         return d
+
+    def _convert_paths_to_strings(self, d: dict) -> None:
+        """Recursively convert Path objects to strings in a dict."""
+        for k, v in list(d.items()):
+            if isinstance(v, Path):
+                d[k] = str(v)
+            elif isinstance(v, dict):
+                self._convert_paths_to_strings(v)
 
     def state_dict(self) -> dict:
         """Serialize for Ignite's Checkpoint handler."""
         return self.to_dict()
 
     def load_state_dict(self, state_dict: dict) -> None:
-        """Restore from a state_dict. Reconstructs nested dataclass objects."""
-        from dataclasses import fields, is_dataclass
+        from dataclasses import fields
+        from pathlib import Path
 
-        for key, value in state_dict.items():
-            if hasattr(self, key):
-                field_type = None
-                for f in fields(self):
-                    if f.name == key:
-                        field_type = f.type
-                        break
-                if field_type and isinstance(value, dict):
-                    # Try to reconstruct nested dataclass
-                    try:
-                        # For dataclass types, field.type is the class itself
-                        if isinstance(field_type, type) and is_dataclass(field_type):
-                            value = field_type(**value)
-                    except Exception:
-                        pass
-                setattr(self, key, value)
+        from cattrs import Converter
+
+        converter = Converter()
+        converter.register_structure_hook(Path, lambda d, _: Path(d) if isinstance(d, str) else d)
+
+        loaded = converter.structure(state_dict, Config)
+        for f in fields(loaded):
+            setattr(self, f.name, getattr(loaded, f.name))
 
 
 # ========== text_encoder.py ==========
@@ -2047,6 +2069,17 @@ import numpy as np
 # [internal import removed]  from utils.motion_utils import T2M_KINEMATIC_CHAIN
 
 
+def compute_forward_direction(joints: np.ndarray) -> np.ndarray:
+    """Compute forward direction vector from joint positions using face joints."""
+    l_hip, r_hip, sdr_r, sdr_l = 2, 1, 17, 16
+    across = joints[r_hip] - joints[l_hip] + joints[sdr_r] - joints[sdr_l]
+    norm = np.linalg.norm(across)
+    if norm < 1e-10:
+        return np.array([0.0, 0.0, 1.0])
+    across = across / norm
+    return np.array([across[2], 0.0, -across[0]])
+
+
 def probe_camera_state(ax) -> dict:
     """
     Print and return matplotlib 3D camera + scene state.
@@ -2095,6 +2128,7 @@ def plot_3d_motion(
     follow_root: bool = False,
     probe: bool = False,
     save_path: Optional[Path] = None,
+    show_forward_vector: bool = False,
 ):
     import base64
     import io
@@ -2139,6 +2173,10 @@ def plot_3d_motion(
         for i in range(len(T2M_KINEMATIC_CHAIN))
     ]
 
+    forward_quiver = None
+    if show_forward_vector:
+        forward_quiver = ax.quiver(0, 0, 0, 0, 0, 1, color="red", alpha=0.8, normalize=True)
+
     if save_path:
         save_path.parent.mkdir(parents=True, exist_ok=True)
     target = str(save_path) if save_path else io.BytesIO()
@@ -2164,6 +2202,17 @@ def plot_3d_motion(
             joints = motion[frame_idx, c_indices, :]
             lines[i].set_data(joints[:, 0], joints[:, 2])
             lines[i].set_3d_properties(joints[:, 1])
+
+        if show_forward_vector:
+            root = motion[frame_idx, 0, :]
+            forward = compute_forward_direction(motion[frame_idx])
+            if forward_quiver is not None:
+                forward_quiver.remove()
+            forward_quiver = ax.quiver(
+                root[0], root[2], root[1],
+                forward[0], forward[2], forward[1],
+                length=radius * 0.5, normalize=True, color="red", alpha=0.8
+            )
 
         fig.canvas.draw()
         img = np.asarray(fig.canvas.buffer_rgba())[..., :3]
@@ -2191,6 +2240,7 @@ def visualize_motion(
     notebook: bool = True,
     probe: bool = False,
     backend: str = "matplotlib",
+    show_forward_vector: bool = False,
 ) -> Any:
     """
     Visualize motion from joint positions.
@@ -2205,12 +2255,15 @@ def visualize_motion(
         notebook: Whether to return visualization for notebook display
         probe: If True, print camera + scene state
         backend: Visualization backend - only "matplotlib" is supported
+        show_forward_vector: If True, draw forward direction vector from root joint
     """
     if backend != "matplotlib":
         print(f"Backend '{backend}' is not supported. Using matplotlib.")
     fps = fps / skip_frames
     motion_subsampled = joint_positions[::skip_frames]
-    html = plot_3d_motion(motion_subsampled, radius=radius, fps=fps, title=title, probe=probe)
+    html = plot_3d_motion(
+        motion_subsampled, radius=radius, fps=fps, title=title, probe=probe, show_forward_vector=show_forward_vector
+    )
     return html
 
 
@@ -2222,6 +2275,7 @@ def plot_3d_motion_comparison(
     title: str = "Generated vs Ground Truth",
     probe: bool = False,
     save_path: Optional[Path] = None,
+    show_forward_vector: bool = False,
 ):
     import base64
     import io
@@ -2278,6 +2332,12 @@ def plot_3d_motion_comparison(
     gt_root_line = ax.plot([], [], [], color=gt_root_traj_color, lw=1.5, linestyle="--")[0]
     gen_root_line = ax.plot([], [], [], color=gen_root_traj_color, lw=1.5, linestyle="--")[0]
 
+    gt_forward_quiver = None
+    gen_forward_quiver = None
+    if show_forward_vector:
+        gt_forward_quiver = ax.quiver(0, 0, 0, 0, 0, 1, color="red", alpha=0.8, normalize=True)
+        gen_forward_quiver = ax.quiver(0, 0, 0, 0, 0, 1, color="red", alpha=0.8, normalize=True)
+
     gt_roots_x = ground_truth_joints[:n_frames, 0, 0]
     gt_roots_z = ground_truth_joints[:n_frames, 0, 2]
     gt_roots_y = ground_truth_joints[:n_frames, 0, 1]
@@ -2314,6 +2374,27 @@ def plot_3d_motion_comparison(
         gen_root_line.set_data(gen_roots_x[:frame_idx + 1], gen_roots_z[:frame_idx + 1])
         gen_root_line.set_3d_properties(gen_roots_y[:frame_idx + 1])
 
+        if show_forward_vector:
+            gt_root = ground_truth_joints[frame_idx, 0, :]
+            gt_forward = compute_forward_direction(ground_truth_joints[frame_idx])
+            if gt_forward_quiver is not None:
+                gt_forward_quiver.remove()
+            gt_forward_quiver = ax.quiver(
+                gt_root[0], gt_root[2], gt_root[1],
+                gt_forward[0], gt_forward[2], gt_forward[1],
+                length=radius * 0.5, normalize=True, color="red", alpha=0.8
+            )
+
+            gen_root = generated_joints[frame_idx, 0, :]
+            gen_forward = compute_forward_direction(generated_joints[frame_idx])
+            if gen_forward_quiver is not None:
+                gen_forward_quiver.remove()
+            gen_forward_quiver = ax.quiver(
+                gen_root[0], gen_root[2], gen_root[1],
+                gen_forward[0], gen_forward[2], gen_forward[1],
+                length=radius * 0.5, normalize=True, color="red", alpha=0.8
+            )
+
         fig.canvas.draw()
         img = np.asarray(fig.canvas.buffer_rgba())[..., :3]
         writer.append_data(img)
@@ -2338,6 +2419,7 @@ def compare_motions(
     radius: float = 1.0,
     backend: str = "matplotlib",
     probe: bool = False,
+    show_forward_vector: bool = False,
 ) -> Any:
     """
     Compare generated motion with ground truth on the same 3D axes.
@@ -2353,6 +2435,7 @@ def compare_motions(
         title="Generated vs Ground Truth",
         probe=probe,
         save_path=save_path,
+        show_forward_vector=show_forward_vector,
     )
 
 
@@ -3719,10 +3802,38 @@ class LatentDecoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        H = config.decoder_config.hidden_size
 
-        self.down_proj = nn.Linear(config.encoder_config.hidden_size, config.decoder_config.hidden_size, bias=True)
+        self.down_proj = nn.Linear(config.encoder_config.hidden_size, H, bias=True)
         self.blocks = nn.Sequential(*[DecoderMLP(config) for _ in range(config.decoder_config.num_layers)])
-        self.out_proj = nn.Linear(config.decoder_config.hidden_size, 68, bias=True)
+
+        self.head_norm = nn.RMSNorm(H, eps=config.predictor_config.rms_norm_eps)
+
+        self.root_head_xz = nn.Sequential(
+            nn.Linear(H, H),
+            nn.GELU(),
+            nn.Linear(H, 2),
+        )
+
+        self.root_head_y = nn.Sequential(
+            nn.Linear(H, H // 2),
+            nn.GELU(),
+            nn.Linear(H // 2, 1),
+        )
+
+        self.yaw_head = nn.Sequential(
+            nn.Linear(H, H // 2),
+            nn.GELU(),
+            nn.Linear(H // 2, 2),
+        )  # delta_yaw sin, cos
+
+        self.ric_head = nn.Sequential(
+            nn.Linear(H, 2 * H),
+            nn.GELU(),
+            nn.Linear(2 * H, 2 * H),
+            nn.GELU(),
+            nn.Linear(2 * H, 63),
+        )  # 21 joint_ric_vel * 3
 
         self._initialize_weights()
 
@@ -3732,12 +3843,19 @@ class LatentDecoder(nn.Module):
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """
         latent: (B, H_encoder) - the latent representation from the predictor
-        output: (B, 68) - the predicted reduced features (root_y, root_vxz, delta_yaw, joint_ric)
+        output: (B, 68) - the predicted reduced features (root_y, root_xz_vel, delta_yaw sin, cos, joint_ric_vel * 3)
         """
         x = self.down_proj(latent)
         x = self.blocks(x)
-        x = self.out_proj(x)
-        return x
+        x = self.head_norm(x)
+
+        root_xz = self.root_head_xz(x)  # (..., 2) - root_xz_vel
+        root_y = self.root_head_y(x)  # (..., 1) - root_y
+        yaw = self.yaw_head(x)  # (..., 2) - delta_yaw sin, cos
+        yaw = nn.functional.normalize(yaw, dim=-1)  # normalize to unit vector
+        ric = self.ric_head(x)  # (..., 63) - 21 joint_ric_vel * 3
+
+        return torch.cat([root_y, root_xz, yaw, ric], dim=-1)
 
     def decode(
         self, latent: torch.Tensor, prev_pos: torch.Tensor, prev_frame: torch.Tensor, normalizer: FeatureNormalizer
@@ -3753,8 +3871,13 @@ class LatentDecoder(nn.Module):
 
         pred = self.forward(latent)
 
-        new_pos = x68_to_positions(pred, prev_positions=prev_pos, prev_x271=prev_frame, normalizer=normalizer)
-        new_frame, _ = positions_to_x271(new_pos, prev_positions=prev_pos, normalizer=normalizer)
+        new_pos = x68_to_positions(
+            pred,
+            normalizer,
+            prev_frame,
+            prev_pos,
+        )
+        new_frame, _ = positions_to_x271(new_pos, prev_pos, normalizer)
 
         relative_shift = new_pos - prev_pos
 
@@ -3796,9 +3919,9 @@ from torch.amp.grad_scaler import GradScaler
 # [internal import removed]  from utils.config import Config
 # [internal import removed]  from utils.dataset import create_dataloader
 # [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, estimate_time_remaining
+# [internal import removed]  from utils.models.finetune_trainer import FinetuneTrainer
 # [internal import removed]  from utils.models.flow_matching_predictor import LatentDecoder
 # [internal import removed]  from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
-# [internal import removed]  from utils.motion_utils import Features, x68_to_x271, x271_to_x68
 # [internal import removed]  from utils.wandb_logger import WandbLogger
 
 
@@ -4248,58 +4371,7 @@ class PretrainTrainer:
         return context_loss
 
     def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
-        prev_positions = joints[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 22, 3)
-        prev_frames = motion[:, :-1, :].flatten(0, 1)  # (B * (seq_len-1), 271)
-        y_frames = motion[:, 1:, :].flatten(0, 1)  # (B * (seq_len-1), 271)
-        decoded = decoded.flatten(0, 1)  # (B * (seq_len-1), 68)
-
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)  # (B * (seq_len-1), 68)
-        y_vel = y_frames[..., Features.VEL]  # (B * (seq_len-1), 66)
-        y_feet = y_frames[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
-
-        dec_271d = x68_to_x271(decoded, self.normalizer, prev_positions, prev_frames)  # (B * (seq_len-1), 271)
-        dec_vel = dec_271d[..., Features.VEL]  # (B * (seq_len-1), 66)
-        dec_feet = dec_271d[..., Features.CONTACTS]  # (B * (seq_len-1), 4)
-        dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
-
-        loss_68d = F.mse_loss(decoded, y_68d, reduction="mean")
-        loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
-
-        mask_feet_4d = (
-            y_feet.bool() & ~dec_feet.bool()
-        )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
-        mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
-        loss_feet = (
-            dec_foot_vel[mask_feet_miss].square().mean()
-            if mask_feet_miss.any()
-            else torch.tensor(0.0, device=self.device)
-        )
-
-        decoder_loss = loss_68d + loss_vel * 0.5 + loss_feet * 0.5
-
-        feet_miss_rate = (
-            mask_feet_4d.sum().float() / y_feet.bool().sum().float()
-            if y_feet.bool().sum() > 0
-            else torch.tensor(0.0, device=self.device)
-        )
-
-        engine.set_metrics(
-            [
-                ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_68d", loss_68d.detach().item()),
-                ("loss_vel", loss_vel.detach().item()),
-                ("loss_feet", loss_feet.detach().item()),
-                ("feet_miss_rate", feet_miss_rate.detach().item()),
-            ],
-        )
-
-        return {
-            "decoder_loss": decoder_loss,
-            "loss_68d": loss_68d.detach(),
-            "loss_vel": loss_vel.detach(),
-            "loss_feet": loss_feet.detach(),
-            "feet_miss_rate": feet_miss_rate.detach(),
-        }
+        return FinetuneTrainer._decoder_loss(self, engine, motion, joints, decoded)
 
     def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         """Attach Ignite event handlers for training orchestration."""
@@ -4351,10 +4423,11 @@ class PretrainTrainer:
                     "context_loss",
                     "probe_loss",
                     "decoder_loss",
-                    "loss_68d",
+                    "loss_root",
+                    "loss_yaw",
+                    "loss_ric",
                     "loss_vel",
-                    "loss_feet",
-                    "feet_miss_rate",
+                    "loss_joint",
                     "lr",
                 ],
                 prefix="train/",
@@ -4590,7 +4663,7 @@ from torch.amp.grad_scaler import GradScaler
 # [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, estimate_time_remaining
 # [internal import removed]  from utils.models.flow_matching_predictor import LatentDecoder
 # [internal import removed]  from utils.models.motion_history_encoder import MotionHistoryEncoder
-# [internal import removed]  from utils.motion_utils import Features, x68_to_x271, x271_to_x68
+# [internal import removed]  from utils.motion_utils import Features, positions_to_x271, x68_to_positions, x271_to_x68
 # [internal import removed]  from utils.wandb_logger import WandbLogger
 
 
@@ -4873,61 +4946,60 @@ class FinetuneTrainer:
             "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
         }
 
-    def _decoder_loss(
-        self,
-        engine: PretrainEngine,
-        motion: torch.Tensor,
-        joints: torch.Tensor,
-        decoded: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+    def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
         prev_positions = joints[:, :-1, :].flatten(0, 1)
         prev_frames = motion[:, :-1, :].flatten(0, 1)
         y_frames = motion[:, 1:, :].flatten(0, 1)
+
         decoded = decoded.flatten(0, 1)
+        decoded = self.normalizer.denormalize_x68(decoded)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions)
-        y_vel = y_frames[..., Features.VEL]
-        y_feet = y_frames[..., Features.CONTACTS]
 
-        dec_271d = x68_to_x271(decoded, self.normalizer, prev_positions, prev_frames)
-        dec_vel = dec_271d[..., Features.VEL]
-        dec_feet = dec_271d[..., Features.CONTACTS]
-        dec_foot_vel = dec_271d[..., Features.joint_mask(["feet"], Features.VEL)]
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
+        y_68d = self.normalizer.denormalize_x68(y_68d)
 
-        loss_68d = F.mse_loss(decoded, y_68d, reduction="mean")
-        loss_vel = F.smooth_l1_loss(dec_vel, y_vel, reduction="mean")
-
-        mask_feet_4d = y_feet.bool() & ~dec_feet.bool()
-        mask_feet_miss = mask_feet_4d.any(dim=-1)
-        loss_feet = (
-            dec_foot_vel[mask_feet_miss].square().mean()
-            if mask_feet_miss.any()
-            else torch.tensor(0.0, device=self.device)
+        dec_positions = x68_to_positions(
+            decoded, self.normalizer,
+            prev_x271=prev_frames,
+            prev_positions=prev_positions,
         )
 
-        decoder_loss = loss_68d + loss_vel * 0.5 + loss_feet * 0.5
-        feet_miss_rate = (
-            mask_feet_4d.sum().float() / y_feet.bool().sum().float()
-            if y_feet.bool().sum() > 0
-            else torch.tensor(0.0, device=self.device)
-        )
+        loss_root = F.mse_loss(decoded[:, :3], y_68d[:, :3], reduction="mean")
+        loss_yaw = F.mse_loss(decoded[:, 3:5], y_68d[:, 3:5], reduction="mean")
+        loss_vel = F.smooth_l1_loss(decoded[:, 5:], y_68d[:, 5:], reduction="mean")
+        loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
+
+        # mask_feet_4d = (
+        #     y_feet.bool() & ~dec_feet.bool()
+        # )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
+        # mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
+        # feet_miss_rate = (
+        #     mask_feet_4d.sum().float() / y_feet.bool().sum().float()
+        #     if y_feet.bool().sum() > 0
+        #     else torch.tensor(0.0, device=self.device)
+        # )
+        # loss_feet = (
+        #     dec_foot_vel[mask_feet_miss].square().mean()
+        #     if mask_feet_miss.any()
+        #     else torch.tensor(0.0, device=self.device)
+        # )
+
+        decoder_loss = 0.2 * loss_root + 1.0 * loss_yaw  + 0.5 * loss_vel + 1.0 * loss_joint
 
         engine.set_metrics(
             [
                 ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_68d", loss_68d.detach().item()),
+                ("loss_root", loss_root.detach().item()),
+                ("loss_yaw", loss_yaw.detach().item()),
                 ("loss_vel", loss_vel.detach().item()),
-                ("loss_feet", loss_feet.detach().item()),
-                ("feet_miss_rate", feet_miss_rate.detach().item()),
+                ("loss_joint", loss_joint.detach().item()),
+                # ("loss_feet", loss_feet.detach().item()),
+                # ("feet_miss_rate", feet_miss_rate.detach().item()),
             ],
         )
 
         return {
             "decoder_loss": decoder_loss,
-            "loss_68d": loss_68d.detach(),
-            "loss_vel": loss_vel.detach(),
-            "loss_feet": loss_feet.detach(),
-            "feet_miss_rate": feet_miss_rate.detach(),
         }
 
     def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
@@ -4976,10 +5048,10 @@ class FinetuneTrainer:
             metrics = engine.get_metrics(
                 [
                     "decoder_loss",
-                    "loss_68d",
+                    "loss_root",
+                    "loss_yaw",
                     "loss_vel",
-                    "loss_feet",
-                    "feet_miss_rate",
+                    "loss_joint",
                     "lr",
                 ],
                 prefix="train/",
@@ -5072,7 +5144,7 @@ class FinetuneTrainer:
                 [
                     ("val_loss", engine.get_metric("val_loss", 0.0)),
                     ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
-                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
+                    # ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
                 ],
                 1.0,
             )
@@ -5093,15 +5165,18 @@ class FinetuneTrainer:
             batch_count = engine.state.iteration // self.accumulation_steps
 
             engine.scale_metrics(
-                ["val_decoder_loss", "val_feet_miss_rate"],
+                [
+                    "val_loss",
+                    "val_decoder_loss",
+                ],
                 1.0 / batch_count if batch_count > 0 else 1.0,
             )
 
             self.wandb_logger.log(
                 engine.get_metrics(
                     [
+                        "val_loss",
                         "val_decoder_loss",
-                        "val_feet_miss_rate",
                         "decoder_loss",
                     ],
                     prefix="val/",
