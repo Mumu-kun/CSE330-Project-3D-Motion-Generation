@@ -260,7 +260,8 @@ class FinetuneTrainer(_BaseTrainer):
             metrics = engine.get_metrics(
                 [
                     "decoder_loss",
-                    "loss_root",
+                    "loss_root_y",
+                    "loss_root_xz",
                     "loss_yaw",
                     "loss_vel",
                     "loss_joint",

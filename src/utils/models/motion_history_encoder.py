@@ -17,7 +17,7 @@ class EncoderRoPEAttention(TemporalRoPEAttention):
                 f"TemporalRoPEAttention requires an even per-head dimension, got head_dim={self.head_dim}."
             )
 
-    def forward(self, hidden_states: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         query = self._reshape_heads(self.q_proj(hidden_states))
@@ -70,7 +70,7 @@ class EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         text_emb: torch.Tensor,
-        is_causal: bool = True,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states, attn_gate = self.adaln_attn(hidden_states, text_emb)

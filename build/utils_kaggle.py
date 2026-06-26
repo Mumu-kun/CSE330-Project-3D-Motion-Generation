@@ -1340,14 +1340,15 @@ class PretrainConfig:
         default_factory=lambda: {
             "mask_num_spans": [
                 (0, 2),
-                (1, 6),
+                (0.5, 4),
+                (1, 5),
             ],
         }
     )
 
     # --- Masking ---
     mask_min_span: int = 5
-    mask_max_span: int = 10
+    mask_max_span: int = 20
 
 
 @dataclass
@@ -2733,20 +2734,14 @@ Compatible with 271D custom feature format from motion_utils.py:
 Note: Root X,Z are stored as velocities for autoregressive stability.
 """
 
-import copy
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, Generic, List, Optional, OrderedDict, Tuple, TypeVar, Union
-from typing import Mapping as MappingABC
+from typing import List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
-from ignite.engine import Engine, State
-from scipy import interpolate as Interp
 from transformers.activations import ACT2FN
 
-# [internal import removed]  from utils.config import Config, FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
+# [internal import removed]  from utils.config import FlowMatchingPredictorConfig, MotionHistoryEncoderConfig
 
 
 class KinematicChainEncoder(nn.Module):
@@ -2973,199 +2968,7 @@ def init_weights(module: nn.Module, linear_init: str = "xavier_normal", linear_s
                 nn.init.zeros_(m.bias)
 
 
-class PretrainState(State):
-    """Custom Ignite State for JEPA pretraining."""
-
-    def __init__(self, *args: Any, config: Config, **kwargs: Any) -> None:
-        super().__init__(*args, **kwargs)
-        self.horizon = 40
-        self.metrics: Dict[str, Any] = {
-            "global_step": 0,
-            "best_train_loss": float("inf"),
-        }
-        self.schedules = config.pre_conf.schedules
-        self.num_epochs = config.get_num_epochs()
-
-    def epoch_progress(self) -> float:
-        """Return progress through current epoch as a float in [0, 1]."""
-        return self.epoch / self.num_epochs if self.num_epochs > 0 else 0.0
-
-    def get_schedule_value(self, name: str, default: float, interp: str = "previous") -> float:
-        """Get current value of a scheduled parameter based on epoch progress."""
-        schedule = self.schedules.get(name)
-
-        if not schedule:
-            return default
-
-        t = self.epoch_progress()
-        t_list, v_list = zip(*schedule)
-        t_list = np.array(t_list)
-        v_list = np.array(v_list)
-        t_list = t_list / np.max(t_list)  # Normalize to [0, 1]
-
-        f = Interp.interp1d(t_list, v_list, kind=interp, assume_sorted=True)
-
-        return float(f(t))
-
-    def state_dict(self) -> dict:
-        """Return a dictionary containing the state of the trainer."""
-        super_dict: OrderedDict = super().state_dict()
-        super_dict.update(
-            {
-                "epoch": self.epoch,
-                "iteration": self.iteration,
-                "metrics": self.metrics,
-                "schedules": self.schedules,
-                "num_epochs": self.num_epochs,
-                "horizon": self.horizon,
-            }
-        )
-        return super_dict
-
-    def load_state_dict(self, state_dict: dict) -> None:
-        """Load the state of the trainer from a dictionary."""
-        super().load_state_dict(state_dict)
-        self.epoch = state_dict.get("epoch", 0)
-        self.iteration = state_dict.get("iteration", 0)
-        self.metrics = state_dict.get("metrics", {})
-        self.schedules = state_dict.get("schedules", {})
-        self.num_epochs = state_dict.get("num_epochs", 0)
-        self.horizon = state_dict.get("horizon", 40)
-
-
-class PretrainEngine(Engine):
-    """Custom Ignite Engine for JEPA pretraining."""
-
-    def __init__(self, process_function: Any, config: Config) -> None:
-        super().__init__(process_function)
-        self.state = PretrainState(config=config)
-        self.config = config
-
-    def get_metric(self, name: str, *args, **kwargs):
-        """Get a metric value by name."""
-        return self.state.metrics.get(name, *args, **kwargs)
-
-    def get_metrics(self, names: list[str], prefix: str = "") -> dict[str, Any]:
-        """Get specified metrics as a dict."""
-        return {f"{prefix}{name}": self.state.metrics.get(name) for name in names}
-
-    def set_metrics(self, pairs: list[tuple[str, Any]]) -> None:
-        """Set multiple metrics at once."""
-        for name, value in pairs:
-            self.state.metrics[name] = value
-
-    def clear_metrics(self, names: list[str]) -> None:
-        """Clear specified metrics."""
-        for name in names:
-            self.state.metrics.pop(name, None)
-
-    def scale_metrics(self, names: list[str], scaler: float) -> None:
-        """Scale specified metrics by a factor."""
-        for name in names:
-            self.state.metrics[name] *= scaler
-
-    def csa_op_metrics(self, pairs: list[tuple[str, float]], scalers: float | list[float], clear: bool = False) -> None:
-        """Add a value to an existing metric (useful for running totals)."""
-        if clear:
-            self.clear_metrics([name for name, _ in pairs])
-        if not isinstance(scalers, list):
-            scalers = [scalers for _ in pairs]
-        for (name, value), scaler in zip(pairs, scalers):
-            self.state.metrics[name] = self.state.metrics.get(name, 0.0) + value * scaler
-
-
-def estimate_time_remaining(engine: PretrainEngine, step_time: float, config: Config) -> float:
-    """Estimate remaining training time based on current progress and elapsed time."""
-    curriculum = config.curriculum
-    num_epochs = config.get_num_epochs()
-    epoch = engine.state.epoch
-    global_step = engine.get_metric("global_step")
-    steps_per_epoch = global_step / epoch
-    total_steps = num_epochs * steps_per_epoch
-    remaining_steps = total_steps - global_step
-
-    remaining_time = remaining_steps * step_time
-    return remaining_time
-
-
-T = TypeVar("T", bound=nn.Module)
-
-
-class EMAModel(Generic[T]):
-    """
-    Exponential Moving Average model wrapper.
-
-    Maintains an EMA copy of a model for more stable evaluation.
-    EMA is used for validation, sampling, and checkpointing.
-    """
-
-    def __init__(self, model: T, decay: float = 0.999):
-        """
-        Initialize EMA model.
-
-        Args:
-            model: The model to create EMA copy of
-            decay: EMA decay rate (default: 0.999)
-        """
-        self.decay = decay
-        self.model: T = copy.deepcopy(model)
-        for p in self.model.parameters():
-            p.requires_grad_(False)
-        self.model.eval()
-
-    def update(self, model: T) -> None:
-        """
-        Update EMA weights.
-
-        Args:
-            model: The source model to update from
-        """
-        with torch.no_grad():
-            for ema_p, p in zip(self.model.parameters(), model.parameters()):
-                ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
-
-    def to(self, device: Union[str, torch.device]) -> "EMAModel[T]":
-        """Move EMA model to device."""
-        self.model.to(device)
-        return self
-
-    def state_dict(self) -> dict[str, Any]:
-        """Return state dict of wrapped model for checkpointing."""
-        return self.model.state_dict()
-
-    def load_state_dict(self, state_dict: MappingABC) -> None:
-        """Load state dict into wrapped model."""
-        self.model.load_state_dict(state_dict)
-
-
-class CheckpointMetadata:
-    """Wrapper for non-stateful metadata to be saved with checkpoints.
-
-    Ignite's Checkpoint handler requires all values in the to_save dict to have
-    ``state_dict`` / ``load_state_dict`` methods. This wrapper lets us store
-    simple metadata (like session_id) alongside model checkpoints without
-    triggering infinite recursion in ignite's _tree_map (which would happen
-    with bare strings since they are Sequences of single-char strings).
-    """
-
-    def __init__(self, data: dict[str, Any]) -> None:
-        self.data = data
-
-    def state_dict(self) -> dict[str, Any]:
-        return self.data
-
-    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        self.data = state_dict
-
-
-def _find_latest_checkpoint(checkpoint_dir: Path, prefix: str) -> Path | None:
-    """Find the latest checkpoint file with given prefix."""
-    if not checkpoint_dir.exists():
-        return None
-    checkpoints = list(checkpoint_dir.glob(f"{prefix}_*.pt"))
-    if not checkpoints:
-        return None
-    return max(checkpoints, key=lambda p: p.stat().st_mtime)
+# [internal import removed]  from utils.models._base_trainer import (
 
 
 # ========== models/motion_history_encoder.py ==========
@@ -3189,7 +2992,7 @@ class EncoderRoPEAttention(TemporalRoPEAttention):
                 f"TemporalRoPEAttention requires an even per-head dimension, got head_dim={self.head_dim}."
             )
 
-    def forward(self, hidden_states: torch.Tensor, is_causal: bool = True) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor, is_causal: bool = False) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
 
         query = self._reshape_heads(self.q_proj(hidden_states))
@@ -3242,7 +3045,7 @@ class EncoderLayer(nn.Module):
         self,
         hidden_states: torch.Tensor,
         text_emb: torch.Tensor,
-        is_causal: bool = True,
+        is_causal: bool = False,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states, attn_gate = self.adaln_attn(hidden_states, text_emb)
@@ -3658,13 +3461,81 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         return attn_output
 
 
+class PredictorSelfAttention(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        pred_config = config.predictor_config
+
+        self.q_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
+        self.k_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
+        self.v_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
+        self.out_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
+
+        self.encoder_cond_proj = nn.Linear(config.encoder_config.hidden_size, pred_config.hidden_size, bias=True)
+        self.gate_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=True)
+
+        self.num_heads = pred_config.num_attention_heads
+        self.head_dim = pred_config.hidden_size // pred_config.num_attention_heads
+        self.hidden_size = pred_config.hidden_size
+        self.attention_dropout = pred_config.attention_dropout
+
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        init_weights(self, linear_init="xavier_normal")
+        nn.init.zeros_(self.gate_proj.weight)
+        nn.init.zeros_(self.gate_proj.bias)
+
+    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def attn_weights(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
+        attn_weights = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        return attn_weights
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        output_attentions: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        batch_size, seq_len, _ = hidden_states.shape
+
+        query = self._reshape_heads(self.q_proj(hidden_states))
+        key = self._reshape_heads(self.k_proj(hidden_states))
+        value = self._reshape_heads(self.v_proj(hidden_states))
+
+        attn_output = nn.functional.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=None,
+            dropout_p=self.attention_dropout if self.training else 0.0,
+            is_causal=False,
+        )
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
+        attn_output = self.out_proj(attn_output)
+
+        if output_attentions:
+            attn_w = self.attn_weights(query, key)
+            return attn_output, attn_w
+
+        return attn_output, None
+
+
 class PredictorLayer(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
 
         pred_config = config.predictor_config
 
-        self.adaln_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_self_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+
+        self.self_attn = PredictorSelfAttention(config)
+
+        self.adaln_cross_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
 
         self.cross_attn = PredictorRopeCrossAttention(config)
 
@@ -3678,13 +3549,25 @@ class PredictorLayer(nn.Module):
         encoder_hidden_states: torch.Tensor,
         adaln_cond: torch.Tensor,
         output_attentions: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        B, N, H = hidden_states.shape
+        visible_encoder_states = encoder_hidden_states[:, :N, :]
+        encoder_cond = encoder_hidden_states[:, -N:, :]
+
+        gated_cond = self.self_attn.gate_proj(self.self_attn.encoder_cond_proj(encoder_cond))
+        hidden_states = hidden_states + gated_cond
+
         residual = hidden_states
-        hidden_states, attn_gate = self.adaln_attn(hidden_states, adaln_cond)
-        hidden_states, attn_weights = self.cross_attn(
-            hidden_states, encoder_hidden_states, output_attentions=output_attentions
+        hidden_states, self_attn_gate = self.adaln_self_attn(hidden_states, adaln_cond)
+        hidden_states, self_attn_weights = self.self_attn(hidden_states, output_attentions=False)
+        hidden_states = residual + self_attn_gate * hidden_states
+
+        residual = hidden_states
+        hidden_states, cross_attn_gate = self.adaln_cross_attn(hidden_states, adaln_cond)
+        hidden_states, cross_attn_weights = self.cross_attn(
+            hidden_states, visible_encoder_states, output_attentions=output_attentions
         )
-        hidden_states = residual + attn_gate * hidden_states
+        hidden_states = residual + cross_attn_gate * hidden_states
 
         residual = hidden_states
         hidden_states, mlp_gate = self.adaln_mlp(hidden_states, adaln_cond)
@@ -3692,9 +3575,9 @@ class PredictorLayer(nn.Module):
         hidden_states = residual + mlp_gate * hidden_states
 
         if output_attentions:
-            return hidden_states, attn_weights
+            return hidden_states, self_attn_weights, cross_attn_weights
 
-        return hidden_states, None
+        return hidden_states, None, None
 
 
 class FlowMatchingPredictor(nn.Module):
@@ -3723,7 +3606,6 @@ class FlowMatchingPredictor(nn.Module):
             nn.SiLU(),
             nn.Linear(config.encoder_config.hidden_size * 2, config.encoder_config.hidden_size * 2, bias=True),
         )
-        self.output_norm = nn.LayerNorm(config.encoder_config.hidden_size)
 
         self._initialize_weights()
 
@@ -3736,10 +3618,20 @@ class FlowMatchingPredictor(nn.Module):
         timesteps: torch.Tensor,
         track_features: torch.Tensor,
         text_embedding: torch.Tensor,
-        current_frame_features: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         **kwargs,
-    ) -> tuple[torch.Tensor, Optional[List[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
+        """
+        Args:
+            noisy_states: [B, N, H_enc]
+            timesteps: [B] or [B, 1]
+            track_features: [B, M+N, H_enc]
+            text_embedding: [B, D]
+            output_attentions: bool
+        Returns:
+            flow_prediction: [B, N, H_enc]
+            all_cross_attns: List of attention weights from each layer if output_attentions is True, else None
+        """
         B, N, H = noisy_states.shape
 
         text_cond = self.text_proj(text_embedding)
@@ -3747,14 +3639,15 @@ class FlowMatchingPredictor(nn.Module):
 
         adaln_cond = torch.cat([text_cond, time_cond], dim=-1)
 
+        all_self_attns: list[torch.Tensor] = []
         all_cross_attns: list[torch.Tensor] = []
 
-        hidden_states = self.latent_in_proj(noisy_states)
+        hidden_states = self.latent_in_proj(noisy_states)  # (B, N, H_pred)
 
         for layer_idx, layer in enumerate(self.layers):
             hidden_states = hidden_states
 
-            hidden_states, attn_weights = layer(
+            hidden_states, self_attn_weights, cross_attn_weights = layer(
                 hidden_states,
                 track_features,
                 adaln_cond=adaln_cond,
@@ -3762,17 +3655,19 @@ class FlowMatchingPredictor(nn.Module):
             )
 
             if output_attentions:
-                all_cross_attns.append(attn_weights)
+                all_self_attns.append(self_attn_weights)
+                all_cross_attns.append(cross_attn_weights)
 
-        hidden_states = self.latent_out_proj(hidden_states)
+        hidden_states = self.latent_out_proj(hidden_states)  # (B, N, H_enc)
 
         output_shift, output_scale = self.output_adaln(adaln_cond).chunk(2, dim=-1)
         output_shift = output_shift.unsqueeze(1)
         output_scale = output_scale.unsqueeze(1)
-        flow_prediction = self.output_norm(output_shift + output_scale * hidden_states)
+        flow_prediction = output_shift + output_scale * hidden_states
 
         return (
             flow_prediction,
+            all_self_attns if output_attentions else None,
             all_cross_attns if output_attentions else None,
         )
 
@@ -3816,6 +3711,8 @@ class LatentDecoder(nn.Module):
         )
 
         self.root_head_y = nn.Sequential(
+            nn.Linear(H, H),
+            nn.GELU(),
             nn.Linear(H, H // 2),
             nn.GELU(),
             nn.Linear(H // 2, 1),
@@ -3884,6 +3781,481 @@ class LatentDecoder(nn.Module):
         return new_pos, relative_shift, new_frame
 
 
+# ========== models/_base_trainer.py ==========
+
+"""Shared mixin and training utilities for motion-history trainer classes."""
+
+
+import copy
+from pathlib import Path
+from typing import Any, Dict, Generic, OrderedDict, TypeVar, Union
+from typing import Mapping as MappingABC
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ignite.engine import Engine, Events, State
+from ignite.handlers import (
+    TerminateOnNan,
+    Timer,
+)
+from ignite.handlers.tqdm_logger import ProgressBar
+from ignite.metrics import RunningAverage
+from scipy import interpolate as Interp
+
+# [internal import removed]  from utils.config import Config
+# [internal import removed]  from utils.dataset import create_dataloader
+# [internal import removed]  from utils.motion_utils import x68_to_positions, x271_to_x68
+# [internal import removed]  from utils.wandb_logger import WandbLogger
+
+T = TypeVar("T", bound=nn.Module)
+
+
+class PretrainState(State):
+    """Custom Ignite State for JEPA pretraining."""
+
+    def __init__(self, *args: Any, config: Config, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.horizon = 40
+        self.metrics: Dict[str, Any] = {
+            "global_step": 0,
+            "best_train_loss": float("inf"),
+        }
+        self.schedules = config.pre_conf.schedules
+        self.num_epochs = config.get_num_epochs()
+        self.timer: Any = None
+
+    def epoch_progress(self) -> float:
+        """Return progress through current epoch as a float in [0, 1]."""
+        return self.epoch / self.num_epochs if self.num_epochs > 0 else 0.0
+
+    def get_schedule_value(self, name: str, default: float, interp: str = "previous") -> float:
+        """Get current value of a scheduled parameter based on epoch progress."""
+        schedule = self.schedules.get(name)
+
+        if not schedule:
+            return default
+
+        t = self.epoch_progress()
+        t_list, v_list = zip(*schedule)
+        t_list = np.array(t_list)
+        v_list = np.array(v_list)
+        t_list = t_list / np.max(t_list)
+
+        f = Interp.interp1d(t_list, v_list, kind=interp, assume_sorted=True)
+
+        return float(f(t))
+
+    def state_dict(self) -> dict:
+        """Return a dictionary containing the state of the trainer."""
+        super_dict: OrderedDict = super().state_dict()
+        super_dict.update(
+            {
+                "epoch": self.epoch,
+                "iteration": self.iteration,
+                "metrics": self.metrics,
+                "schedules": self.schedules,
+                "num_epochs": self.num_epochs,
+                "horizon": self.horizon,
+            }
+        )
+        return super_dict
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Load the state of the trainer from a dictionary."""
+        super().load_state_dict(state_dict)
+        self.epoch = state_dict.get("epoch", 0)
+        self.iteration = state_dict.get("iteration", 0)
+        self.metrics = state_dict.get("metrics", {})
+        self.schedules = state_dict.get("schedules", {})
+        self.num_epochs = state_dict.get("num_epochs", 0)
+        self.horizon = state_dict.get("horizon", 40)
+
+
+class PretrainEngine(Engine):
+    """Custom Ignite Engine for JEPA pretraining."""
+
+    def __init__(self, process_function: Any, config: Config) -> None:
+        super().__init__(process_function)
+        self.state = PretrainState(config=config)
+        self.config = config
+
+    def get_metric(self, name: str, *args, **kwargs):
+        """Get a metric value by name."""
+        return self.state.metrics.get(name, *args, **kwargs)
+
+    def get_metrics(self, names: list[str], prefix: str = "") -> dict[str, Any]:
+        """Get specified metrics as a dict."""
+        return {f"{prefix}{name}": self.state.metrics.get(name) for name in names}
+
+    def set_metrics(self, pairs: list[tuple[str, Any]]) -> None:
+        """Set multiple metrics at once."""
+        for name, value in pairs:
+            self.state.metrics[name] = value
+
+    def clear_metrics(self, names: list[str]) -> None:
+        """Clear specified metrics."""
+        for name in names:
+            self.state.metrics.pop(name, None)
+
+    def scale_metrics(self, names: list[str], scaler: float) -> None:
+        """Scale specified metrics by a factor."""
+        for name in names:
+            self.state.metrics[name] *= scaler
+
+    def csa_op_metrics(self, pairs: list[tuple[str, float]], scalers: float | list[float], clear: bool = False) -> None:
+        """Add a value to an existing metric (useful for running totals)."""
+        if clear:
+            self.clear_metrics([name for name, _ in pairs])
+        if not isinstance(scalers, list):
+            scalers = [scalers for _ in pairs]
+        for (name, value), scaler in zip(pairs, scalers):
+            self.state.metrics[name] = self.state.metrics.get(name, 0.0) + value * scaler
+
+
+def estimate_time_remaining(engine: PretrainEngine, step_time: float, config: Config) -> float:
+    """Estimate remaining training time based on current progress and elapsed time."""
+    num_epochs = config.get_num_epochs()
+    epoch = engine.state.epoch
+    global_step = engine.get_metric("global_step")
+    steps_per_epoch = global_step / epoch
+    total_steps = num_epochs * steps_per_epoch
+    remaining_steps = total_steps - global_step
+
+    remaining_time = remaining_steps * step_time
+    return remaining_time
+
+
+class EMAModel(Generic[T]):
+    """
+    Exponential Moving Average model wrapper.
+
+    Maintains an EMA copy of a model for more stable evaluation.
+    EMA is used for validation, sampling, and checkpointing.
+    """
+
+    def __init__(self, model: T, decay: float = 0.999):
+        """
+        Initialize EMA model.
+
+        Args:
+            model: The model to create EMA copy of
+            decay: EMA decay rate (default: 0.999)
+        """
+        self.decay = decay
+        self.model: T = copy.deepcopy(model)
+        for p in self.model.parameters():
+            p.requires_grad_(False)
+        self.model.eval()
+
+    def update(self, model: T) -> None:
+        """
+        Update EMA weights.
+
+        Args:
+            model: The source model to update from
+        """
+        with torch.no_grad():
+            for ema_p, p in zip(self.model.parameters(), model.parameters()):
+                ema_p.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
+
+    def to(self, device: Union[str, torch.device]) -> "EMAModel[T]":
+        """Move EMA model to device."""
+        self.model.to(device)
+        return self
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return state dict of wrapped model for checkpointing."""
+        return self.model.state_dict()
+
+    def load_state_dict(self, state_dict: MappingABC) -> None:
+        """Load state dict into wrapped model."""
+        self.model.load_state_dict(state_dict)
+
+
+class CheckpointMetadata:
+    """Wrapper for non-stateful metadata to be saved with checkpoints.
+
+    Ignite's Checkpoint handler requires all values in the to_save dict to have
+    ``state_dict`` / ``load_state_dict`` methods. This wrapper lets us store
+    simple metadata (like session_id) alongside model checkpoints without
+    triggering infinite recursion in ignite's _tree_map (which would happen
+    with bare strings since they are Sequences of single-char strings).
+    """
+
+    def __init__(self, data: dict[str, Any]) -> None:
+        self.data = data
+
+    def state_dict(self) -> dict[str, Any]:
+        return self.data
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self.data = state_dict
+
+
+def _find_latest_checkpoint(checkpoint_dir: Path, prefix: str) -> Path | None:
+    """Find the latest checkpoint file with given prefix."""
+    if not checkpoint_dir.exists():
+        return None
+    checkpoints = list(checkpoint_dir.glob(f"{prefix}_*.pt"))
+    if not checkpoints:
+        return None
+    return max(checkpoints, key=lambda p: p.stat().st_mtime)
+
+
+class _BaseTrainer:
+    """Shared mixin for PretrainTrainer and FinetuneTrainer.
+
+    Rust-style composition: no __init__; concrete trainers keep their own
+    construction and call mixin helpers via self.<method>().
+    """
+
+    # -- dataloader + scheduler + wandb helpers --
+
+    def _create_dataloaders(self) -> None:
+        self.train_loader, self.normalizer = create_dataloader(self.config, "train", shuffle=True)
+        self.val_loader, _ = create_dataloader(self.config, "val", shuffle=False)
+
+    def _setup_scheduler(
+        self, optimizer: torch.optim.Optimizer, num_epochs: int
+    ) -> torch.optim.lr_scheduler.LRScheduler:
+        accumulation_steps = (
+            self.accumulation_steps
+            if hasattr(self, "accumulation_steps") and self.accumulation_steps is not None
+            else 1
+        )
+        steps_per_epoch = max(len(self.train_loader) // accumulation_steps, 1)
+        total_steps = max(num_epochs * steps_per_epoch, 1)
+        warmup_epochs = int(self.config.lr_warmup_epochs)
+        pct_start = min(max(warmup_epochs / num_epochs, 0.0), 1.0) if num_epochs > 0 else 0.0
+        return torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(self.config.learning_rate),
+            total_steps=total_steps,
+            pct_start=pct_start,
+            anneal_strategy="cos",
+        )
+
+    def _init_wandb(self, phase: str, extra_config: dict[str, Any] | None = None, name: str | None = None) -> None:
+        if not getattr(self, "wandb_project", None):
+            return
+        cfg: dict[str, Any] = {
+            "lr": float(self.config.learning_rate),
+            "weight_decay": float(self.config.weight_decay),
+            "ema_decay": float(self.config.ema_decay),
+            "batch_size": getattr(self.train_loader, "batch_size", self.config.batch_size),
+            "effective_batch_size": self.config.effective_batch_size,
+            "phase": phase,
+        }
+        if extra_config:
+            cfg.update(extra_config)
+        self.wandb_logger = WandbLogger(
+            project=self.wandb_project,
+            name=name,
+            config=cfg,
+            resume_id=self.resume_id if self.resume_id else None,
+        )
+        self.resume_id = self.wandb_logger.run.id if self.wandb_logger.run else None
+
+    # -- batch prep --
+
+    def _prepare_batch(self, batch: Dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        motion = batch["motion"].to(self.device)
+        motion = self.normalizer.normalize(motion)
+        text = batch["text_clip"].to(self.device)
+        joints = batch["joints"].to(self.device)
+        if motion.ndim != 3 or motion.shape[1] < 2:
+            raise ValueError(f"Expected motion (B, T, 271), got {tuple(motion.shape)}")
+        return motion, text, joints
+
+    # -- decoder loss (shared, fixes latent bug in PretrainTrainer) --
+
+    def _decoder_loss(
+        self, engine: PretrainEngine, motion: torch.Tensor, joints: torch.Tensor, decoded: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        prev_positions = joints[:, :-1, :].flatten(0, 1)
+        prev_frames = motion[:, :-1, :].flatten(0, 1)
+        y_frames = motion[:, 1:, :].flatten(0, 1)
+
+        decoded_flat = decoded.flatten(0, 1)
+        decoded_denorm = self.normalizer.denormalize_x68(decoded_flat)
+
+        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
+        y_68d = self.normalizer.denormalize_x68(y_68d)
+
+        dec_positions = x68_to_positions(
+            decoded_denorm,
+            self.normalizer,
+            prev_x271=prev_frames,
+            prev_positions=prev_positions,
+        )
+
+        loss_root_y = F.mse_loss(decoded_denorm[:, :1], y_68d[:, :1], reduction="mean")
+        loss_root_xz = F.mse_loss(decoded_denorm[:, 1:3], y_68d[:, 1:3], reduction="mean")
+        loss_yaw = F.mse_loss(decoded_denorm[:, 3:5], y_68d[:, 3:5], reduction="mean")
+        loss_vel = F.smooth_l1_loss(decoded_denorm[:, 5:], y_68d[:, 5:], reduction="mean")
+        loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
+
+        decoder_loss = 1 * loss_root_y + 0.2 * loss_root_xz + 1.0 * loss_yaw + 0.5 * loss_vel
+
+        engine.set_metrics(
+            [
+                ("decoder_loss", decoder_loss.detach().item()),
+                ("loss_root_y", loss_root_y.detach().item()),
+                ("loss_root_xz", loss_root_xz.detach().item()),
+                ("loss_yaw", loss_yaw.detach().item()),
+                ("loss_vel", loss_vel.detach().item()),
+                ("loss_joint", loss_joint.detach().item()),
+            ],
+        )
+
+        return {"decoder_loss": decoder_loss}
+
+    # -- model parameter logging --
+
+    @staticmethod
+    def _log_model_parameters(*models: tuple[str, nn.Module]) -> None:
+        for name, model in models:
+            total = sum(p.numel() for p in model.parameters())
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            frozen = total - trainable
+            print(f"\n{'=' * 60}")
+            print(f"Model: {name}")
+            print(f"{'=' * 60}")
+            print(f"Total parameters     : {total:,}")
+            print(f"Trainable parameters : {trainable:,}")
+            print(f"Frozen parameters    : {frozen:,}")
+            if total > 0:
+                print("-" * 60)
+                print(f"{'Category':<30} {'Params':>12} {'%':>7}")
+                print("-" * 60)
+                categories: dict[str, int] = {}
+                for pname, param in model.named_parameters():
+                    cat = _assign_category(pname)
+                    categories[cat] = categories.get(cat, 0) + param.numel()
+                for cat, count in categories.items():
+                    pct = count / total * 100
+                    print(f"{cat:<30} {count:>12,} {pct:>6.2f}%")
+            print("-" * 60)
+
+    # -- handler hooks (override in subclasses) --
+
+    def _log_train_step(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        """Attach per-iteration training log handler."""
+
+        @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _handler(engine: PretrainEngine) -> None:
+            if not self.wandb_logger:
+                return
+            timer = engine.state.timer
+            step_time = timer.value() if timer.value() is not None else 0.0
+            timer.reset()
+            step_time_avg = (
+                engine.state.metrics["step_time_avg"] if "step_time_avg" in engine.state.metrics else step_time
+            )
+            remaining_time = estimate_time_remaining(engine, step_time_avg, self.config)
+            engine.set_metrics([("step_time", step_time), ("remaining_time", remaining_time)])
+            metrics = engine.get_metrics(["loss", "lr"], prefix="train/")
+            self.wandb_logger.log(metrics, step=engine.get_metric("global_step", 0))
+
+    def _log_best_validation(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        """Attach COMPLETED handler that logs validation metrics."""
+
+        @evaluator.on(Events.COMPLETED)
+        def _handler(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
+            self.wandb_logger.log(
+                engine.get_metrics(["val_loss", "loss"], prefix="val/"),
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            self.wandb_logger.log(
+                {"epoch": int(trainer.state.epoch), "global_step": int(trainer.get_metric("global_step", 0))},
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+
+    def _track_batch_loss(self, evaluator: PretrainEngine) -> None:
+        """Attach per-iteration running-val-loss handler."""
+
+        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _handler(engine: PretrainEngine) -> None:
+            engine.csa_op_metrics([("val_loss", engine.get_metric("loss", 0.0))], 1.0)
+
+    # -- common handler scaffolding --
+
+    def _limit_val_batches(self, evaluator: PretrainEngine) -> None:
+        val_batches = self.config.val_batches
+        if val_batches > 0:
+
+            @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+            def _handler(engine: PretrainEngine) -> None:
+                if engine.state.iteration // self.accumulation_steps >= val_batches:
+                    engine.terminate()
+
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        """Attach Ignite event handlers for training orchestration. Subclasses override hook methods to customize."""
+        trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
+        ProgressBar(mininterval=10.0).attach(trainer, ["loss"])
+        trainer.state.horizon = self.config.horizon
+
+        timer = Timer(average=False)
+        timer.attach(trainer, start=Events.STARTED, resume=Events.ITERATION_STARTED, pause=Events.ITERATION_COMPLETED)
+        RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0)).attach(trainer, "step_time_avg")
+
+        trainer.state.timer = timer
+
+        @trainer.on(Events.GET_BATCH_STARTED)
+        def _set_horizon(engine: PretrainEngine) -> None:
+            engine.state.dataloader.dataset.set_horizon(engine.state.horizon)
+
+        @evaluator.on(Events.GET_BATCH_STARTED)
+        def _set_horizon_eval(engine: PretrainEngine) -> None:
+            engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)
+
+        self._limit_val_batches(evaluator)
+
+        @trainer.on(Events.EPOCH_COMPLETED(every=self.config.val_interval))
+        def _run_validation(engine: PretrainEngine) -> None:
+            evaluator.run(self.val_loader)
+
+        self._log_train_step(trainer, evaluator)
+        self._track_batch_loss(evaluator)
+        self._log_best_validation(trainer, evaluator)
+
+    # -- public run --
+
+    def run(self, max_epochs: int | None = None) -> None:
+        """Execute the training loop."""
+        trainer = PretrainEngine(lambda engine, batch: self._train_step(engine, batch), self.config)
+        evaluator = PretrainEngine(lambda engine, batch: self._val_step(engine, batch), self.config)
+        self.evaluator = evaluator
+        self._attach_handlers(trainer, evaluator)
+        epochs = max_epochs or int(self.config.get_num_epochs())
+        trainer.run(self.train_loader, max_epochs=epochs)
+        if self.wandb_logger:
+            self.wandb_logger.finish()
+
+
+def _assign_category(name: str) -> str:
+    name_lower = name.lower()
+    if "cross_attn" in name_lower:
+        return "cross_attn"
+    if "self_attn" in name_lower or "attn" in name_lower:
+        return "self_attn"
+    if "mlp" in name_lower:
+        return "mlp"
+    if "adaln" in name_lower:
+        return "adaln"
+    if "layer_norm" in name_lower or "norm" in name_lower:
+        return "layer_norm"
+    if "register" in name_lower or "mask_token" in name_lower:
+        return "learnable_tokens"
+    if "linear" in name_lower or "proj" in name_lower:
+        return "linear_proj"
+    return "other"
+
+
 # ========== models/pretrain_trainer.py ==========
 
 """
@@ -3903,26 +4275,17 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from ignite.engine import Events
 from ignite.handlers import (
     Checkpoint,
     DiskSaver,
-    TerminateOnNan,
-    Timer,
 )
-from ignite.handlers.tqdm_logger import ProgressBar
-from ignite.metrics import RunningAverage
-from torch.amp.grad_scaler import GradScaler
 
 # [internal import removed]  from utils.config import Config
-# [internal import removed]  from utils.dataset import create_dataloader
-# [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, estimate_time_remaining
-# [internal import removed]  from utils.models.finetune_trainer import FinetuneTrainer
+# [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, _BaseTrainer, estimate_time_remaining
 # [internal import removed]  from utils.models.flow_matching_predictor import LatentDecoder
 # [internal import removed]  from utils.models.motion_history_encoder import JepaPredictor, LinearProbe, MotionHistoryEncoder
-# [internal import removed]  from utils.wandb_logger import WandbLogger
 
 
 class InterpEnum(Enum):
@@ -3971,7 +4334,10 @@ def random_span_mask(
         if not valid:
             break
 
-        idx, left, right, length = valid[0]
+        weights = torch.tensor([v[3] for v in valid], dtype=torch.float)
+        choice_idx = int(torch.multinomial(weights, 1).item())
+
+        idx, left, right, length = valid[choice_idx]
         span = int(torch.randint(min_span, min(max_span, length) + 1, ()).item())
         start = int(torch.randint(left, right - span + 1, ()).item())
         end = start + span
@@ -4007,11 +4373,11 @@ def random_span_mask(
     return mask
 
 
-class PretrainTrainer:
+class PretrainTrainer(_BaseTrainer):
     """
     JEPA-style pretraining trainer with masked frame reconstruction.
 
-    Fully self-contained: builds models, optimizer, and Ignite engine.
+    Fully self-contained:, and Ignite engine.
     Usage:
         trainer = PretrainTrainer(config=config, train_loader=train_loader, val_loader=val_loader)
         trainer.run()
@@ -4025,14 +4391,14 @@ class PretrainTrainer:
         self.config = config
         self.wandb_project = wandb_project
 
-        # Device and AMP setup
         self.device = torch.device(config.device) if torch.cuda.is_available() else torch.device("cpu")
         self.use_amp = self.device.type == "cuda"
         self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
-        self.scaler: GradScaler = GradScaler(self.device.type, enabled=self.use_amp)
+        self.scaler: torch.amp.grad_scaler.GradScaler = torch.amp.grad_scaler.GradScaler(
+            self.device.type, enabled=self.use_amp
+        )
 
-        # Models - built internally
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config)
         self.ema_encoder: EMAModel = EMAModel(self.encoder, decay=float(config.ema_decay))
         self.jepa_predictor: JepaPredictor = JepaPredictor(config.encoder_config)
@@ -4043,17 +4409,19 @@ class PretrainTrainer:
             text_embedding_dim=config.text_embedding_dim,
         ).to(self.device)
 
-        self._log_model_parameters(self.encoder, self.jepa_predictor, self.linear_probe, self.decoder)
+        self._log_model_parameters(
+            ("MotionHistoryEncoder", self.encoder),
+            ("JepaPredictor", self.jepa_predictor),
+            ("LinearProbe", self.linear_probe),
+            ("LatentDecoder", self.decoder),
+        )
 
-        # W&B logger
-        self.wandb_logger: WandbLogger | None = None
+        self.wandb_logger = None
 
-        # Initialize all objects
         self._initialize()
 
     def _initialize(self) -> None:
         """Initialize all components: models, optimizer, W&B."""
-        # Create checkpoint directory
         config = self.config
 
         utc_plus_6 = timezone(timedelta(hours=6))
@@ -4062,8 +4430,7 @@ class PretrainTrainer:
 
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        self.train_loader, self.normalizer = create_dataloader(config, "train", shuffle=True)
-        self.val_loader, _ = create_dataloader(config, "val", shuffle=False)
+        self._create_dataloaders()
 
         self.optimizer: torch.optim.Optimizer = torch.optim.AdamW(
             list(self.encoder.parameters()) + list(self.jepa_predictor.parameters()),
@@ -4076,7 +4443,6 @@ class PretrainTrainer:
             weight_decay=float(config.weight_decay),
         )
 
-        # Move to device
         self.encoder.to(self.device)
         self.jepa_predictor.to(self.device)
         self.linear_probe.to(self.device)
@@ -4086,132 +4452,31 @@ class PretrainTrainer:
         self.accumulation_steps = ceil(config.effective_batch_size / config.batch_size) or 1
 
         num_epochs = int(config.get_num_epochs())
-        warmup_epochs = int(config.lr_warmup_epochs)
-        steps_per_epoch = max(len(self.train_loader) // self.accumulation_steps, 1)
-        total_steps = num_epochs * steps_per_epoch
-        pct_start = min(max(warmup_epochs / num_epochs, 0.0), 1.0) if num_epochs > 0 else 0.0
-
-        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=float(config.learning_rate),
-            total_steps=total_steps,
-            pct_start=pct_start,
-            anneal_strategy="cos",
-        )
-        self.aux_lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.aux_optimizer,
-            max_lr=float(config.learning_rate),
-            total_steps=total_steps,
-            pct_start=pct_start,
-            anneal_strategy="cos",
-        )
+        self.lr_scheduler = self._setup_scheduler(self.optimizer, num_epochs)
+        self.aux_lr_scheduler = self._setup_scheduler(self.aux_optimizer, num_epochs)
 
         self.resume_id = None
 
-        # Setup W&B
-        if self.wandb_project:
-            self.wandb_logger = WandbLogger(
-                project=self.wandb_project,
-                name=self.pretraining_session_id,
-                config={
-                    "lr": float(self.config.learning_rate),
-                    "weight_decay": float(self.config.weight_decay),
-                    "ema_decay": float(self.config.ema_decay),
-                    "batch_size": self.train_loader.batch_size,
-                    "effective_batch_size": self.config.effective_batch_size,
-                    "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
-                    "jepa_params": sum(p.numel() for p in self.jepa_predictor.parameters()),
-                    "decoder_params": sum(p.numel() for p in self.decoder.parameters()),
-                    "phase": "pretrain",
-                    "session_id": self.session_id,
-                },
-                resume_id=self.resume_id if self.resume_id else None,
-            )
-
-            self.resume_id = self.wandb_logger.run.id if self.wandb_logger.run else None
+        self._init_wandb(
+            "pretrain",
+            extra_config={
+                "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
+                "jepa_params": sum(p.numel() for p in self.jepa_predictor.parameters()),
+                "decoder_params": sum(p.numel() for p in self.decoder.parameters()),
+            },
+            name=self.pretraining_session_id,
+        )
+        if self.wandb_logger:
             print(f"Initialized W&B run with ID: {self.resume_id}")
-
-    @staticmethod
-    def _log_model_parameters(
-        encoder: MotionHistoryEncoder, jepa_predictor: JepaPredictor, linear_probe: LinearProbe, decoder: LatentDecoder
-    ) -> dict[str, int]:
-        """Print total and category-wise parameter counts for all models."""
-
-        def _print_model_summary(name: str, model: nn.Module) -> int:
-            total = sum(p.numel() for p in model.parameters())
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            frozen = total - trainable
-            print(f"\n{'=' * 60}")
-            print(f"Model: {name}")
-            print(f"{'=' * 60}")
-            print(f"Total parameters     : {total:,}")
-            print(f"Trainable parameters : {trainable:,}")
-            print(f"Frozen parameters    : {frozen:,}")
-            print("-" * 60)
-            print(f"{'Category':<30} {'Params':>12} {'%':>7}")
-            print("-" * 60)
-            categories = _categorize_parameters(model)
-            for cat, count in categories.items():
-                pct = count / total * 100 if total > 0 else 0.0
-                print(f"{cat:<30} {count:>12,} {pct:>6.2f}%")
-            print("-" * 60)
-
-            return trainable
-
-        def _categorize_parameters(model: nn.Module) -> Dict[str, int]:
-            categories: Dict[str, int] = {}
-            for name, param in model.named_parameters():
-                cat = _assign_category(name)
-                categories[cat] = categories.get(cat, 0) + param.numel()
-            return categories
-
-        def _assign_category(name: str) -> str:
-            name_lower = name.lower()
-            if "cross_attn" in name_lower:
-                return "cross_attn"
-            if "self_attn" in name_lower or "attn" in name_lower:
-                return "self_attn"
-            if "mlp" in name_lower:
-                return "mlp"
-            if "adaln" in name_lower:
-                return "adaln"
-            if "layer_norm" in name_lower or "norm" in name_lower:
-                return "layer_norm"
-            if "register" in name_lower or "mask_token" in name_lower:
-                return "learnable_tokens"
-            if "linear" in name_lower or "proj" in name_lower:
-                return "linear_proj"
-            return "other"
-
-        p_enc = _print_model_summary("MotionHistoryEncoder", encoder)
-        p_jepa = _print_model_summary("JepaPredictor", jepa_predictor)
-        p_linear = _print_model_summary("LinearProbe", linear_probe)
-        p_decoder = _print_model_summary("LatentDecoder", decoder)
-
-        return {
-            "encoder": p_enc,
-            "jepa_predictor": p_jepa,
-            "linear_probe": p_linear,
-            "decoder": p_decoder,
-        }
 
     def _train_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one pretraining step."""
-
-        # Forward pass
         self.encoder.train()
         self.jepa_predictor.train()
         self.linear_probe.train()
         self.decoder.train()
 
-        # Prepare batch
-        motion = batch["motion"].to(self.device)
-        motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
-        joints = batch["joints"].to(self.device)
-
-        if motion.ndim != 3 or motion.shape[1] < 2:
-            raise ValueError(f"Expected motion (B, T, 271), got {tuple(motion.shape)}")
+        motion, text, joints = self._prepare_batch(batch)
 
         losses = self._compute_loss(engine, motion, joints, text)
 
@@ -4253,10 +4518,7 @@ class PretrainTrainer:
         self.linear_probe.eval()
         self.decoder.eval()
 
-        motion = batch["motion"].to(self.device)
-        motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
-        joints = batch["joints"].to(self.device)
+        motion, text, joints = self._prepare_batch(batch)
 
         with torch.no_grad():
             losses = self._compute_loss(engine, motion, joints, text)
@@ -4277,12 +4539,11 @@ class PretrainTrainer:
         min_span = self.config.pre_conf.mask_min_span
         max_span = self.config.pre_conf.mask_max_span
 
-        # Build mask
         mask_bool = (
             random_span_mask(seq_len, num_spans, min_span, max_span, engine).unsqueeze(0).expand(batch_size, -1)
-        ).to(self.device)  # (B, seq_len)
+        ).to(self.device)
 
-        with torch.amp.autocast(  # type: ignore
+        with torch.amp.autocast(
             device_type=self.device.type,
             dtype=self.amp_dtype,
             enabled=self.use_amp,
@@ -4290,41 +4551,31 @@ class PretrainTrainer:
             text_emb = text[:, -1, :] if text.ndim == 3 else text
             masked_context = self.encoder.forward(
                 motion, torch.zeros_like(text_emb), mask=mask_bool, return_layer_outputs=True
-            )  # (B, seq_len, L, H) where L = num_hidden_layers
+            )
 
             with torch.no_grad():
                 target_encoder = self.ema_encoder.model
                 target_encoder.eval()
                 target_context = target_encoder(
                     motion, torch.zeros_like(text_emb), mask=None, return_layer_outputs=True
-                ).detach()  # (B, seq_len, L, H)
+                ).detach()
 
             _, _, L, H = masked_context.shape
 
-            predicted = self.jepa_predictor(masked_context)  # (B, seq_len, L, H)
+            predicted = self.jepa_predictor(masked_context)
 
-            #
-            # Compute Loss
-            #
-            _loss = F.smooth_l1_loss(predicted, target_context, reduction="none").mean(dim=(2, 3))  # (B, seq_len)
-            # Extract masked tokens
+            _loss = F.smooth_l1_loss(predicted, target_context, reduction="none").mean(dim=(2, 3))
             mask_loss = (_loss * mask_bool.float()).sum() / mask_bool.sum().clamp(min=1)
             context_loss = self._context_loss(engine, _loss, mask_bool)
             loss = mask_loss + context_loss * self.config.jepa_ctx_weight
 
-            #
-            # Linear probe loss (cosine similarity between predicted context and text embedding)
-            #
-            probe_out = self.linear_probe(target_context[:, :, -1, :])  # Use last layer's output for probing
+            probe_out = self.linear_probe(target_context[:, :, -1, :])
             probe_out = F.normalize(probe_out, dim=-1)
             normalized_text = F.normalize(text_emb, dim=-1)
             probe_loss = 1 - F.cosine_similarity(probe_out, normalized_text, dim=-1).mean()
 
-            #
-            # Decoder loss
-            #
-            latent = target_context[:, 1:, -1, :]  # (B, seq_len-1, H_enc)
-            decoded = self.decoder(latent)  # (B, seq_len-1, 68)
+            latent = target_context[:, 1:, -1, :]
+            decoded = self.decoder(latent)
 
             decoder_losses = self._decoder_loss(engine, motion, joints, decoded)
             decoder_loss = decoder_losses["decoder_loss"]
@@ -4337,7 +4588,7 @@ class PretrainTrainer:
                 ("probe_loss", probe_loss.detach().item()),
             ],
             1.0 / self.accumulation_steps,
-            engine.state.iteration % self.accumulation_steps == 1,  # Clear on first step of accumulation
+            engine.state.iteration % self.accumulation_steps == 1,
         )
 
         return {
@@ -4349,73 +4600,36 @@ class PretrainTrainer:
 
     def _context_loss(self, engine: PretrainEngine, _loss: torch.Tensor, mask_bool: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len = mask_bool.shape
-        all_mask_indices = [
-            mask_bool[b].nonzero(as_tuple=False).squeeze(1)  # (num_masked_b,)
-            for b in range(batch_size)
-        ]
+        all_mask_indices = [mask_bool[b].nonzero(as_tuple=False).squeeze(1) for b in range(batch_size)]
 
-        pos = torch.arange(seq_len, device=self.device)  # (seq_len,)
+        pos = torch.arange(seq_len, device=self.device)
         weights = torch.zeros(batch_size, seq_len, device=self.device)
 
-        # Compute distance of each position to nearest masked position
-        pos_exp = pos.unsqueeze(0).unsqueeze(2)  # (1, seq_len, 1)
-        mask_idx_exp = torch.stack(all_mask_indices).unsqueeze(1)  # (B, 1, num_masked)
-        distances = (pos_exp - mask_idx_exp).abs()  # (B, seq_len, num_masked)
-        min_distances = distances.min(dim=2).values  # (B, seq_len)
-        weights = 1.0 / torch.sqrt(min_distances + 1e-8)  # Higher weight = closer to masked
-        weights[mask_bool] = 0.0  # Masked positions don't contribute to context loss
+        pos_exp = pos.unsqueeze(0).unsqueeze(2)
+        mask_idx_exp = torch.stack(all_mask_indices).unsqueeze(1)
+        distances = (pos_exp - mask_idx_exp).abs()
+        min_distances = distances.min(dim=2).values
+        weights = 1.0 / torch.sqrt(min_distances + 1e-8)
+        weights[mask_bool] = 0.0
 
-        unmasked_bool = ~mask_bool  # (B, seq_len)
+        unmasked_bool = ~mask_bool
         context_loss = (_loss * unmasked_bool.float() * weights.detach()).sum() / (unmasked_bool.sum().float() + 1e-8)
 
         return context_loss
 
-    def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
-        return FinetuneTrainer._decoder_loss(self, engine, motion, joints, decoded)
-
-    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
-        """Attach Ignite event handlers for training orchestration."""
-
-        # NaN termination
-        trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
-
-        # Progress bar for console display
-        pbar = ProgressBar(
-            mininterval=10.0,
-        )
-        pbar.attach(trainer, ["loss"])
-
-        trainer.state.horizon = self.config.horizon
-
-        timer = Timer(average=False)
-
-        timer.attach(trainer, start=Events.STARTED, resume=Events.ITERATION_STARTED, pause=Events.ITERATION_COMPLETED)
-
-        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0)).attach(
-            trainer, "step_time_avg"
-        )
-
-        # Step logging
+    def _log_train_step(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
-        def _log_train_step(engine: PretrainEngine) -> None:
+        def _handler(engine: PretrainEngine) -> None:
             if not self.wandb_logger:
                 return
-
+            timer = engine.state.timer
             step_time = timer.value() if timer.value() is not None else 0.0
             timer.reset()
-
-            _step_time_avg = (
-                trainer.state.metrics["step_time_avg"] if "step_time_avg" in trainer.state.metrics else step_time
+            step_time_avg = (
+                engine.state.metrics["step_time_avg"] if "step_time_avg" in engine.state.metrics else step_time
             )
-            remaining_time = estimate_time_remaining(engine, _step_time_avg, self.config)
-
-            engine.set_metrics(
-                [
-                    ("step_time", step_time),
-                    ("remaining_time", remaining_time),
-                ]
-            )
-
+            remaining_time = estimate_time_remaining(engine, step_time_avg, self.config)
+            engine.set_metrics([("step_time", step_time), ("remaining_time", remaining_time)])
             metrics = engine.get_metrics(
                 [
                     "loss",
@@ -4444,13 +4658,61 @@ class PretrainTrainer:
                 step=engine.get_metric("global_step", 0),
             )
 
-        @trainer.on(Events.GET_BATCH_STARTED)
-        def _set_horizon(engine: PretrainEngine) -> None:
-            engine.state.dataloader.dataset.set_horizon(engine.state.horizon)  # type: ignore[attr-defined]
+    def _log_best_validation(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        @evaluator.on(Events.COMPLETED)
+        def _handler(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
+            batch_count = engine.state.iteration // self.accumulation_steps
+            engine.scale_metrics(
+                ["val_loss", "val_decoder_loss", "val_feet_miss_rate"],
+                1.0 / batch_count if batch_count > 0 else 1.0,
+            )
+            self.wandb_logger.log(
+                engine.get_metrics(
+                    [
+                        "val_loss",
+                        "val_decoder_loss",
+                        "val_feet_miss_rate",
+                        "loss",
+                        "mask_loss",
+                        "context_loss",
+                        "probe_loss",
+                        "decoder_loss",
+                    ],
+                    prefix="val/",
+                ),
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            self.wandb_logger.log(
+                {"epoch": int(trainer.state.epoch), "global_step": int(trainer.get_metric("global_step", 0))},
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            val_loss = float(engine.get_metric("val_loss", float("inf")))
+            best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
+            if val_loss < best_val_loss:
+                engine.set_metrics([("best_val_loss", val_loss)])
+                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
+            eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
+            best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
+            if eval_loss < best_eval_loss:
+                engine.set_metrics([("best_eval_loss", eval_loss)])
+                self.wandb_logger.log({"val/best_eval_loss": eval_loss}, step=int(trainer.get_metric("global_step", 0)))
 
-        @evaluator.on(Events.GET_BATCH_STARTED)
-        def _set_horizon_eval(engine: PretrainEngine) -> None:
-            engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)  # type: ignore[attr-defined]
+    def _track_batch_loss(self, evaluator: PretrainEngine) -> None:
+        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _handler(engine: PretrainEngine) -> None:
+            engine.csa_op_metrics(
+                [
+                    ("val_loss", engine.get_metric("loss", 0.0)),
+                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
+                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
+                ],
+                1.0,
+            )
+
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        super()._attach_handlers(trainer, evaluator)
 
         checkpoint_mapping = {
             "trainer": trainer,
@@ -4467,10 +4729,8 @@ class PretrainTrainer:
             "config": CheckpointMetadata(asdict(self.config)),
         }
 
-        def global_step_transform(engine: PretrainEngine, _) -> int:
-            return trainer.get_metric("global_step", 0)
+        global_step_transform = self._create_global_step_transform(trainer)
 
-        # Best checkpoint handler
         val_best_checkpoint = Checkpoint(
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
@@ -4502,101 +4762,28 @@ class PretrainTrainer:
             global_step_transform=global_step_transform,
         )
 
-        trainer.add_event_handler(
-            Events.EPOCH_COMPLETED(every=self.config.checkpoint_interval),
-            latest_checkpoint,
-        )
-
-        @trainer.on(Events.EPOCH_COMPLETED(every=self.config.val_interval))
-        def _run_validation(engine: PretrainEngine) -> None:
-            evaluator.run(self.val_loader)
-
-        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
-        def track_batch_loss(engine: PretrainEngine) -> None:
-            engine.csa_op_metrics(
-                [
-                    ("val_loss", engine.get_metric("loss", 0.0)),
-                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
-                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
-                ],
-                1.0,
-            )
-
-        val_batches = self.config.val_batches
-        if val_batches > 0:
-
-            @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
-            def _limit_val_batches(engine: PretrainEngine) -> None:
-                if engine.state.iteration // self.accumulation_steps >= val_batches:
-                    engine.terminate()
-
-        @evaluator.on(Events.COMPLETED)
-        def _log_best_validation(engine: PretrainEngine) -> None:
-            if self.wandb_logger is None:
-                return
-
-            batch_count = engine.state.iteration // self.accumulation_steps
-
-            engine.scale_metrics(
-                ["val_loss", "val_decoder_loss", "val_feet_miss_rate"],
-                1.0 / batch_count if batch_count > 0 else 1.0,
-            )
-
-            self.wandb_logger.log(
-                engine.get_metrics(
-                    [
-                        "val_loss",
-                        "val_decoder_loss",
-                        "val_feet_miss_rate",
-                        "loss",
-                        "mask_loss",
-                        "context_loss",
-                        "probe_loss",
-                        "decoder_loss",
-                    ],
-                    prefix="val/",
-                ),
-                step=int(trainer.get_metric("global_step", 0)),
-            )
-
-            self.wandb_logger.log(
-                {
-                    "epoch": int(trainer.state.epoch),
-                    "global_step": int(trainer.get_metric("global_step", 0)),
-                },
-                step=int(trainer.get_metric("global_step", 0)),
-            )
-
-            val_loss = float(engine.get_metric("val_loss", float("inf")))
-            best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
-            if val_loss < best_val_loss:
-                engine.set_metrics([("best_val_loss", val_loss)])
-                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
-
-            eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
-            best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
-            if eval_loss < best_eval_loss:
-                engine.set_metrics([("best_eval_loss", eval_loss)])
-                self.wandb_logger.log({"val/best_eval_loss": eval_loss}, step=int(trainer.get_metric("global_step", 0)))
-
+        trainer.add_event_handler(Events.EPOCH_COMPLETED(every=self.config.checkpoint_interval), latest_checkpoint)
         evaluator.add_event_handler(Events.COMPLETED, val_best_checkpoint)
         evaluator.add_event_handler(Events.COMPLETED, eval_best_checkpoint)
 
+    @staticmethod
+    def _create_global_step_transform(trainer: PretrainEngine):
+        def _transform(engine: PretrainEngine, _) -> int:
+            return trainer.get_metric("global_step", 0)
+
+        return _transform
+
     def run(self, max_epochs: int | None = None) -> None:
-        """Execute the pretraining loop."""
         print(f"Starting pretraining session: {self.pretraining_session_id}")
         trainer = PretrainEngine(lambda engine, batch: self._train_step(engine, batch), self.config)
         self.evaluator = PretrainEngine(lambda engine, batch: self._val_step(engine, batch), self.config)
         self._attach_handlers(trainer, self.evaluator)
-
         epochs = max_epochs or int(self.config.get_num_epochs())
         trainer.run(self.train_loader, max_epochs=epochs)
-
         if self.wandb_logger:
             self.wandb_logger.finish()
 
 
-# Convenience function for notebook usage
 def train_pretrain(
     config: Config,
     wandb_project: str | None = None,
@@ -4645,26 +4832,17 @@ from pathlib import Path
 from typing import Dict, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from ignite.engine import Events
 from ignite.handlers import (
     Checkpoint,
     DiskSaver,
-    TerminateOnNan,
-    Timer,
 )
-from ignite.handlers.tqdm_logger import ProgressBar
-from ignite.metrics import RunningAverage
 from torch.amp.grad_scaler import GradScaler
 
 # [internal import removed]  from utils.config import Config
-# [internal import removed]  from utils.dataset import create_dataloader
-# [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, estimate_time_remaining
+# [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, _BaseTrainer, estimate_time_remaining
 # [internal import removed]  from utils.models.flow_matching_predictor import LatentDecoder
 # [internal import removed]  from utils.models.motion_history_encoder import MotionHistoryEncoder
-# [internal import removed]  from utils.motion_utils import Features, positions_to_x271, x68_to_positions, x271_to_x68
-# [internal import removed]  from utils.wandb_logger import WandbLogger
 
 
 @contextmanager
@@ -4691,7 +4869,7 @@ def _torch_load_with_compat(path, map_location, weights_only):
     return checkpoint
 
 
-class FinetuneTrainer:
+class FinetuneTrainer(_BaseTrainer):
     """Decoder-only finetuning trainer."""
 
     def __init__(
@@ -4720,7 +4898,6 @@ class FinetuneTrainer:
             self.device
         )
 
-        # Move to device
         self.encoder.to(self.device)
         self.ema_encoder.to(self.device)
         self.decoder.to(self.device)
@@ -4732,47 +4909,38 @@ class FinetuneTrainer:
         self.encoder.eval()
         self.ema_encoder.model.eval()
 
-        self._log_model_parameters()
+        self._log_model_parameters(
+            ("MotionHistoryEncoder", self.encoder),
+            ("LatentDecoder", self.decoder),
+        )
 
-        self.wandb_logger: WandbLogger | None = None
+        self.wandb_logger = None
 
         self._initialize()
 
     def _initialize(self) -> None:
-        config = self.config
         self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-        self.train_loader, self.normalizer = create_dataloader(self.config, "train", shuffle=True)
-        self.val_loader, _ = create_dataloader(self.config, "val", shuffle=False)
+        self._create_dataloaders()
 
-        self.accumulation_steps = ceil(config.effective_batch_size / config.batch_size) or 1
+        self.accumulation_steps = ceil(self.config.effective_batch_size / self.config.batch_size) or 1
 
         self.optimizer = torch.optim.AdamW(
             self.decoder.parameters(),
             lr=float(self.config.learning_rate),
             weight_decay=float(self.config.weight_decay),
         )
-        self._setup_scheduler(num_epochs=int(config.get_num_epochs()))
+        self.lr_scheduler = self._setup_scheduler(self.optimizer, num_epochs=int(self.config.get_num_epochs()))
 
-        if self.wandb_project:
-            self.wandb_logger = WandbLogger(
-                project=self.wandb_project,
-                name=self.finetuning_session_id,
-                config={
-                    "lr": float(self.config.learning_rate),
-                    "weight_decay": float(self.config.weight_decay),
-                    "ema_decay": float(self.config.ema_decay),
-                    "batch_size": getattr(self.train_loader, "batch_size", self.config.batch_size),
-                    "effective_batch_size": self.config.effective_batch_size,
-                    "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
-                    "decoder_params": sum(p.numel() for p in self.decoder.parameters()),
-                    "phase": "finetune_decoder",
-                    "session_id": self.session_id,
-                    "pretrained_checkpoint": str(self.pretrained_checkpoint_path),
-                },
-                resume_id=self.resume_id,
-            )
-            self.resume_id = self.wandb_logger.run.id if self.wandb_logger.run else None
+        self._init_wandb(
+            "finetune_decoder",
+            extra_config={
+                "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
+                "decoder_params": sum(p.numel() for p in self.decoder.parameters()),
+                "pretrained_checkpoint": str(self.pretrained_checkpoint_path),
+            },
+            name=self.finetuning_session_id,
+        )
 
     def _load_pretrained_encoder_state(self) -> None:
         if not self.pretrained_checkpoint_path.exists():
@@ -4780,7 +4948,6 @@ class FinetuneTrainer:
 
         checkpoint = _torch_load_with_compat(self.pretrained_checkpoint_path, self.device, weights_only=False)
 
-        # Handle both wrapped and unwrapped metadata/config
         metadata = checkpoint.get("metadata")
         if isinstance(metadata, CheckpointMetadata):
             metadata = metadata.state_dict()
@@ -4791,7 +4958,6 @@ class FinetuneTrainer:
         if isinstance(config_raw, CheckpointMetadata):
             config_raw = config_raw.state_dict()
         if isinstance(config_raw, dict):
-            # Reconstruct config from dict - Config.load_state_dict handles nested dataclasses
             config.load_state_dict(config_raw)
 
         encoder_state = checkpoint.get("encoder")
@@ -4811,60 +4977,12 @@ class FinetuneTrainer:
         self.encoder.load_state_dict(primary_state)
         self.ema_encoder.load_state_dict(ema_state)
 
-    def _log_model_parameters(self) -> None:
-        def _summary(name: str, module: nn.Module) -> None:
-            total = sum(param.numel() for param in module.parameters())
-            trainable = sum(param.numel() for param in module.parameters() if param.requires_grad)
-            frozen = total - trainable
-            print(f"\n{'=' * 60}")
-            print(f"Model: {name}")
-            print(f"{'=' * 60}")
-            print(f"Total parameters     : {total:,}")
-            print(f"Trainable parameters : {trainable:,}")
-            print(f"Frozen parameters    : {frozen:,}")
-
-        _summary("MotionHistoryEncoder", self.encoder)
-        _summary("LatentDecoder", self.decoder)
-
-    def _set_dataset_horizon(self) -> None:
-        horizon = int(self.config.horizon)
-        if hasattr(self.train_loader, "dataset") and hasattr(self.train_loader.dataset, "set_horizon"):
-            self.train_loader.dataset.set_horizon(horizon)  # type: ignore[attr-defined]
-        if hasattr(self.val_loader, "dataset") and hasattr(self.val_loader.dataset, "set_horizon"):
-            self.val_loader.dataset.set_horizon(horizon)  # type: ignore[attr-defined]
-
-    def _setup_scheduler(self, num_epochs: int) -> None:
-        assert self.optimizer is not None
-        steps_per_epoch = max(ceil(len(self.train_loader) / self.accumulation_steps), 1)
-        total_steps = max(num_epochs * steps_per_epoch, 1)
-        warmup_epochs = int(self.config.lr_warmup_epochs)
-        pct_start = min(max(warmup_epochs / num_epochs, 0.0), 1.0) if num_epochs > 0 else 0.0
-        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            self.optimizer,
-            max_lr=float(self.config.learning_rate),
-            total_steps=total_steps,
-            pct_start=pct_start,
-            anneal_strategy="cos",
-        )
-
-    @staticmethod
-    def _prepare_text_embedding(text: torch.Tensor) -> torch.Tensor:
-        return text[:, -1, :] if text.ndim == 3 else text
-
     def _train_step(self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """Execute one pretraining step."""
         self._decoder = self.decoder
-        # Forward pass
         self._decoder.train()
 
-        # Prepare batch
-        motion = batch["motion"].to(self.device)
-        motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
-        joints = batch["joints"].to(self.device)
-
-        if motion.ndim != 3 or motion.shape[1] < 2:
-            raise ValueError(f"Expected motion (B, T, 271), got {tuple(motion.shape)}")
+        motion, text, joints = self._prepare_batch(batch)
 
         losses = self._compute_loss(engine, motion, joints, text)
 
@@ -4894,10 +5012,7 @@ class FinetuneTrainer:
         self._decoder = self.ema_decoder.model
         self._decoder.eval()
 
-        motion = batch["motion"].to(self.device)
-        motion = self.normalizer.normalize(motion)
-        text = batch["text_clip"].to(self.device)
-        joints = batch["joints"].to(self.device)
+        motion, text, joints = self._prepare_batch(batch)
 
         with torch.no_grad():
             losses = self._compute_loss(engine, motion, joints, text)
@@ -4912,7 +5027,7 @@ class FinetuneTrainer:
     ) -> Dict[str, torch.Tensor]:
         batch_size, seq_len, _ = motion.shape
 
-        with torch.amp.autocast(  # type: ignore
+        with torch.amp.autocast(
             device_type=self.device.type,
             dtype=self.amp_dtype,
             enabled=self.use_amp,
@@ -4924,21 +5039,19 @@ class FinetuneTrainer:
                 target_encoder.eval()
                 target_context = target_encoder(
                     motion, torch.zeros_like(text_emb), mask=None, return_layer_outputs=True
-                ).detach()  # (B, seq_len, L, H)
+                ).detach()
 
-            latent = target_context[:, 1:, -1, :]  # (B, seq_len-1, H_enc)
-            decoded = self._decoder(latent)  # (B, seq_len-1, 68)
+            latent = target_context[:, 1:, -1, :]
+            decoded = self._decoder(latent)
 
             decoder_losses = self._decoder_loss(engine, motion, joints, decoded)
             loss = decoder_losses["decoder_loss"]
             decoder_loss = decoder_losses["decoder_loss"]
 
         engine.csa_op_metrics(
-            [
-                ("loss", loss.detach().item()),
-            ],
+            [("loss", loss.detach().item())],
             1.0 / self.accumulation_steps,
-            engine.state.iteration % self.accumulation_steps == 1,  # Clear on first step of accumulation
+            engine.state.iteration % self.accumulation_steps == 1,
         )
 
         return {
@@ -4946,109 +5059,24 @@ class FinetuneTrainer:
             "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
         }
 
-    def _decoder_loss(self, engine: PretrainEngine, motion, joints, decoded):
-        prev_positions = joints[:, :-1, :].flatten(0, 1)
-        prev_frames = motion[:, :-1, :].flatten(0, 1)
-        y_frames = motion[:, 1:, :].flatten(0, 1)
-
-        decoded = decoded.flatten(0, 1)
-        decoded = self.normalizer.denormalize_x68(decoded)
-
-
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
-        y_68d = self.normalizer.denormalize_x68(y_68d)
-
-        dec_positions = x68_to_positions(
-            decoded, self.normalizer,
-            prev_x271=prev_frames,
-            prev_positions=prev_positions,
-        )
-
-        loss_root = F.mse_loss(decoded[:, :3], y_68d[:, :3], reduction="mean")
-        loss_yaw = F.mse_loss(decoded[:, 3:5], y_68d[:, 3:5], reduction="mean")
-        loss_vel = F.smooth_l1_loss(decoded[:, 5:], y_68d[:, 5:], reduction="mean")
-        loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
-
-        # mask_feet_4d = (
-        #     y_feet.bool() & ~dec_feet.bool()
-        # )  # (B * (seq_len-1), 4) - 4d foot contact false negatives - ground truth contact - prediction does not
-        # mask_feet_miss = mask_feet_4d.any(dim=-1)  # (B * (seq_len-1),) - boolean mask for any foot contact miss
-        # feet_miss_rate = (
-        #     mask_feet_4d.sum().float() / y_feet.bool().sum().float()
-        #     if y_feet.bool().sum() > 0
-        #     else torch.tensor(0.0, device=self.device)
-        # )
-        # loss_feet = (
-        #     dec_foot_vel[mask_feet_miss].square().mean()
-        #     if mask_feet_miss.any()
-        #     else torch.tensor(0.0, device=self.device)
-        # )
-
-        decoder_loss = 0.2 * loss_root + 1.0 * loss_yaw  + 0.5 * loss_vel + 1.0 * loss_joint
-
-        engine.set_metrics(
-            [
-                ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_root", loss_root.detach().item()),
-                ("loss_yaw", loss_yaw.detach().item()),
-                ("loss_vel", loss_vel.detach().item()),
-                ("loss_joint", loss_joint.detach().item()),
-                # ("loss_feet", loss_feet.detach().item()),
-                # ("feet_miss_rate", feet_miss_rate.detach().item()),
-            ],
-        )
-
-        return {
-            "decoder_loss": decoder_loss,
-        }
-
-    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
-        """Attach Ignite event handlers for training orchestration."""
-
-        # NaN termination
-        trainer.add_event_handler(Events.ITERATION_COMPLETED, TerminateOnNan())
-
-        # Progress bar for console display
-        pbar = ProgressBar(
-            mininterval=10.0,
-        )
-        pbar.attach(trainer, ["loss"])
-
-        trainer.state.horizon = self.config.horizon
-
-        timer = Timer(average=False)
-
-        timer.attach(trainer, start=Events.STARTED, resume=Events.ITERATION_STARTED, pause=Events.ITERATION_COMPLETED)
-
-        step_time_avg = RunningAverage(output_transform=lambda _: trainer.get_metric("step_time", 0.0)).attach(
-            trainer, "step_time_avg"
-        )
-
-        # Step logging
+    def _log_train_step(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
         @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
-        def _log_train_step(engine: PretrainEngine) -> None:
+        def _handler(engine: PretrainEngine) -> None:
             if not self.wandb_logger:
                 return
-
+            timer = engine.state.timer
             step_time = timer.value() if timer.value() is not None else 0.0
             timer.reset()
-
-            _step_time_avg = (
-                trainer.state.metrics["step_time_avg"] if "step_time_avg" in trainer.state.metrics else step_time
+            step_time_avg = (
+                engine.state.metrics["step_time_avg"] if "step_time_avg" in engine.state.metrics else step_time
             )
-            remaining_time = estimate_time_remaining(engine, _step_time_avg, self.config)
-
-            engine.set_metrics(
-                [
-                    ("step_time", step_time),
-                    ("remaining_time", remaining_time),
-                ]
-            )
-
+            remaining_time = estimate_time_remaining(engine, step_time_avg, self.config)
+            engine.set_metrics([("step_time", step_time), ("remaining_time", remaining_time)])
             metrics = engine.get_metrics(
                 [
                     "decoder_loss",
-                    "loss_root",
+                    "loss_root_y",
+                    "loss_root_xz",
                     "loss_yaw",
                     "loss_vel",
                     "loss_joint",
@@ -5068,13 +5096,51 @@ class FinetuneTrainer:
                 step=engine.get_metric("global_step", 0),
             )
 
-        @trainer.on(Events.GET_BATCH_STARTED)
-        def _set_horizon(engine: PretrainEngine) -> None:
-            engine.state.dataloader.dataset.set_horizon(engine.state.horizon)  # type: ignore[attr-defined]
+    def _log_best_validation(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        @evaluator.on(Events.COMPLETED)
+        def _handler(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
+            batch_count = engine.state.iteration // self.accumulation_steps
+            engine.scale_metrics(
+                ["val_loss", "val_decoder_loss"],
+                1.0 / batch_count if batch_count > 0 else 1.0,
+            )
+            self.wandb_logger.log(
+                engine.get_metrics(
+                    ["val_loss", "val_decoder_loss", "decoder_loss"],
+                    prefix="val/",
+                ),
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            self.wandb_logger.log(
+                {"epoch": int(trainer.state.epoch), "global_step": int(trainer.get_metric("global_step", 0))},
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            val_loss = float(engine.get_metric("val_loss", float("inf")))
+            best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
+            if val_loss < best_val_loss:
+                engine.set_metrics([("best_val_loss", val_loss)])
+                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
+            eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
+            best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
+            if eval_loss < best_eval_loss:
+                engine.set_metrics([("best_eval_loss", eval_loss)])
+                self.wandb_logger.log({"val/best_eval_loss": eval_loss}, step=int(trainer.get_metric("global_step", 0)))
 
-        @evaluator.on(Events.GET_BATCH_STARTED)
-        def _set_horizon_eval(engine: PretrainEngine) -> None:
-            engine.state.dataloader.dataset.set_horizon(trainer.state.horizon)  # type: ignore[attr-defined]
+    def _track_batch_loss(self, evaluator: PretrainEngine) -> None:
+        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _handler(engine: PretrainEngine) -> None:
+            engine.csa_op_metrics(
+                [
+                    ("val_loss", engine.get_metric("val_loss", 0.0)),
+                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
+                ],
+                1.0,
+            )
+
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        super()._attach_handlers(trainer, evaluator)
 
         checkpoint_mapping = {
             "trainer": trainer,
@@ -5091,10 +5157,9 @@ class FinetuneTrainer:
             "config": CheckpointMetadata(asdict(self.config)),
         }
 
-        def global_step_transform(engine: PretrainEngine, _) -> int:
+        def _global_step_transform(engine: PretrainEngine, _) -> int:
             return trainer.get_metric("global_step", 0)
 
-        # Best checkpoint handler
         val_best_checkpoint = Checkpoint(
             checkpoint_mapping,
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
@@ -5103,20 +5168,9 @@ class FinetuneTrainer:
             filename_pattern="{filename_prefix}_{global_step}.pt",
             score_function=lambda engine: -float(engine.state.metrics["loss"]),
             score_name="val_loss",
-            global_step_transform=global_step_transform,
+            global_step_transform=_global_step_transform,
         )
         self.val_best_checkpoint = val_best_checkpoint
-
-        # eval_best_checkpoint = Checkpoint(
-        #     checkpoint_mapping,
-        #     DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
-        #     n_saved=1,
-        #    filename_prefix=f"finetune_best_eval_{self.finetuning_session_id}",
-        #     score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
-        #     score_name="eval_loss",
-        #     filename_pattern="{filename_prefix}_{global_step}.pt",
-        #     global_step_transform=global_step_transform,
-        # )
 
         latest_checkpoint = Checkpoint(
             checkpoint_mapping,
@@ -5124,98 +5178,20 @@ class FinetuneTrainer:
             n_saved=1,
             filename_prefix=f"finetune_latest_{self.finetuning_session_id}",
             filename_pattern="{filename_prefix}_{global_step}.pt",
-            global_step_transform=global_step_transform,
+            global_step_transform=_global_step_transform,
         )
-
         self.latest_checkpoint = latest_checkpoint
 
-        trainer.add_event_handler(
-            Events.EPOCH_COMPLETED(every=self.config.checkpoint_interval),
-            latest_checkpoint,
-        )
-
-        @trainer.on(Events.EPOCH_COMPLETED(every=self.config.val_interval))
-        def _run_validation(engine: PretrainEngine) -> None:
-            evaluator.run(self.val_loader)
-
-        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
-        def track_batch_loss(engine: PretrainEngine) -> None:
-            engine.csa_op_metrics(
-                [
-                    ("val_loss", engine.get_metric("val_loss", 0.0)),
-                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
-                    # ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
-                ],
-                1.0,
-            )
-
-        val_batches = self.config.val_batches
-        if val_batches > 0:
-
-            @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
-            def _limit_val_batches(engine: PretrainEngine) -> None:
-                if engine.state.iteration // self.accumulation_steps >= val_batches:
-                    engine.terminate()
-
-        @evaluator.on(Events.COMPLETED)
-        def _log_best_validation(engine: PretrainEngine) -> None:
-            if self.wandb_logger is None:
-                return
-
-            batch_count = engine.state.iteration // self.accumulation_steps
-
-            engine.scale_metrics(
-                [
-                    "val_loss",
-                    "val_decoder_loss",
-                ],
-                1.0 / batch_count if batch_count > 0 else 1.0,
-            )
-
-            self.wandb_logger.log(
-                engine.get_metrics(
-                    [
-                        "val_loss",
-                        "val_decoder_loss",
-                        "decoder_loss",
-                    ],
-                    prefix="val/",
-                ),
-                step=int(trainer.get_metric("global_step", 0)),
-            )
-
-            self.wandb_logger.log(
-                {
-                    "epoch": int(trainer.state.epoch),
-                    "global_step": int(trainer.get_metric("global_step", 0)),
-                },
-                step=int(trainer.get_metric("global_step", 0)),
-            )
-
-            val_loss = float(engine.get_metric("val_loss", float("inf")))
-            best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
-            if val_loss < best_val_loss:
-                engine.set_metrics([("best_val_loss", val_loss)])
-                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
-
-            eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
-            best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
-            if eval_loss < best_eval_loss:
-                engine.set_metrics([("best_eval_loss", eval_loss)])
-                self.wandb_logger.log({"val/best_eval_loss": eval_loss}, step=int(trainer.get_metric("global_step", 0)))
-
+        trainer.add_event_handler(Events.EPOCH_COMPLETED(every=self.config.checkpoint_interval), latest_checkpoint)
         evaluator.add_event_handler(Events.COMPLETED, val_best_checkpoint)
 
     def run(self, max_epochs: int | None = None) -> None:
-        """Execute the finetuning loop."""
         print(f"Starting finetuning session: {self.session_id}")
         trainer = PretrainEngine(lambda engine, batch: self._train_step(engine, batch), self.config)
         self.evaluator = PretrainEngine(lambda engine, batch: self._val_step(engine, batch), self.config)
         self._attach_handlers(trainer, self.evaluator)
-
         epochs = max_epochs or int(self.config.get_num_epochs())
         trainer.run(self.train_loader, max_epochs=epochs)
-
         if self.wandb_logger:
             self.wandb_logger.finish()
 

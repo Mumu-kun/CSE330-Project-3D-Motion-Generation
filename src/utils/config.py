@@ -107,14 +107,15 @@ class PretrainConfig:
         default_factory=lambda: {
             "mask_num_spans": [
                 (0, 2),
-                (1, 6),
+                (0.5, 4),
+                (1, 5),
             ],
         }
     )
 
     # --- Masking ---
     mask_min_span: int = 5
-    mask_max_span: int = 10
+    mask_max_span: int = 20
 
 
 @dataclass

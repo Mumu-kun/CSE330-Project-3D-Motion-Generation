@@ -307,17 +307,19 @@ class _BaseTrainer:
             prev_positions=prev_positions,
         )
 
-        loss_root = F.mse_loss(decoded_denorm[:, :3], y_68d[:, :3], reduction="mean")
+        loss_root_y = F.mse_loss(decoded_denorm[:, :1], y_68d[:, :1], reduction="mean")
+        loss_root_xz = F.mse_loss(decoded_denorm[:, 1:3], y_68d[:, 1:3], reduction="mean")
         loss_yaw = F.mse_loss(decoded_denorm[:, 3:5], y_68d[:, 3:5], reduction="mean")
         loss_vel = F.smooth_l1_loss(decoded_denorm[:, 5:], y_68d[:, 5:], reduction="mean")
         loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
 
-        decoder_loss = 0.2 * loss_root + 1.0 * loss_yaw + 0.5 * loss_vel + 1.0 * loss_joint
+        decoder_loss = 1 * loss_root_y + 0.2 * loss_root_xz + 1.0 * loss_yaw + 0.5 * loss_vel
 
         engine.set_metrics(
             [
                 ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_root", loss_root.detach().item()),
+                ("loss_root_y", loss_root_y.detach().item()),
+                ("loss_root_xz", loss_root_xz.detach().item()),
                 ("loss_yaw", loss_yaw.detach().item()),
                 ("loss_vel", loss_vel.detach().item()),
                 ("loss_joint", loss_joint.detach().item()),
@@ -436,6 +438,26 @@ class _BaseTrainer:
         self._log_train_step(trainer, evaluator)
         self._track_batch_loss(evaluator)
         self._log_best_validation(trainer, evaluator)
+
+        @trainer.on(Events.EPOCH_STARTED)
+        def _reset_train_loss(engine: PretrainEngine) -> None:
+            engine.state.metrics["loss"] = 0.0
+
+        @trainer.on(Events.EPOCH_COMPLETED)
+        def _track_best_train_loss(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
+            batch_count = engine.state.iteration // self.accumulation_steps
+            if batch_count > 0:
+                engine.scale_metrics(["loss"], 1.0 / batch_count)
+            epoch_loss = float(engine.get_metric("loss", float("inf")))
+            best_train_loss = float(engine.get_metric("best_train_loss", float("inf")))
+            if epoch_loss < best_train_loss:
+                engine.set_metrics([("best_train_loss", epoch_loss)])
+                self.wandb_logger.log(
+                    {"train/best_train_loss": epoch_loss},
+                    step=int(trainer.get_metric("global_step", 0)),
+                )
 
     # -- public run --
 

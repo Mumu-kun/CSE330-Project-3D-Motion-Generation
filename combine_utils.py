@@ -102,6 +102,7 @@ FILE_ORDER = [
     "models/__init__.py",
     "models/motion_history_encoder.py",
     "models/flow_matching_predictor.py",
+    "models/_base_trainer.py",
     "models/pretrain_trainer.py",
     "models/finetune_trainer.py",
 ]

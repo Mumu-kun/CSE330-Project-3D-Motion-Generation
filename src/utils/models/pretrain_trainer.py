@@ -75,7 +75,10 @@ def random_span_mask(
         if not valid:
             break
 
-        idx, left, right, length = valid[0]
+        weights = torch.tensor([v[3] for v in valid], dtype=torch.float)
+        choice_idx = int(torch.multinomial(weights, 1).item())
+
+        idx, left, right, length = valid[choice_idx]
         span = int(torch.randint(min_span, min(max_span, length) + 1, ()).item())
         start = int(torch.randint(left, right - span + 1, ()).item())
         end = start + span
@@ -403,7 +406,7 @@ class PretrainTrainer(_BaseTrainer):
                 return
             batch_count = engine.state.iteration // self.accumulation_steps
             engine.scale_metrics(
-                ["val_loss", "val_decoder_loss", "val_feet_miss_rate"],
+                ["val_loss", "val_decoder_loss", "val_probe_loss"],
                 1.0 / batch_count if batch_count > 0 else 1.0,
             )
             self.wandb_logger.log(
@@ -411,12 +414,7 @@ class PretrainTrainer(_BaseTrainer):
                     [
                         "val_loss",
                         "val_decoder_loss",
-                        "val_feet_miss_rate",
-                        "loss",
-                        "mask_loss",
-                        "context_loss",
-                        "probe_loss",
-                        "decoder_loss",
+                        "val_probe_loss",
                     ],
                     prefix="val/",
                 ),
@@ -430,7 +428,7 @@ class PretrainTrainer(_BaseTrainer):
             best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
             if val_loss < best_val_loss:
                 engine.set_metrics([("best_val_loss", val_loss)])
-                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
+                self.wandb_logger.log({"val/best_val_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
             eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
             best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
             if eval_loss < best_eval_loss:
@@ -440,11 +438,13 @@ class PretrainTrainer(_BaseTrainer):
     def _track_batch_loss(self, evaluator: PretrainEngine) -> None:
         @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
         def _handler(engine: PretrainEngine) -> None:
+            # Ignite stores process_function return dict in state.output, not state.metrics
+            output = engine.state.output if isinstance(engine.state.output, dict) else {}
             engine.csa_op_metrics(
                 [
-                    ("val_loss", engine.get_metric("loss", 0.0)),
-                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
-                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
+                    ("val_loss", float(output.get("val_loss", 0.0))),
+                    ("val_decoder_loss", float(output.get("val_decoder_loss", 0.0))),
+                    ("val_probe_loss", float(output.get("val_probe_loss", 0.0))),
                 ],
                 1.0,
             )
@@ -475,7 +475,7 @@ class PretrainTrainer(_BaseTrainer):
             n_saved=1,
             filename_prefix=f"pretrain_best_val_{self.pretraining_session_id}",
             filename_pattern="{filename_prefix}_{global_step}.pt",
-            score_function=lambda engine: -float(engine.state.metrics["loss"]),
+            score_function=lambda engine: -float(engine.state.metrics["val_loss"]),
             score_name="val_loss",
             global_step_transform=global_step_transform,
         )
@@ -485,7 +485,7 @@ class PretrainTrainer(_BaseTrainer):
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
             filename_prefix=f"pretrain_best_eval_{self.pretraining_session_id}",
-            score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
+            score_function=lambda engine: -float(engine.state.metrics["val_decoder_loss"]),
             score_name="eval_loss",
             filename_pattern="{filename_prefix}_{global_step}.pt",
             global_step_transform=global_step_transform,
