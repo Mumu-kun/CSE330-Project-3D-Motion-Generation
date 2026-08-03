@@ -65,7 +65,32 @@ class CLIPEncoder(torch.nn.Module):
 
         return embeddings
 
+    @torch.no_grad()
+    def encode_sequence(self, text: Union[str, List[str]], max_length: int = 77) -> torch.Tensor:
+        """
+        Encode text captions into a sequence of token embeddings.
+
+        Args:
+            text: A single string or a list of strings.
+            max_length: Maximum sequence length (CLIP max is 77).
+
+        Returns:
+            embeddings: (B, S, 512) tensor containing token sequence embeddings.
+        """
+        if isinstance(text, str):
+            text = [text]
+
+        device = next(self.model.parameters()).device
+
+        inputs = self.tokenizer(
+            text, padding=True, truncation=True, max_length=max_length, return_tensors="pt"
+        ).to(device)
+        outputs = self.model(**inputs)
+
+        return outputs.last_hidden_state
+
     @property
     def embedding_dim(self) -> int:
         """Output dimension of the CLIP text model."""
         return self.model.config.hidden_size
+

@@ -15,7 +15,7 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union, ca
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
+# GradScaler is dynamically selected in trainer classes
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 
@@ -461,6 +461,24 @@ class Features:
     D68_JOINTS_VEL = slice(5, 68)
     D68_YAW_SINCOS = slice(3, 5)
 
+    D72_ROOT_Y = slice(0, 1)
+    D72_ROOT_VX = slice(1, 2)
+    D72_ROOT_VZ = slice(2, 3)
+    D72_YAW_SIN = slice(3, 4)
+    D72_YAW_COS = slice(4, 5)
+    D72_JOINTS_RIC = slice(5, 68)
+    D72_CONTACTS = slice(68, 72)
+    D72_YAW_SINCOS = slice(3, 5)
+
+    D75_ROOT_Y = D72_ROOT_Y
+    D75_ROOT_VX = D72_ROOT_VX
+    D75_ROOT_VZ = D72_ROOT_VZ
+    D75_YAW_SIN = D72_YAW_SIN
+    D75_YAW_COS = D72_YAW_COS
+    D75_JOINTS_RIC = D72_JOINTS_RIC
+    D75_CONTACTS = D72_CONTACTS
+    D75_YAW_SINCOS = D72_YAW_SINCOS
+
     @staticmethod
     def joint_mask(collection: list[str | int], sl: slice) -> torch.Tensor:
         """Returns a (271,) mask for the specified collection."""
@@ -871,6 +889,28 @@ class FeatureNormalizer:
             ],
             dim=0,
         )
+        self._mean_72d = torch.cat(
+            [
+                mean[Features.ROOT_Y],
+                mean[Features.ROOT_VX],
+                mean[Features.ROOT_VZ],
+                torch.zeros(2),
+                mean[Features.JOINT_RIC],
+                torch.zeros(4),
+            ],
+            dim=0,
+        )
+        self._std_72d = torch.cat(
+            [
+                std[Features.ROOT_Y],
+                std[Features.ROOT_VX],
+                std[Features.ROOT_VZ],
+                torch.ones(2),
+                std[Features.JOINT_RIC],
+                torch.ones(4),
+            ],
+            dim=0,
+        )
         # Precompute derived stats for 263D
         # 263D layout: [
         #   root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
@@ -914,6 +954,8 @@ class FeatureNormalizer:
             self.std = self.std.to(x.device)
             self._mean_68d = self._mean_68d.to(x.device)
             self._std_68d = self._std_68d.to(x.device)
+            self._mean_72d = self._mean_72d.to(x.device)
+            self._std_72d = self._std_72d.to(x.device)
             self._mean_263 = self._mean_263.to(x.device)
             self._std_263 = self._std_263.to(x.device)
 
@@ -940,6 +982,25 @@ class FeatureNormalizer:
         assert x68.shape[-1] == 68
         self._sync(x68)
         return x68 * self._std_68d + self._mean_68d
+
+    def normalize_x72(self, x72: torch.Tensor) -> torch.Tensor:
+        """Normalize a 72D (~75D) predictor/decoder state."""
+        assert x72.shape[-1] in (72, 75, 68)
+        self._sync(x72)
+        mean = self._mean_72d if x72.shape[-1] == 72 else (self._mean_68d if x72.shape[-1] == 68 else self._mean_72d)
+        std = self._std_72d if x72.shape[-1] == 72 else (self._std_68d if x72.shape[-1] == 68 else self._std_72d)
+        return (x72 - mean) / std
+
+    def denormalize_x72(self, x72: torch.Tensor) -> torch.Tensor:
+        """Denormalize a 72D (~75D) predictor/decoder state to original scale."""
+        assert x72.shape[-1] in (72, 75, 68)
+        self._sync(x72)
+        mean = self._mean_72d if x72.shape[-1] == 72 else (self._mean_68d if x72.shape[-1] == 68 else self._mean_72d)
+        std = self._std_72d if x72.shape[-1] == 72 else (self._std_68d if x72.shape[-1] == 68 else self._std_72d)
+        return x72 * std + mean
+
+    normalize_x75 = normalize_x72
+    denormalize_x75 = denormalize_x72
 
     def normalize_x263(self, x263: torch.Tensor) -> torch.Tensor:
         """Normalize a 263D evaluator feature vector."""
@@ -1044,21 +1105,21 @@ def x271_to_positions(
 
 
 # ============================================================================
-# x271 <-> x68 Conversion
+# x271 <-> x72 / x75 / x68 Conversion
 # ============================================================================
 
 
-def x271_to_x68(
+def x271_to_x72(
     x271: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_positions: Optional[torch.Tensor] = None,
     prev_x271: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Convert normalized 271D -> reduced 68D predictor state.
+    Convert normalized 271D -> reduced 72D (~75D) predictor/decoder state.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
-    Output is in the same normalized space as the predictor expects.
+    72D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_ric(63) + contacts(4)]
+    Output is in the same normalized space as the predictor/decoder expects.
     """
     assert x271.shape[-1] == 271
     raw = normalizer.denormalize(x271)
@@ -1072,41 +1133,46 @@ def x271_to_x68(
         raw[..., Features.ROOT_ROT6D],
         None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
     )
-    joint_vel = raw[..., Features.JOINT_VEL]
+    joint_ric = raw[..., Features.JOINT_RIC]
+    contacts = raw[..., Features.CONTACTS]
 
-    x68 = torch.cat([root_y, root_vx, root_vz, delta_yaw_sin_cos, joint_vel], dim=-1)
-    x68 = normalizer.normalize_x68(x68)
+    x72 = torch.cat([root_y, root_vx, root_vz, delta_yaw_sin_cos, joint_ric, contacts], dim=-1)
+    x72 = normalizer.normalize_x72(x72)
 
-    return x68
+    return x72
 
 
-def x68_to_positions(
-    x68: torch.Tensor,
+x271_to_x75 = x271_to_x72
+x271_to_x68 = x271_to_x72
+
+
+def x72_to_positions(
+    x72: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_x271: torch.Tensor,
     prev_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Reconstruct global joint positions from denormalized 68D predictor output.
+    Reconstruct global joint positions from 72D (~75D) decoder output.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
+    72D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_ric(63) + contacts(4)]
     prev_x271: normalized 271D feature vector for previous frame
     """
-    B = x68.shape[0]
+    B = x72.shape[0]
 
-    x68_denorm = normalizer.denormalize_x68(x68)
+    x72_denorm = normalizer.denormalize_x72(x72)
     prev_x271_raw = normalizer.denormalize(prev_x271)
 
-    root_y = x68_denorm[:, Features.D68_ROOT_Y]
-    root_vx = x68_denorm[:, Features.D68_ROOT_VX]
-    root_vz = x68_denorm[:, Features.D68_ROOT_VZ]
+    root_y = x72_denorm[:, Features.D72_ROOT_Y]
+    root_vx = x72_denorm[:, Features.D72_ROOT_VX]
+    root_vz = x72_denorm[:, Features.D72_ROOT_VZ]
 
-    prev_root_pos = prev_positions[:, 0] if prev_positions is not None else torch.zeros(B, 3, device=x68.device, dtype=x68.dtype)
+    prev_root_pos = prev_positions[:, 0] if prev_positions is not None else torch.zeros(B, 3, device=x72.device, dtype=x72.dtype)
     root_x = prev_root_pos[:, 0:1] + root_vx
     root_z = prev_root_pos[:, 2:3] + root_vz
     root_pos = torch.cat([root_x, root_y, root_z], dim=-1)
 
-    delta_yaw_sin_cos = x68_denorm[:, Features.D68_YAW_SINCOS]
+    delta_yaw_sin_cos = x72_denorm[:, Features.D72_YAW_SINCOS]
     prev_root_rot_6d = prev_x271_raw[:, Features.ROOT_ROT6D]
     prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
     delta_yaw = sin_cos_to_yaw(delta_yaw_sin_cos)
@@ -1114,84 +1180,20 @@ def x68_to_positions(
     root_quat = yaw_to_root_rot6d(yaw)
     root_quat = cont6d_to_quaternion(root_quat)
 
-    joint_vel = x68_denorm[:, Features.D68_JOINTS_VEL].reshape(B, 21, 3)
-
-    if prev_positions is not None:
-        prev_root_quat = cont6d_to_quaternion(prev_root_rot_6d)
-        prev_ric_full = _compute_ric(prev_positions, prev_root_quat)
-        prev_ric = prev_ric_full[:, 1:]
-    else:
-        prev_ric = torch.zeros(B, 21, 3, device=x68.device, dtype=x68.dtype)
-    joint_ric = prev_ric + joint_vel
+    # Direct RIC positions for 21 non-root joints (NO frame-to-frame velocity accumulation!)
+    joint_ric = x72_denorm[:, Features.D72_JOINTS_RIC].reshape(B, 21, 3)
 
     global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric)
     new_joint_pos = root_pos.unsqueeze(1) + global_joints
     return torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
 
 
-# ============================================================================
-# x271 <-> x263 Conversion (legacy evaluator format)
-# ============================================================================
+x75_to_positions = x72_to_positions
+x68_to_positions = x72_to_positions
 
 
-def x271_to_x263(
-    x271: torch.Tensor,  # (B, 271) normalized
-    normalizer: FeatureNormalizer,
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized — previous frame for delta-yaw computation
-) -> torch.Tensor:
-    """
-    Convert normalized 271D -> legacy 263D evaluator layout.
-
-    263D layout: [
-        root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
-    ]
-    """
-    assert x271.shape[-1] == 271
-    raw = normalizer.denormalize(x271)
-    raw_prev = normalizer.denormalize(prev_x271) if prev_x271 is not None else None
-
-    root_rot_vel = compute_root_delta_yaw(
-        raw[..., Features.ROOT_ROT6D],
-        None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
-    )
-    root_block = torch.cat([root_rot_vel, raw[..., 1:3], raw[..., 0:1]], dim=-1)
-
-    x263 = torch.cat(
-        [
-            root_block,  # 4D
-            raw[..., Features.JOINT_RIC],  # 63D
-            raw[..., Features.JOINT_ROT6D],  # 126D
-            raw[..., Features.VEL],  # 66D
-            raw[..., Features.CONTACTS],  # 4D
-        ],
-        dim=-1,
-    )
-
-    return normalizer.normalize_x263(x263)
-
-
-def x271_seq_to_x263(
-    x271_seq: torch.Tensor,  # (T, 271) or (B, T, 271) normalized
-    normalizer: FeatureNormalizer,
-) -> torch.Tensor:
-    """Convert a normalized 271D motion sequence to the legacy 263D evaluator layout."""
-    if x271_seq.ndim == 2:
-        frames, prev = [], None
-        for frame in x271_seq:
-            frames.append(x271_to_x263(frame.unsqueeze(0), normalizer, prev))
-            prev = frame.unsqueeze(0)
-        return torch.cat(frames, dim=0)
-
-    return torch.stack([x271_seq_to_x263(x271_seq[i], normalizer) for i in range(x271_seq.shape[0])])
-
-
-# ============================================================================
-# x68 <-> x271 and x68 <-> x263 Cross-Conversions
-# ============================================================================
-
-
-def x68_to_x271(
-    x68: torch.Tensor,
+def x72_to_x271(
+    x72: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_x271: torch.Tensor,
     prev_positions: Optional[torch.Tensor] = None,
@@ -1199,20 +1201,19 @@ def x68_to_x271(
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
     """
-    Convert denormalized 68D predictor output -> normalized 271D feature frame.
-
-    Simple path: x68 -> positions (via x68_to_positions), then positions + prev_positions -> x271
-    (via positions_to_x271). No expensive round-trip through x271_to_positions.
-
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
+    Convert denormalized 72D predictor output -> normalized 271D feature frame.
     """
-    positions = x68_to_positions(x68, normalizer, prev_x271, prev_positions)
+    positions = x72_to_positions(x72, normalizer, prev_x271, prev_positions)
     x271, _ = positions_to_x271(positions, prev_positions, normalizer, dataset_type, feet_thre)
     return x271
 
 
-def x68_to_x263(
-    x68: torch.Tensor,
+x75_to_x271 = x72_to_x271
+x68_to_x271 = x72_to_x271
+
+
+def x72_to_x263(
+    x72: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_x271: torch.Tensor,
     prev_positions: Optional[torch.Tensor] = None,
@@ -1220,13 +1221,15 @@ def x68_to_x263(
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
     """
-    Convert denormalized 68D predictor output -> 263D evaluator layout.
-
-    Route: x68 -> positions -> x271 -> x263
+    Convert 72D predictor output -> 263D evaluator layout.
     """
-    x271 = x68_to_x271(x68, normalizer, prev_x271, prev_positions, dataset_type, feet_thre)
+    x271 = x72_to_x271(x72, normalizer, prev_x271, prev_positions, dataset_type, feet_thre)
     prev_x271_raw = normalizer.denormalize(prev_x271)
     return x271_to_x263(x271, normalizer, prev_x271_raw[:, Features.ROOT_ROT6D])
+
+
+x75_to_x263 = x72_to_x263
+x68_to_x263 = x72_to_x263
 
 
 # ========== config.py ==========
@@ -1255,10 +1258,10 @@ from typing import Any, Optional
 
 @dataclass
 class FlowMatchingPredictorConfig:
-    hidden_size: int = 256
-    intermediate_size: int = 768
-    num_hidden_layers: int = 4
-    num_attention_heads: int = 8
+    hidden_size: int = 512
+    intermediate_size: int = 1536
+    num_hidden_layers: int = 6
+    num_attention_heads: int = 16
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     attention_bias: bool = True
@@ -1267,6 +1270,7 @@ class FlowMatchingPredictorConfig:
     track_dimensionality: int = 3
     global_cond_dim: int = 512  # CLIP embedding: 512D
     head_dim: Optional[int] = None
+    use_self_attn_rope: bool = True
 
     def __post_init__(self) -> None:
         if self.head_dim is None:
@@ -1371,6 +1375,9 @@ class Config:
     joint_dim: int = 3
     max_motion_length: int = 200
     fps: int = 20
+    # Number of history frames fed to the encoder as context for Phase 3.
+    # Must be > 0; sequences shorter than this are zero-padded at the front.
+    history_length: int = 40
 
     # --- Sub-configs ---
     encoder_config: MotionHistoryEncoderConfig = field(default_factory=MotionHistoryEncoderConfig)
@@ -1581,10 +1588,35 @@ class CLIPEncoder(torch.nn.Module):
 
         return embeddings
 
+    @torch.no_grad()
+    def encode_sequence(self, text: Union[str, List[str]], max_length: int = 77) -> torch.Tensor:
+        """
+        Encode text captions into a sequence of token embeddings.
+
+        Args:
+            text: A single string or a list of strings.
+            max_length: Maximum sequence length (CLIP max is 77).
+
+        Returns:
+            embeddings: (B, S, 512) tensor containing token sequence embeddings.
+        """
+        if isinstance(text, str):
+            text = [text]
+
+        device = next(self.model.parameters()).device
+
+        inputs = self.tokenizer(
+            text, padding=True, truncation=True, max_length=max_length, return_tensors="pt"
+        ).to(device)
+        outputs = self.model(**inputs)
+
+        return outputs.last_hidden_state
+
     @property
     def embedding_dim(self) -> int:
         """Output dimension of the CLIP text model."""
         return self.model.config.hidden_size
+
 
 
 # ========== dataset.py ==========
@@ -1774,13 +1806,19 @@ class Text2MotionDataset(Dataset):
     This is the ONLY version that works - replace everything else
     """
 
-    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]:
+    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]:
         """
         Returns a single sample from the dataset.
         GUARANTEES: All returned tensors have shape (max_motion_length, features)
 
         NOTE: Returns RAW (unnormalized) features. Normalization should be done
         externally using FeatureNormalizer before passing to models.
+
+        history_motion: (history_length, 271) RAW features from the frames
+        immediately preceding the target window.  Zero-padded at the front when
+        fewer than history_length frames are available before the target start.
+        Used exclusively by Phase 3 (FlowMatchingPredictor) as the encoder
+        conditioning context; ignored by pretrain and decoder trainers.
         """
         idx = self.pointer + item
         data = self.data_dict[self.name_list[idx]]
@@ -1807,9 +1845,10 @@ class Text2MotionDataset(Dataset):
         # ===== PAD OR TRUNCATE TO MAX_MOTION_LENGTH =====
         target_len = self.current_horizon
         current_len = original_length
+        history_length = self.config.history_length
 
         if current_len < target_len:
-            # Pad with zeros
+            # ── Short sequence: pad target, no history available ──────────────
             pad_size = target_len - current_len
             motion = torch.cat(
                 [
@@ -1836,10 +1875,38 @@ class Text2MotionDataset(Dataset):
                 ],
                 dim=0,
             )
+            # No frames precede the target window — history is all zeros
+            history_motion = torch.zeros(history_length, motion.shape[1], dtype=motion.dtype)
+            history_valid_length = 0
+
         elif current_len > target_len:
             start_idx = random.randint(0, current_len - self.current_horizon)
+
+            # ── History: frames strictly before start_idx ─────────────────────
+            hist_end   = start_idx
+            hist_start = max(0, start_idx - history_length)
+            hist_slice = motion[hist_start:hist_end]            # (≤ history_length, 271)
+            history_valid_length = hist_slice.shape[0]
+
+            if hist_slice.shape[0] < history_length:
+                # Zero-pad at the front so history is always (history_length, 271)
+                pad_h = torch.zeros(
+                    history_length - hist_slice.shape[0],
+                    motion.shape[1],
+                    dtype=motion.dtype,
+                )
+                history_motion = torch.cat([pad_h, hist_slice], dim=0)
+            else:
+                history_motion = hist_slice
+
+            # ── Target window ─────────────────────────────────────────────────
             motion = motion[start_idx : start_idx + self.current_horizon]
             joints = joints[start_idx : start_idx + self.current_horizon]
+
+        else:
+            # current_len == target_len: no room for history
+            history_motion = torch.zeros(history_length, motion.shape[1], dtype=motion.dtype)
+            history_valid_length = 0
 
         valid_length = min(current_len, target_len)
 
@@ -1878,11 +1945,12 @@ class Text2MotionDataset(Dataset):
             )
 
         # text_embedding shape: (1, 512) - pooled CLIP embedding
-        # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
+        # motion shape:         (target_len, 271)   - target window; used for z1 (decoder + predictor target)
+        # history_motion shape: (history_length, 271) - frames strictly preceding motion; used for track_features
         # valid_length is the number of real frames before zero-padding, capped at target_len.
         sample_id = self.name_list[idx]
 
-        return caption, motion, joints, valid_length, text_embedding, sample_id, tokens
+        return caption, motion, joints, history_motion, valid_length, text_embedding, sample_id, tokens, history_valid_length
 
     def reset_min_len(self, length: int | None = None):
         if length is None:
@@ -1915,42 +1983,52 @@ CLIP_EMBED_DIM = 512
 
 
 def text2motion_collate_fn(
-    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]],
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str], int]],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
     Expects each sample to be a tuple:
-      - caption: str
-      - motion: (max_T, 271) torch.Tensor - full 271D features
-      - joints: (max_T, J, 3) torch.Tensor
-      - length: int number of valid frames before padding, capped at the returned horizon
-    - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
-    - sample_id: str sample identifier
+      - caption:        str
+      - motion:         (target_len, 271) torch.Tensor - target window, RAW 271D features
+      - joints:         (target_len, J, 3) torch.Tensor
+      - history_motion: (history_length, 271) torch.Tensor - frames preceding motion,
+                        zero-padded at front when not enough history; RAW features.
+                        Used only by FlowMatchingTrainer (Phase 3).
+      - length:         int - valid frames in motion before padding, capped at target_len
+      - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
+      - sample_id:      str
+      - tokens:         list[str]
+      - history_valid_length: int - exact count of real non-zero history frames
     """
     # Lists of items
-    captions = [b[0] for b in batch]
-    motions_list = [b[1] for b in batch]
-    joints_list = [b[2] for b in batch]
-    lengths = [b[3] for b in batch]
-    text_embs_list = [b[4] for b in batch]
-    sample_ids = [b[5] for b in batch]
-    tokens_list = [b[6] for b in batch]
+    captions         = [b[0] for b in batch]
+    motions_list     = [b[1] for b in batch]
+    joints_list      = [b[2] for b in batch]
+    history_list     = [b[3] for b in batch]
+    lengths          = [b[4] for b in batch]
+    text_embs_list   = [b[5] for b in batch]
+    sample_ids       = [b[6] for b in batch]
+    tokens_list      = [b[7] for b in batch]
+    hist_lengths     = [b[8] for b in batch]
 
     # Stack tensors directly
-    motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)
-    joints_batch = torch.stack(joints_list, dim=0)  # (B, T, J, 3)
-    length_batch = torch.tensor(lengths, dtype=torch.long)  # (B,)
-
-    text_emb_batch = torch.stack(text_embs_list, dim=0)  # (B, 1, 512)
+    motion_batch       = torch.stack(motions_list,   dim=0)  # (B, T, 271)
+    joints_batch       = torch.stack(joints_list,    dim=0)  # (B, T, J, 3)
+    history_batch      = torch.stack(history_list,   dim=0)  # (B, history_length, 271)
+    length_batch       = torch.tensor(lengths, dtype=torch.long)  # (B,)
+    text_emb_batch     = torch.stack(text_embs_list, dim=0)  # (B, 1, 512)
+    hist_length_batch  = torch.tensor(hist_lengths, dtype=torch.long)  # (B,)
 
     return {
-        "captions": captions,
-        "sample_ids": sample_ids,
-        "motion": motion_batch,
-        "joints": joints_batch,
-        "lengths": length_batch,
-        "text_clip": text_emb_batch,
-        "tokens": tokens_list,
+        "captions":             captions,
+        "sample_ids":           sample_ids,
+        "motion":               motion_batch,        # target window
+        "history_motion":       history_batch,      # context window preceding target
+        "joints":               joints_batch,
+        "lengths":              length_batch,
+        "text_clip":            text_emb_batch,
+        "tokens":               tokens_list,
+        "history_valid_length": hist_length_batch,
     }
 
 
@@ -2440,6 +2518,176 @@ def compare_motions(
     )
 
 
+# ========== pipeline.py ==========
+
+"""
+Inference pipeline for Text-to-3D Motion generation using FlowMatchingPredictor and MotionHistoryEncoder.
+"""
+
+from typing import Any, Optional, Union
+
+import numpy as np
+import torch
+
+# [internal import removed]  from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
+
+
+@torch.no_grad()
+def generate_motion_from_prompt(
+    text_prompt: str,
+    history_motion: torch.Tensor,     # (1, history_length, 271) raw
+    initial_joints: torch.Tensor,     # (1, 22, 3) raw - seed positions
+    initial_frame: torch.Tensor,      # (1, 271) raw - seed frame
+    predictor_trainer: Any,
+    decoder_trainer: Any,
+    normalizer: FeatureNormalizer,
+    clip_encoder: Any,
+    device: torch.device | str = "cuda",
+    num_inference_steps: int = 20,
+    time_schedule_power: float = 3.0,
+    guidance_scale: float = 2.5,
+    horizon: int = 80,
+    history_valid_length: Optional[Union[int, torch.Tensor]] = None,
+) -> np.ndarray:
+    """Generate joint positions by integrating flow matching ODE in latent space.
+
+    Args:
+        text_prompt: Text description of the motion to generate.
+        history_motion: Historical motion sequence (1, history_length, 271) RAW features.
+        initial_joints: Seed joint positions (1, 22, 3) RAW features for initial frame.
+        initial_frame: Seed frame features (1, 271) RAW features for frame 0.
+        predictor_trainer: FlowMatchingTrainer instance.
+        decoder_trainer: LatentDecoder trainer instance (or object with .ema_decoder).
+        normalizer: FeatureNormalizer instance for raw feature normalization.
+        clip_encoder: CLIP text sequence encoder.
+        device: Device to execute generation on.
+        num_inference_steps: Number of Euler integration steps.
+        time_schedule_power: Power parameter for ODE time discretization schedule.
+        guidance_scale: Classifier-Free Guidance (CFG) scale.
+        horizon: Target horizon sequence length (default 80 frames).
+        history_valid_length: Exact count of non-padded history frames. Derived if None.
+
+    Returns:
+        generated_positions: (horizon, 22, 3) numpy array of generated joint positions.
+    """
+    target_encoder = decoder_trainer.ema_encoder.model
+    target_encoder.eval()
+    predictor = predictor_trainer.ema_predictor.model
+    predictor.eval()
+    decoder = decoder_trainer.ema_decoder.model
+    decoder.eval()
+
+    device = torch.device(device) if isinstance(device, str) else device
+
+    # Step 1: Clear KV cache and reference state in predictor
+    predictor.clear_cache()
+
+    # Step 2: Encode text prompt to sequence embedding
+    text_seq = clip_encoder.encode_sequence([text_prompt]).to(device)  # (1, S, 512)
+    text_pooled_ref = text_seq.mean(dim=1)  # for zeros sizing
+
+    # Step 3: Compute history conditioning context
+    zeros_hist = torch.zeros(1, text_pooled_ref.shape[1], device=device, dtype=history_motion.dtype)
+    history_norm = normalizer.normalize(history_motion.to(device))
+    track_features = target_encoder(
+        history_norm, zeros_hist, mask=None, return_layer_outputs=False
+    ).detach()  # (1, T_hist, H_enc)
+
+    T_hist = track_features.shape[1]
+    S_text = text_seq.shape[1]
+    S_cond = S_text + T_hist
+
+    # Determine valid history length and construct boolean key-padding mask
+    if history_valid_length is None:
+        # Check if history_motion is all zeros (e.g. generation from scratch)
+        is_all_zero = (history_motion == 0).all().item()
+        val_len = 0 if is_all_zero else T_hist
+    elif isinstance(history_valid_length, torch.Tensor):
+        val_len = int(history_valid_length.item())
+    else:
+        val_len = int(history_valid_length)
+
+    hist_idx = torch.arange(T_hist, device=device).unsqueeze(0)  # (1, T_hist)
+    valid_start = T_hist - val_len
+    hist_mask = hist_idx >= valid_start  # (1, T_hist) bool
+    text_mask = torch.ones((1, S_text), dtype=torch.bool, device=device)  # (1, S_text) bool
+    cond_mask = torch.cat([text_mask, hist_mask], dim=1)  # (1, S_cond) bool
+    key_padding_mask = cond_mask.unsqueeze(1).unsqueeze(2)  # (1, 1, 1, S_cond) bool
+
+    # Step 4: Sample noise for target sequence latents (T_target = horizon - 1 frames)
+    T_target = horizon - 1
+    z_t = torch.randn(1, T_target, target_encoder.config.hidden_size, device=device)
+
+    # Step 5: Integrate flow ODE from t=0 to t=1
+    s = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device)
+    tau = 1.0 - (1.0 - s).pow(time_schedule_power)
+
+    for step in range(num_inference_steps):
+        t_start = tau[step].expand(1)
+        t_end = tau[step + 1]
+        dt = t_end - t_start
+
+        # Conditioned branch: Concatenate text sequence and history context
+        combined_cond = torch.cat([text_seq, track_features], dim=1)  # (1, S + T_hist, 512)
+        text_pooled = text_seq.mean(dim=1)  # (1, 512)
+
+        v_cond, _, _ = predictor(
+            noisy_states=z_t,
+            timesteps=t_start,
+            track_features=combined_cond,
+            text_embedding=text_pooled,
+            key_padding_mask=key_padding_mask,
+        )
+
+        # Unconditioned branch: Concatenate null sequence and history context
+        null_emb = predictor_trainer.null_text_embedding(1).to(dtype=text_seq.dtype)  # (1, 512)
+        null_seq = null_emb.unsqueeze(1).expand(-1, text_seq.shape[1], -1)  # (1, S, 512)
+        combined_uncond = torch.cat([null_seq, track_features], dim=1)  # (1, S + T_hist, 512)
+        null_pooled = null_seq.mean(dim=1)  # (1, 512)
+
+        v_uncond, _, _ = predictor(
+            noisy_states=z_t,
+            timesteps=t_start,
+            track_features=combined_uncond,
+            text_embedding=null_pooled,
+            key_padding_mask=key_padding_mask,
+        )
+
+        v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
+        z_t = z_t + v_t * dt
+
+    # Final integrated latent in normalized space
+    z1_pred_norm = z_t  # (1, T_target, H_enc)
+
+    # Step 6: Denormalize latent back to encoder's native latent scale before passing to decoder
+    z1_pred = predictor_trainer.denormalize_latent(z1_pred_norm)
+    decoded_68d = decoder(z1_pred)  # (1, T_target, 68)
+
+    # Step 7: Step-by-step autoregressive reconstruction of joint positions
+    current_pos = initial_joints.to(device)  # (1, 22, 3)
+    current_frame = normalizer.normalize(initial_frame.to(device))  # (1, 271)
+
+    generated_positions = [current_pos[0].cpu()]
+
+    for frame_idx in range(T_target):
+        pred_68d = decoded_68d[:, frame_idx]  # (1, 68)
+
+        new_pos = x68_to_positions(
+            pred_68d,
+            normalizer,
+            current_frame,
+            current_pos,
+        )  # (1, 22, 3)
+
+        new_frame, _ = positions_to_x271(new_pos, current_pos, normalizer)
+
+        current_pos = new_pos
+        current_frame = new_frame
+        generated_positions.append(new_pos[0].cpu())
+
+    return torch.stack(generated_positions, dim=0).numpy()
+
+
 # ========== wandb_logger.py ==========
 
 """
@@ -2809,7 +3057,7 @@ class AdaLN(nn.Module):
       - gate is applied AFTER the operation as a residual scale
     """
 
-    def __init__(self, d_model: int, d_cond: int):
+    def __init__(self, d_model: int, d_cond: int, init_gate_bias: float = 0.0):
         super().__init__()
 
         # No learnable affine params — AdaLN supplies them externally
@@ -2822,6 +3070,8 @@ class AdaLN(nn.Module):
         self.proj = nn.Linear(d_cond, 3 * d_model)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
+        if init_gate_bias != 0.0:
+            nn.init.constant_(self.proj.bias[2 * d_model:], init_gate_bias)
 
     def forward(
         self,
@@ -2969,6 +3219,10 @@ def init_weights(module: nn.Module, linear_init: str = "xavier_normal", linear_s
 
 
 # [internal import removed]  from utils.models._base_trainer import (
+
+# Expose model classes for package import
+# [internal import removed]  from utils.models.motion_history_encoder import MotionHistoryEncoder
+# [internal import removed]  from utils.models.flow_matching_predictor import FlowMatchingPredictor, LatentDecoder
 
 
 # ========== models/motion_history_encoder.py ==========
@@ -3343,7 +3597,7 @@ from torch import nn
 
 # [internal import removed]  from utils.config import Config, FlowMatchingPredictorConfig
 # [internal import removed]  from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
-# [internal import removed]  from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
+# [internal import removed]  from utils.motion_utils import FeatureNormalizer, positions_to_x271, x72_to_positions
 
 
 class SinusoidalEmbedder(nn.Module):
@@ -3406,6 +3660,10 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         self.kv_cache = TemporalLayerCache()
         self._init_weights()
 
+    def clear_cache(self) -> None:
+        self.kv_cache.key = None
+        self.kv_cache.value = None
+
     def _init_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
 
@@ -3421,6 +3679,7 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         encoder_hidden_states: torch.Tensor,  # (B, M, H_enc)
         _encoder_cache: Optional[TemporalLayerCache] = None,
         output_attentions: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -3436,18 +3695,11 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         key = encoder_cache.key
         value = encoder_cache.value
 
-        cos, sin = self._build_rope(
-            seq_len=seq_len,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        query = self._apply_rope(query, cos, sin)
-
         attn_output = nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=False,
         )
@@ -3458,37 +3710,30 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
             attn_weights = self.attn_weights(query, key, value)
             return attn_output, attn_weights
 
-        return attn_output
+        return attn_output, None
 
 
-class PredictorSelfAttention(nn.Module):
-    def __init__(self, config: Config) -> None:
-        super().__init__()
+class PredictorSelfAttention(TemporalRoPEAttention):
+    def __init__(self, config: Config, use_self_attn_rope: Optional[bool] = None) -> None:
+        super().__init__(config.predictor_config)
         pred_config = config.predictor_config
-
-        self.q_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
-        self.k_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
-        self.v_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
-        self.out_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
+        self.config = config
+        self.use_self_attn_rope = (
+            use_self_attn_rope
+            if use_self_attn_rope is not None
+            else getattr(pred_config, "use_self_attn_rope", True)
+        )
 
         self.encoder_cond_proj = nn.Linear(config.encoder_config.hidden_size, pred_config.hidden_size, bias=True)
-        self.gate_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=True)
-
-        self.num_heads = pred_config.num_attention_heads
-        self.head_dim = pred_config.hidden_size // pred_config.num_attention_heads
-        self.hidden_size = pred_config.hidden_size
-        self.attention_dropout = pred_config.attention_dropout
+        self.gate_proj = nn.Linear(3 * pred_config.hidden_size, 1, bias=True)
+        self.cond_scale = nn.Parameter(torch.tensor(0.1))
 
         self._init_weights()
 
     def _init_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
-
-    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        nn.init.constant_(self.gate_proj.bias, -3.0)  # sigmoid(-3) ≈ 0.047
 
     def attn_weights(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
         attn_weights = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
@@ -3498,6 +3743,7 @@ class PredictorSelfAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        masked_cond: torch.Tensor,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len, _ = hidden_states.shape
@@ -3505,6 +3751,15 @@ class PredictorSelfAttention(nn.Module):
         query = self._reshape_heads(self.q_proj(hidden_states))
         key = self._reshape_heads(self.k_proj(hidden_states))
         value = self._reshape_heads(self.v_proj(hidden_states))
+
+        if self.use_self_attn_rope:
+            cos, sin = self._build_rope(
+                seq_len=seq_len,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            query = self._apply_rope(query, cos, sin)
+            key = self._apply_rope(key, cos, sin)
 
         attn_output = nn.functional.scaled_dot_product_attention(
             query,
@@ -3531,17 +3786,20 @@ class PredictorLayer(nn.Module):
 
         pred_config = config.predictor_config
 
-        self.adaln_self_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_self_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size)
 
         self.self_attn = PredictorSelfAttention(config)
 
-        self.adaln_cross_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_cross_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size, init_gate_bias=-2.0)
 
         self.cross_attn = PredictorRopeCrossAttention(config)
 
-        self.adaln_mlp = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_mlp = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size)
 
         self.mlp = PredictorMLP(pred_config)
+
+    def clear_cache(self) -> None:
+        self.cross_attn.clear_cache()
 
     def forward(
         self,
@@ -3549,23 +3807,37 @@ class PredictorLayer(nn.Module):
         encoder_hidden_states: torch.Tensor,
         adaln_cond: torch.Tensor,
         output_attentions: bool = False,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        history_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         B, N, H = hidden_states.shape
-        visible_encoder_states = encoder_hidden_states[:, :N, :]
-        encoder_cond = encoder_hidden_states[:, -N:, :]
+        hist_source = history_states if history_states is not None else encoder_hidden_states
+        T_hist = hist_source.shape[1]
+        
+        if T_hist < N:
+            # Edge-repetition padding at front to preserve temporal magnitude continuity (Path A)
+            pad_len = N - T_hist
+            pad = hist_source[:, :1, :].expand(-1, pad_len, -1)
+            masked_cond_raw = torch.cat([pad, hist_source], dim=1)
+        else:
+            # Slice the last N frames
+            masked_cond_raw = hist_source[:, -N:, :]
 
-        gated_cond = self.self_attn.gate_proj(self.self_attn.encoder_cond_proj(encoder_cond))
-        hidden_states = hidden_states + gated_cond
+        masked_cond = self.self_attn.encoder_cond_proj(masked_cond_raw)
+        gate_input = torch.cat([masked_cond, adaln_cond.unsqueeze(1).expand(-1, N, -1), hidden_states], dim=-1)
+        gate = torch.sigmoid(self.self_attn.gate_proj(gate_input))
+
+        hidden_states = hidden_states + (self.self_attn.cond_scale * gate) * masked_cond
 
         residual = hidden_states
         hidden_states, self_attn_gate = self.adaln_self_attn(hidden_states, adaln_cond)
-        hidden_states, self_attn_weights = self.self_attn(hidden_states, output_attentions=False)
+        hidden_states, self_attn_weights = self.self_attn(hidden_states, masked_cond, output_attentions=output_attentions)
         hidden_states = residual + self_attn_gate * hidden_states
 
         residual = hidden_states
         hidden_states, cross_attn_gate = self.adaln_cross_attn(hidden_states, adaln_cond)
         hidden_states, cross_attn_weights = self.cross_attn(
-            hidden_states, visible_encoder_states, output_attentions=output_attentions
+            hidden_states, encoder_hidden_states, output_attentions=output_attentions, attn_mask=key_padding_mask
         )
         hidden_states = residual + cross_attn_gate * hidden_states
 
@@ -3589,6 +3861,15 @@ class FlowMatchingPredictor(nn.Module):
         super().__init__()
         self.config = config
         pred_config = config.predictor_config
+        if isinstance(pred_config, dict):
+            # [internal import removed]  from utils.config import FlowMatchingPredictorConfig
+
+            pred_config = FlowMatchingPredictorConfig(**pred_config)
+            config.predictor_config = pred_config
+        if isinstance(config.encoder_config, dict):
+            # [internal import removed]  from utils.config import MotionHistoryEncoderConfig
+
+            config.encoder_config = MotionHistoryEncoderConfig(**config.encoder_config)
 
         self.text_proj = nn.Linear(config.text_embedding_dim, pred_config.hidden_size, bias=True)
 
@@ -3602,7 +3883,7 @@ class FlowMatchingPredictor(nn.Module):
         self.latent_out_proj = nn.Linear(pred_config.hidden_size, config.encoder_config.hidden_size, bias=True)
         # Output prediction head
         self.output_adaln = nn.Sequential(
-            nn.Linear(pred_config.hidden_size * 2, config.encoder_config.hidden_size * 2, bias=True),
+            nn.Linear(pred_config.hidden_size, config.encoder_config.hidden_size * 2, bias=True),
             nn.SiLU(),
             nn.Linear(config.encoder_config.hidden_size * 2, config.encoder_config.hidden_size * 2, bias=True),
         )
@@ -3612,6 +3893,12 @@ class FlowMatchingPredictor(nn.Module):
     def _initialize_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
 
+    def clear_cache(self) -> None:
+        for layer in self.layers:
+            layer.clear_cache()
+        if hasattr(self, "_last_track_features"):
+            del self._last_track_features
+
     def forward(
         self,
         noisy_states: torch.Tensor,
@@ -3619,6 +3906,8 @@ class FlowMatchingPredictor(nn.Module):
         track_features: torch.Tensor,
         text_embedding: torch.Tensor,
         output_attentions: bool = False,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        history_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
         """
@@ -3628,16 +3917,20 @@ class FlowMatchingPredictor(nn.Module):
             track_features: [B, M+N, H_enc]
             text_embedding: [B, D]
             output_attentions: bool
+            key_padding_mask: Optional[torch.Tensor] of shape (B, 1, 1, S_cond) or boolean mask
+            history_states: Optional[torch.Tensor] of shape (B, T_hist, H_enc)
         Returns:
-            flow_prediction: [B, N, H_enc]
             all_cross_attns: List of attention weights from each layer if output_attentions is True, else None
         """
+        # Clear/reset KV cache if training or if track_features changes to avoid cross-batch leaking/graph errors
+        if self.training or not hasattr(self, "_last_track_features") or self._last_track_features is not track_features:
+            self.clear_cache()
+            self._last_track_features = track_features
+
         B, N, H = noisy_states.shape
 
-        text_cond = self.text_proj(text_embedding)
-        time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)
-
-        adaln_cond = torch.cat([text_cond, time_cond], dim=-1)
+        time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)  # [B, H_pred]
+        adaln_cond = time_cond + self.text_proj(text_embedding)  # [B, H_pred]
 
         all_self_attns: list[torch.Tensor] = []
         all_cross_attns: list[torch.Tensor] = []
@@ -3649,9 +3942,11 @@ class FlowMatchingPredictor(nn.Module):
 
             hidden_states, self_attn_weights, cross_attn_weights = layer(
                 hidden_states,
-                track_features,
+                encoder_hidden_states=track_features,
                 adaln_cond=adaln_cond,
                 output_attentions=output_attentions,
+                key_padding_mask=key_padding_mask,
+                history_states=history_states,
             )
 
             if output_attentions:
@@ -3730,7 +4025,13 @@ class LatentDecoder(nn.Module):
             nn.Linear(2 * H, 2 * H),
             nn.GELU(),
             nn.Linear(2 * H, 63),
-        )  # 21 joint_ric_vel * 3
+        )  # 21 joint direct RIC positions * 3
+
+        self.contact_head = nn.Sequential(
+            nn.Linear(H, H // 2),
+            nn.GELU(),
+            nn.Linear(H // 2, 4),
+        )  # 4 foot contact logits
 
         self._initialize_weights()
 
@@ -3740,7 +4041,7 @@ class LatentDecoder(nn.Module):
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """
         latent: (B, H_encoder) - the latent representation from the predictor
-        output: (B, 68) - the predicted reduced features (root_y, root_xz_vel, delta_yaw sin, cos, joint_ric_vel * 3)
+        output: (B, 72) - the predicted reduced features (root_y, root_xz_vel, delta_yaw sin, cos, joint_ric * 3, foot_contacts)
         """
         x = self.down_proj(latent)
         x = self.blocks(x)
@@ -3750,9 +4051,10 @@ class LatentDecoder(nn.Module):
         root_y = self.root_head_y(x)  # (..., 1) - root_y
         yaw = self.yaw_head(x)  # (..., 2) - delta_yaw sin, cos
         yaw = nn.functional.normalize(yaw, dim=-1)  # normalize to unit vector
-        ric = self.ric_head(x)  # (..., 63) - 21 joint_ric_vel * 3
+        ric = self.ric_head(x)  # (..., 63) - 21 joint direct RIC positions
+        contacts = self.contact_head(x)  # (..., 4) - foot contact logits
 
-        return torch.cat([root_y, root_xz, yaw, ric], dim=-1)
+        return torch.cat([root_y, root_xz, yaw, ric, contacts], dim=-1)
 
     def decode(
         self, latent: torch.Tensor, prev_pos: torch.Tensor, prev_frame: torch.Tensor, normalizer: FeatureNormalizer
@@ -3768,7 +4070,7 @@ class LatentDecoder(nn.Module):
 
         pred = self.forward(latent)
 
-        new_pos = x68_to_positions(
+        new_pos = x72_to_positions(
             pred,
             normalizer,
             prev_frame,
@@ -3806,7 +4108,7 @@ from scipy import interpolate as Interp
 
 # [internal import removed]  from utils.config import Config
 # [internal import removed]  from utils.dataset import create_dataloader
-# [internal import removed]  from utils.motion_utils import x68_to_positions, x271_to_x68
+# [internal import removed]  from utils.motion_utils import Features, x72_to_positions, x271_to_x72
 # [internal import removed]  from utils.wandb_logger import WandbLogger
 
 T = TypeVar("T", bound=nn.Module)
@@ -4079,36 +4381,48 @@ class _BaseTrainer:
         y_frames = motion[:, 1:, :].flatten(0, 1)
 
         decoded_flat = decoded.flatten(0, 1)
-        decoded_denorm = self.normalizer.denormalize_x68(decoded_flat)
+        decoded_denorm = self.normalizer.denormalize_x72(decoded_flat)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
-        y_68d = self.normalizer.denormalize_x68(y_68d)
+        y_72d = x271_to_x72(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
+        y_72d_denorm = self.normalizer.denormalize_x72(y_72d)
 
-        dec_positions = x68_to_positions(
-            decoded_denorm,
+        dec_positions = x72_to_positions(
+            decoded_flat,
             self.normalizer,
             prev_x271=prev_frames,
             prev_positions=prev_positions,
         )
 
-        loss_root_y = F.mse_loss(decoded_denorm[:, :1], y_68d[:, :1], reduction="mean")
-        loss_root_xz = F.mse_loss(decoded_denorm[:, 1:3], y_68d[:, 1:3], reduction="mean")
-        loss_yaw = F.mse_loss(decoded_denorm[:, 3:5], y_68d[:, 3:5], reduction="mean")
-        loss_vel = F.smooth_l1_loss(decoded_denorm[:, 5:], y_68d[:, 5:], reduction="mean")
+        loss_root_y = F.mse_loss(decoded_denorm[:, :1], y_72d_denorm[:, :1], reduction="mean")
+        loss_root_xz = F.mse_loss(decoded_denorm[:, 1:3], y_72d_denorm[:, 1:3], reduction="mean")
+        loss_yaw = F.mse_loss(decoded_denorm[:, 3:5], y_72d_denorm[:, 3:5], reduction="mean")
+        loss_ric = F.mse_loss(decoded_denorm[:, 5:68], y_72d_denorm[:, 5:68], reduction="mean")
+        loss_contact = F.binary_cross_entropy_with_logits(
+            decoded_flat[:, 68:72], y_frames[:, Features.CONTACTS], reduction="mean"
+        )
         loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
 
-        decoder_loss = 1 * loss_root_y + 0.2 * loss_root_xz + 1.0 * loss_yaw + 0.5 * loss_vel
-
-        engine.set_metrics(
-            [
-                ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_root_y", loss_root_y.detach().item()),
-                ("loss_root_xz", loss_root_xz.detach().item()),
-                ("loss_yaw", loss_yaw.detach().item()),
-                ("loss_vel", loss_vel.detach().item()),
-                ("loss_joint", loss_joint.detach().item()),
-            ],
+        decoder_loss = (
+            1.0 * loss_root_y
+            + 1.0 * loss_root_xz
+            + 1.0 * loss_yaw
+            + 1.0 * loss_ric
+            + 0.5 * loss_contact
+            + 1.0 * loss_joint
         )
+
+        if engine is not None:
+            engine.set_metrics(
+                [
+                    ("decoder_loss", decoder_loss.detach().item()),
+                    ("loss_root_y", loss_root_y.detach().item()),
+                    ("loss_root_xz", loss_root_xz.detach().item()),
+                    ("loss_yaw", loss_yaw.detach().item()),
+                    ("loss_ric", loss_ric.detach().item()),
+                    ("loss_contact", loss_contact.detach().item()),
+                    ("loss_joint", loss_joint.detach().item()),
+                ],
+            )
 
         return {"decoder_loss": decoder_loss}
 
@@ -4223,6 +4537,26 @@ class _BaseTrainer:
         self._track_batch_loss(evaluator)
         self._log_best_validation(trainer, evaluator)
 
+        @trainer.on(Events.EPOCH_STARTED)
+        def _reset_train_loss(engine: PretrainEngine) -> None:
+            engine.state.metrics["loss"] = 0.0
+
+        @trainer.on(Events.EPOCH_COMPLETED)
+        def _track_best_train_loss(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
+            batch_count = engine.state.iteration // self.accumulation_steps
+            if batch_count > 0:
+                engine.scale_metrics(["loss"], 1.0 / batch_count)
+            epoch_loss = float(engine.get_metric("loss", float("inf")))
+            best_train_loss = float(engine.get_metric("best_train_loss", float("inf")))
+            if epoch_loss < best_train_loss:
+                engine.set_metrics([("best_train_loss", epoch_loss)])
+                self.wandb_logger.log(
+                    {"train/best_train_loss": epoch_loss},
+                    step=int(trainer.get_metric("global_step", 0)),
+                )
+
     # -- public run --
 
     def run(self, max_epochs: int | None = None) -> None:
@@ -4254,6 +4588,800 @@ def _assign_category(name: str) -> str:
     if "linear" in name_lower or "proj" in name_lower:
         return "linear_proj"
     return "other"
+
+
+# ========== models/flow_matching_trainer.py ==========
+
+"""Flow Matching Predictor trainer — Phase 3.
+
+Loads a pretrained MotionHistoryEncoder from checkpoint, freezes it,
+and trains a FlowMatchingPredictor using rectified flow matching in
+the encoder's latent space.
+
+Training objective: learn v_theta(z_t, t, c) such that integrating
+the ODE from t=0 to t=1 transports Gaussian noise to the encoder's
+latent distribution, conditioned on text c and motion history.
+
+Key design:
+  - Encoder frozen throughout (both online and EMA copies)
+  - Predictor trained with separate AdamW + OneCycleLR
+  - Power-schedule timestep sampling: t = u^{1/(p+1)}, p=config.t_sampling_power
+  - CFG dropout: config.cfg_dropout fraction replace text with a learned null embedding
+  - Rectified flow target: v* = z1 - z0, where z_t = (1-t)*z0 + t*z1
+  - EMA maintained for the predictor
+  - Can run standalone via FlowMatchingTrainer.run() or supply models to a combined loop
+
+Leakage-free latent construction (requires dataset to emit separate tensors):
+  - target_motion  (= batch["motion"])         : the sequence being generated
+  - history_motion (= batch["history_motion"]) : frames strictly preceding the target,
+                                                 zero-padded when unavailable
+
+  z1             = EMA_encoder(target_motion,  zeros_text, return_layer_outputs=True)[:, 1:, -1, :]
+  track_features = EMA_encoder(history_motion, zeros_text, return_layer_outputs=False)
+
+  Because target_motion and history_motion are non-overlapping by construction in
+  dataset.py, the encoder running on history_motion cannot see any frame that is
+  part of the target being generated.  This is true regardless of whether the
+  encoder is causal or bidirectional.
+
+  Text conditioning reaches the predictor exclusively through the AdaLN text_embedding
+  argument, which is also the sole location of CFG dropout.
+"""
+
+
+import os
+import pathlib
+from contextlib import contextmanager
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
+from math import ceil
+from pathlib import Path
+from typing import Dict, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from ignite.engine import Events
+from ignite.handlers import (
+    Checkpoint,
+    DiskSaver,
+)
+
+# [internal import removed]  from utils.config import Config
+# [internal import removed]  from utils.models import (
+# [internal import removed]  from utils.models.flow_matching_predictor import FlowMatchingPredictor
+# [internal import removed]  from utils.models.motion_history_encoder import MotionHistoryEncoder
+
+
+# ── Windows checkpoint compat ──────────────────────────────────────────────────
+
+
+@contextmanager
+def _windows_checkpoint_path_compat():
+    """Allow checkpoints pickled with PosixPath to load on Windows."""
+    original_posix_path = pathlib.PosixPath
+    should_patch_posix = os.name == "nt"
+    if should_patch_posix:
+        pathlib.PosixPath = pathlib.WindowsPath
+    try:
+        yield
+    finally:
+        if should_patch_posix:
+            pathlib.PosixPath = original_posix_path
+
+
+def _torch_load_with_compat(path, map_location, weights_only):
+    """Load checkpoint with Windows path compatibility."""
+    with _windows_checkpoint_path_compat():
+        try:
+            checkpoint = torch.load(path, map_location=map_location, weights_only=weights_only)
+        finally:
+            pass
+    return checkpoint
+
+
+# ── Latent space stats container ───────────────────────────────────────────────
+
+
+class _LatentStats(nn.Module):
+    """Container for latent statistics so Ignite can serialize them cleanly."""
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.mean = nn.Parameter(torch.zeros(dim), requires_grad=False)
+        self.std = nn.Parameter(torch.ones(dim), requires_grad=False)
+        self.norm_std = nn.Parameter(torch.ones(dim), requires_grad=False)
+        self.initialized = nn.Parameter(torch.tensor(False, dtype=torch.bool), requires_grad=False)
+
+
+
+# ── Learned null embedding ─────────────────────────────────────────────────────
+
+
+class _NullTextEmbedding(nn.Module):
+    """Learned unconditional text embedding for Classifier-Free Guidance.
+
+    Owned by the trainer (not the predictor model) so the predictor
+    architecture remains unchanged. Saved in checkpoints as a separate key
+    and included in the predictor optimizer's parameter group.
+    """
+
+    def __init__(self, dim: int) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.zeros(1, dim))
+
+    def forward(self, batch_size: int) -> torch.Tensor:
+        """Return null embedding expanded to (batch_size, dim)."""
+        return self.weight.expand(batch_size, -1)
+
+
+# ── Trainer ────────────────────────────────────────────────────────────────────
+
+
+class FlowMatchingTrainer(_BaseTrainer):
+    """Phase 3: Flow Matching Predictor trainer.
+
+    Trains FlowMatchingPredictor using rectified flow matching while keeping
+    the MotionHistoryEncoder fully frozen.
+
+    Usage (standalone)::
+
+        trainer = FlowMatchingTrainer(
+            config=config,
+            pretrained_checkpoint_path="checkpoints/pretrain_best_val_xxx.pt",
+        )
+        trainer.run()
+
+    Usage (combined notebook loop)::
+
+        trainer = FlowMatchingTrainer(config=config, pretrained_checkpoint_path=ckpt)
+        # Access trainer.predictor, trainer.ema_predictor, trainer.null_text_embedding,
+        # trainer.normalizer, trainer.ema_encoder directly from your notebook loop.
+        loss = trainer.compute_flow_loss(motion, text_emb)
+    """
+
+    def __init__(
+        self,
+        config: Config,
+        pretrained_checkpoint_path: str | Path,
+        wandb_project: str | None = None,
+    ) -> None:
+        self.config = config
+        self.pretrained_checkpoint_path = Path(pretrained_checkpoint_path) if pretrained_checkpoint_path is not None else None
+        self.wandb_project = wandb_project
+
+        self.device = torch.device(config.device) if torch.cuda.is_available() else torch.device("cpu")
+        self.use_amp = self.device.type == "cuda"
+        self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
+        self.scaler = (
+            torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler")
+            else torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        )
+
+        self.session_id = datetime.now(timezone(timedelta(hours=6))).strftime("%Y%m%d_%H%M%S")
+        self.phase3_session_id = self.session_id
+        self.resume_id: str | None = None
+
+        # ── Load frozen encoder from checkpoint ──
+        self._load_pretrained_encoder_state()
+
+        # ── Build predictor + EMA ──
+        self.predictor = FlowMatchingPredictor(config).to(self.device)
+        self.ema_predictor: EMAModel[FlowMatchingPredictor] = EMAModel(
+            self.predictor, decay=float(config.ema_decay)
+        ).to(self.device)
+
+        # ── Learned null text embedding for CFG ──
+        self.null_text_embedding = _NullTextEmbedding(config.text_embedding_dim).to(self.device)
+
+        # ── Instantiate CLIP Text Sequence Encoder ──
+        # [internal import removed]  from utils.text_encoder import CLIPEncoder
+        self.clip_encoder = CLIPEncoder().to(self.device)
+
+        # ── Instantiate Latent statistics container ──
+        self.latent_stats = _LatentStats(config.encoder_config.hidden_size).to(self.device)
+
+        self.encoder.to(self.device)
+        self.ema_encoder.to(self.device)
+        self.predictor.to(self.device)
+
+        # ── Freeze encoder completely ──
+        for parameter in self.encoder.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.ema_encoder.model.parameters():
+            parameter.requires_grad_(False)
+        self.encoder.eval()
+        self.ema_encoder.model.eval()
+
+        self._log_model_parameters(
+            ("MotionHistoryEncoder (frozen)", self.encoder),
+            ("FlowMatchingPredictor", self.predictor),
+        )
+
+        self.wandb_logger = None
+        self._initialize()
+
+    # ── Initialization helpers ─────────────────────────────────────────────────
+
+    def _initialize(self) -> None:
+        self.config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self._create_dataloaders()
+        self._compute_latent_statistics()
+
+        self.accumulation_steps = ceil(self.config.effective_batch_size / self.config.batch_size) or 1
+
+        # Optimizer: predictor params + learned null embedding trained jointly
+        self.optimizer = torch.optim.AdamW(
+            list(self.predictor.parameters()) + list(self.null_text_embedding.parameters()),
+            lr=float(self.config.learning_rate),
+            weight_decay=float(self.config.weight_decay),
+        )
+        self.lr_scheduler = self._setup_scheduler(
+            self.optimizer, num_epochs=int(self.config.get_num_epochs())
+        )
+
+        self._init_wandb(
+            "phase3_flow_matching",
+            extra_config={
+                "encoder_params": sum(p.numel() for p in self.encoder.parameters()),
+                "predictor_params": sum(p.numel() for p in self.predictor.parameters()),
+                "pretrained_checkpoint": str(self.pretrained_checkpoint_path),
+                "cfg_dropout": self.config.cfg_dropout,
+                "t_sampling_power": self.config.t_sampling_power,
+            },
+            name=self.phase3_session_id,
+        )
+
+    def _load_pretrained_encoder_state(self) -> None:
+        """Load encoder (online + EMA) from a pretrain checkpoint and freeze both."""
+        if self.pretrained_checkpoint_path is None:
+            raise FileNotFoundError(
+                "Pretrained checkpoint path is None. No pretrained checkpoint was found matching prefix 'pretrain_best_val_*.pt' in './checkpoints/pretrain'."
+            )
+        if not self.pretrained_checkpoint_path.exists():
+            raise FileNotFoundError(f"Pretrained checkpoint not found: {self.pretrained_checkpoint_path}")
+
+        checkpoint = _torch_load_with_compat(
+            self.pretrained_checkpoint_path, self.device, weights_only=False
+        )
+
+        metadata = checkpoint.get("metadata")
+        if isinstance(metadata, CheckpointMetadata):
+            metadata = metadata.state_dict()
+        self.pretraining_session_id = metadata.get("session_id", "unknown") if metadata else "unknown"
+
+        config_raw = checkpoint.get("config")
+        config: Config = Config()
+        if isinstance(config_raw, CheckpointMetadata):
+            config_raw = config_raw.state_dict()
+        if isinstance(config_raw, dict):
+            config.load_state_dict(config_raw)
+
+        encoder_state = checkpoint.get("encoder")
+        encoder_ema_state = checkpoint.get("encoder_ema")
+        if encoder_state is None and encoder_ema_state is None:
+            raise KeyError(
+                f"Checkpoint {self.pretrained_checkpoint_path} does not contain "
+                "encoder or encoder_ema weights"
+            )
+
+        primary_state = encoder_state if encoder_state is not None else encoder_ema_state
+        ema_state = encoder_ema_state if encoder_ema_state is not None else encoder_state
+        assert primary_state is not None
+
+        self.encoder = MotionHistoryEncoder(config).to(self.device)
+        self.ema_encoder = EMAModel(self.encoder, decay=float(config.ema_decay)).to(self.device)
+        self.encoder.load_state_dict(primary_state)
+        self.ema_encoder.load_state_dict(ema_state)
+
+    # ── Core helpers ───────────────────────────────────────────────────────────
+
+    def _sample_timesteps(self, batch_size: int) -> torch.Tensor:
+        """Sample timesteps from power schedule.
+
+        Density: p(t) ∝ t^power → inverse CDF: t = u^{1/(power+1)}.
+        Concentrates samples near t→1 (harder high-noise region) where the
+        flow matching loss is most informative.
+
+        Returns:
+            t: (batch_size,) float32 tensor in [0, 1].
+        """
+        u = torch.rand(batch_size, device=self.device)
+        power = float(self.config.t_sampling_power)
+        return u.pow(1.0 / (power + 1.0))
+
+    def _apply_cfg_dropout(
+        self,
+        text_emb: torch.Tensor,
+        batch_size: int,
+        is_training: bool = True,
+    ) -> torch.Tensor:
+        """Stochastically replace text with learned null embedding for CFG training.
+
+        10% of samples use the unconditional (null) embedding so the predictor
+        learns both text-conditioned and text-free trajectory distributions.
+        No dropout is applied during validation.
+        """
+        dropout_prob = float(self.config.cfg_dropout)
+        if dropout_prob <= 0.0 or not is_training:
+            return text_emb
+        cfg_mask = torch.rand(batch_size, device=self.device) < dropout_prob  # (B,) bool
+        null_emb = self.null_text_embedding(batch_size).to(dtype=text_emb.dtype)  # (B, 512)
+
+        # If text_emb is a sequence (B, S, 512), expand the null embedding along sequence dimension
+        if text_emb.ndim == 3:
+            S = text_emb.shape[1]
+            null_seq_emb = null_emb.unsqueeze(1).expand(-1, S, -1)
+            return torch.where(cfg_mask.unsqueeze(-1).unsqueeze(-1), null_seq_emb, text_emb)
+
+        return torch.where(cfg_mask.unsqueeze(-1), null_emb, text_emb)
+
+    def _compute_latent_statistics(self) -> None:
+        """Compute running mean and std of the encoder's latents over the training dataset."""
+        if self.latent_stats.initialized.item():
+            print("Latent space statistics already loaded from checkpoint.")
+            return
+
+        print("Pre-computing latent space normalization statistics...")
+
+        def _collect_z1(loader, num_batches):
+            all_z1 = []
+            with torch.no_grad():
+                for i, batch in enumerate(loader):
+                    if i >= num_batches:
+                        break
+                    motion_raw = batch["motion"].to(self.device)
+                    target_motion = self.normalizer.normalize(motion_raw)
+                    zeros_text = torch.zeros(target_motion.shape[0], self.config.text_embedding_dim,
+                                             device=self.device, dtype=target_motion.dtype)
+                    raw_target = self.ema_encoder.model(target_motion, zeros_text, mask=None, return_layer_outputs=True)
+                    z1 = raw_target[:, 1:, -1, :].detach()  # (B, T-1, H)
+                    all_z1.append(z1.cpu())
+            return torch.cat(all_z1, dim=0).flatten(0, 1)  # (N, H)
+
+        combined_z1 = _collect_z1(self.train_loader, num_batches=20)
+        latent_mean = combined_z1.mean(dim=0).to(self.device)
+        latent_std = torch.clamp(combined_z1.std(dim=0).to(self.device), min=1e-5)
+
+        # Compute per-channel std on independent held-out validation sample
+        holdout_z1 = _collect_z1(self.val_loader, num_batches=5)
+        normalized_holdout = (holdout_z1.to(self.device) - latent_mean) / latent_std
+        norm_std = torch.clamp(normalized_holdout.std(dim=0), min=1e-5)
+
+        self.latent_stats.mean.copy_(latent_mean)
+        self.latent_stats.std.copy_(latent_std)
+        if hasattr(self.latent_stats, "norm_std"):
+            self.latent_stats.norm_std.copy_(norm_std)
+        self.latent_stats.initialized.copy_(torch.tensor(True, device=self.device))
+        print("Latent statistics computed successfully.")
+
+
+    def normalize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        """Normalize target latent z to have mean 0 and std 1 channel-wise."""
+        mean = self.latent_stats.mean.to(device=z.device, dtype=z.dtype)
+        std = self.latent_stats.std.to(device=z.device, dtype=z.dtype)
+        return (z - mean) / std
+
+    def denormalize_latent(self, z: torch.Tensor) -> torch.Tensor:
+        """Denormalize latent z back to its original scale and shift."""
+        mean = self.latent_stats.mean.to(device=z.device, dtype=z.dtype)
+        std = self.latent_stats.std.to(device=z.device, dtype=z.dtype)
+        return z * std + mean
+
+    # ── Latent computation (usable from external combined loops) ───────────────
+
+    @torch.no_grad()
+    def compute_target_latents(
+        self,
+        target_motion: torch.Tensor,
+        history_motion: torch.Tensor,
+        text_emb: torch.Tensor,
+        history_valid_length: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute frozen encoder outputs for flow matching, with no leakage.
+
+        target_motion and history_motion are non-overlapping by construction
+        (dataset.py guarantees this).  The encoder is bidirectional, so the only
+        way to prevent leakage is to run it on two disjoint input sequences.
+
+        Args:
+            target_motion:  Normalised target window (B, T_target, 271).  This is the
+                            sequence being generated.  Used to produce z1.
+            history_motion: Normalised history window (B, T_history, 271).  Frames
+                            strictly preceding the target window.  Used to produce
+                            track_features.  Zero-padded at front when unavailable.
+            text_emb:       Text embedding (B, D).  Used only to build a zeros tensor
+                            of the right shape/dtype; NOT passed to the encoder.
+            history_valid_length: Optional (B,) tensor indicating number of real history frames.
+
+        Returns:
+            z1:             Target latents (B, T_target-1, H_enc) — last encoder layer,
+                            token index 1 onwards (matches decoder_trainer convention).
+            track_features: History context (B, T_history, H_enc) — last encoder layer.
+                            Encoder saw only history frames; no target frame information.
+        """
+        target_enc = self.ema_encoder.model
+        target_enc.eval()
+
+        zeros_text = torch.zeros_like(text_emb)
+
+        # z1 from target_motion (what the predictor must learn to generate)
+        raw_target = target_enc(
+            target_motion, zeros_text, mask=None, return_layer_outputs=True
+        )  # (B, T_target, L, H_enc)
+        z1 = raw_target[:, 1:, -1, :].detach()  # (B, T_target-1, H_enc)
+
+        # track_features from history_motion (disjoint from target — no leakage possible)
+        # Text is zeroed: conditioning lives exclusively in AdaLN (text_embedding arg).
+        zeros_text_hist = torch.zeros(history_motion.shape[0], text_emb.shape[1],
+                                      device=history_motion.device, dtype=history_motion.dtype)
+        track_features = target_enc(
+            history_motion, zeros_text_hist, mask=None, return_layer_outputs=False
+        ).detach()  # (B, T_history, H_enc)
+
+        return z1, track_features
+
+    def compute_flow_loss(
+        self,
+        target_motion: torch.Tensor | None = None,
+        history_motion: torch.Tensor | None = None,
+        text_emb: torch.Tensor | None = None,
+        is_training: bool = True,
+        z1: torch.Tensor | None = None,
+        track_features: torch.Tensor | None = None,
+        history_valid_length: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute rectified flow matching loss.
+
+        Suitable for use from external (non-Ignite) combined training loops.
+
+        Args:
+            target_motion:  Normalised target window (B, T_target, 271).
+            history_motion: Normalised history window (B, T_history, 271), non-overlapping
+                            with target_motion.
+            text_emb:       Text embedding (B, D) or sequence (B, S, D).
+            is_training:    If False, skip CFG dropout; use EMA predictor.
+            z1:             Pre-computed target latents (B, T_target-1, H_enc).
+                            Computed from frozen encoder if not supplied.
+            track_features: Pre-computed history context (B, T_history, H_enc).
+                            Computed from frozen encoder if not supplied.
+            history_valid_length: Optional (B,) tensor with valid history counts.
+
+        Returns:
+            loss:  Scalar flow matching MSE loss.
+            t_vec: Timestep vector (B,) for diagnostics/logging.
+        """
+        # Ensure text_emb has a sequence dimension (B, S, D)
+        if text_emb is not None and text_emb.ndim == 2:
+            text_emb = text_emb.unsqueeze(1)
+
+        if z1 is None or track_features is None:
+            if target_motion is None or history_motion is None or text_emb is None:
+                raise ValueError("target_motion, history_motion, and text_emb must be provided if z1 or track_features is None.")
+            # Encoder expects a 2D text embedding for shapes (B, 512).
+            # We use the mean pooled text embedding to avoid breaking encoder's check.
+            encoder_text_ref = text_emb.mean(dim=1)
+            z1, track_features = self.compute_target_latents(target_motion, history_motion, encoder_text_ref, history_valid_length=history_valid_length)
+
+        batch_size = z1.shape[0]
+
+        # Apply target latent normalization channel-wise
+        z1_normalized = self.normalize_latent(z1)
+
+        z0 = torch.randn_like(z1_normalized)
+        t = self._sample_timesteps(batch_size)
+        t_bc = t.view(batch_size, 1, 1)
+
+        z_t = (1.0 - t_bc) * z0 + t_bc * z1_normalized
+        v_target = z1_normalized - z0
+
+        text_with_cfg = self._apply_cfg_dropout(text_emb, batch_size, is_training=is_training)
+
+        # Concatenate text token sequence and history context along the sequence dimension: (B, S + M, 512)
+        combined_cond = torch.cat([text_with_cfg, track_features], dim=1)
+
+        # Build boolean key-padding mask for combined_cond = [text_with_cfg, track_features]
+        S_text = text_with_cfg.shape[1]
+        T_hist = track_features.shape[1]
+        S_cond = S_text + T_hist
+
+        if history_valid_length is not None:
+            device = track_features.device
+            hist_idx = torch.arange(T_hist, device=device).unsqueeze(0)  # (1, T_hist)
+            valid_start = (T_hist - history_valid_length.to(device=device)).unsqueeze(1)  # (B, 1)
+            hist_mask = hist_idx >= valid_start  # (B, T_hist) bool
+            text_mask = torch.ones((batch_size, S_text), dtype=torch.bool, device=device)  # (B, S_text) bool
+            cond_mask = torch.cat([text_mask, hist_mask], dim=1)  # (B, S_cond) bool
+            attn_mask = cond_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S_cond) bool
+        else:
+            attn_mask = None
+
+        # Mean pool the text sequence to get a global vector for the predictor's global AdaLN path: (B, 512)
+        text_pooled = text_with_cfg.mean(dim=1)
+
+        active_predictor = self.predictor if is_training else self.ema_predictor.model
+        v_pred, _, _ = active_predictor(
+            noisy_states=z_t,
+            timesteps=t,
+            track_features=combined_cond,       # Pass combined condition as cross-attention target
+            text_embedding=text_pooled,         # Pass pooled vector for global AdaLN text projection
+            output_attentions=False,
+            key_padding_mask=attn_mask,
+            history_states=track_features,      # Pass pure history frames for self-attention masked_cond
+        )
+
+        # Stage 3: Inverse Latent Channel Standard Deviation Loss Reweighting (using normalized-space std)
+        if hasattr(self, "latent_stats") and self.latent_stats is not None and getattr(self.latent_stats, "initialized", False):
+            if hasattr(self.latent_stats, "norm_std"):
+                ch_std = self.latent_stats.norm_std.view(1, 1, -1).detach() + 1e-4
+            else:
+                ch_std = z1_normalized.detach().flatten(0, 1).std(dim=0).view(1, 1, -1) + 1e-4
+            ch_weight = 1.0 / ch_std
+            ch_weight = ch_weight / ch_weight.mean()  # Normalize mean weight to 1.0
+            loss = ((v_pred - v_target) ** 2 * ch_weight).mean()
+        else:
+            loss = F.mse_loss(v_pred, v_target, reduction="mean")
+        return loss, t
+
+
+    # ── Ignite step functions ──────────────────────────────────────────────────
+
+    def _train_step(
+        self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Execute one Ignite training step."""
+        self.predictor.train()
+        self.null_text_embedding.train()
+
+        target_motion, history_motion, text_emb = self._prepare_batch_phase3(batch)
+        hist_valid_len = batch.get("history_valid_length", None)
+
+        with torch.amp.autocast(
+            device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp
+        ):
+            loss, _t = self.compute_flow_loss(target_motion, history_motion, text_emb, is_training=True, history_valid_length=hist_valid_len)
+
+        self.scaler.scale(loss / self.accumulation_steps).backward()
+
+        if engine.state.iteration % self.accumulation_steps == 0:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                list(self.predictor.parameters()) + list(self.null_text_embedding.parameters()),
+                max_norm=float(self.config.gradient_clip),
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            self.optimizer.zero_grad(set_to_none=True)
+
+            self.ema_predictor.update(self.predictor)
+            self.lr_scheduler.step()
+
+            engine.state.metrics["global_step"] = engine.state.iteration // self.accumulation_steps
+
+        engine.csa_op_metrics(
+            [("loss", loss.detach().item())],
+            1.0 / self.accumulation_steps,
+            engine.state.iteration % self.accumulation_steps == 1,
+        )
+
+        return {
+            "loss": loss.detach(),
+            "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
+        }
+
+    def _val_step(
+        self, engine: PretrainEngine, batch: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        """Execute one Ignite validation step using EMA predictor."""
+        self.ema_predictor.model.eval()
+
+        target_motion, history_motion, text_emb = self._prepare_batch_phase3(batch)
+        hist_valid_len = batch.get("history_valid_length", None)
+
+        with torch.no_grad():
+            with torch.amp.autocast(
+                device_type=self.device.type, dtype=self.amp_dtype, enabled=self.use_amp
+            ):
+                loss, _t = self.compute_flow_loss(target_motion, history_motion, text_emb, is_training=False, history_valid_length=hist_valid_len)
+
+        return {
+            "lr": torch.tensor(self.lr_scheduler.get_last_lr()[0], device=self.device),
+            "val_loss": loss,
+        }
+
+    def _prepare_batch_phase3(
+        self, batch: Dict[str, torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Extract and normalize target_motion, history_motion, and text_emb from a batch.
+
+        Returns:
+            target_motion:  Normalised (B, T_target, 271)
+            history_motion: Normalised (B, T_history, 271)
+            text_emb:       (B, S, D) sequence embeddings (dynamically computed from captions)
+                            or (B, D) pooled fallback.
+        """
+        motion_raw  = batch["motion"].to(self.device)          # target window, raw
+        history_raw = batch["history_motion"].to(self.device)  # history window, raw
+
+        target_motion  = self.normalizer.normalize(motion_raw)
+        history_motion = self.normalizer.normalize(history_raw)
+
+        if "captions" in batch:
+            text_emb = self.clip_encoder.encode_sequence(batch["captions"])
+        else:
+            text_raw = batch["text_clip"].to(self.device)
+            text_emb = text_raw[:, -1, :] if text_raw.ndim == 3 else text_raw  # (B, D)
+
+        return target_motion, history_motion, text_emb
+
+    # ── Logging ────────────────────────────────────────────────────────────────
+
+    def _log_train_step(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        @trainer.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _handler(engine: PretrainEngine) -> None:
+            if not self.wandb_logger:
+                return
+            timer = engine.state.timer
+            step_time = timer.value() if timer.value() is not None else 0.0
+            timer.reset()
+            step_time_avg = (
+                engine.state.metrics["step_time_avg"]
+                if "step_time_avg" in engine.state.metrics
+                else step_time
+            )
+            remaining_time = estimate_time_remaining(engine, step_time_avg, self.config)
+            engine.set_metrics([("step_time", step_time), ("remaining_time", remaining_time)])
+            metrics = engine.get_metrics(["loss", "lr"], prefix="train/")
+            self.wandb_logger.log(metrics, step=engine.get_metric("global_step", 0))
+            self.wandb_logger.log(
+                {
+                    "train/horizon": engine.state.horizon,
+                    "epoch": int(engine.state.epoch),
+                    "global_step": int(engine.get_metric("global_step", 0)),
+                    "step_time": step_time,
+                    "remaining_time": remaining_time,
+                },
+                step=engine.get_metric("global_step", 0),
+            )
+
+    def _log_best_validation(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        @evaluator.on(Events.COMPLETED)
+        def _handler(engine: PretrainEngine) -> None:
+            if self.wandb_logger is None:
+                return
+            batch_count = engine.state.iteration // self.accumulation_steps
+            engine.scale_metrics(
+                ["val_loss"],
+                1.0 / batch_count if batch_count > 0 else 1.0,
+            )
+            self.wandb_logger.log(
+                engine.get_metrics(["val_loss"], prefix="val/"),
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            self.wandb_logger.log(
+                {
+                    "epoch": int(trainer.state.epoch),
+                    "global_step": int(trainer.get_metric("global_step", 0)),
+                },
+                step=int(trainer.get_metric("global_step", 0)),
+            )
+            val_loss = float(engine.get_metric("val_loss", float("inf")))
+            best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
+            if val_loss < best_val_loss:
+                engine.set_metrics([("best_val_loss", val_loss)])
+                self.wandb_logger.log(
+                    {"val/best_val_loss": val_loss},
+                    step=int(trainer.get_metric("global_step", 0)),
+                )
+
+    def _track_batch_loss(self, evaluator: PretrainEngine) -> None:
+        @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
+        def _handler(engine: PretrainEngine) -> None:
+            output = engine.state.output if isinstance(engine.state.output, dict) else {}
+            engine.csa_op_metrics(
+                [("val_loss", float(output.get("val_loss", 0.0)))],
+                1.0,
+            )
+
+    # ── Checkpoint ─────────────────────────────────────────────────────────────
+
+    def _attach_handlers(self, trainer: PretrainEngine, evaluator: PretrainEngine) -> None:
+        super()._attach_handlers(trainer, evaluator)
+
+        checkpoint_mapping = {
+            "trainer": trainer,
+            "encoder": self.encoder,
+            "encoder_ema": self.ema_encoder,
+            "predictor": self.predictor,
+            "predictor_ema": self.ema_predictor,
+            "null_text_embedding": self.null_text_embedding,
+            "latent_stats": self.latent_stats,
+            "optimizer": self.optimizer,
+            "scaler": self.scaler,
+            "lr_scheduler": self.lr_scheduler,
+            "metadata": CheckpointMetadata(
+                {
+                    "pretrain_id": self.pretraining_session_id,
+                    "session_id": self.session_id,
+                    "resume_id": self.resume_id,
+                }
+            ),
+            "config": CheckpointMetadata(asdict(self.config)),
+        }
+
+        def _global_step_transform(engine: PretrainEngine, _) -> int:
+            return trainer.get_metric("global_step", 0)
+
+        val_best_checkpoint = Checkpoint(
+            checkpoint_mapping,
+            DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
+            n_saved=1,
+            filename_prefix=f"phase3_best_val_{self.phase3_session_id}",
+            filename_pattern="{filename_prefix}_{global_step}.pt",
+            score_function=lambda engine: -float(engine.state.metrics["val_loss"]),
+            score_name="val_loss",
+            global_step_transform=_global_step_transform,
+        )
+        self.val_best_checkpoint = val_best_checkpoint
+
+        latest_checkpoint = Checkpoint(
+            checkpoint_mapping,
+            DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
+            n_saved=1,
+            filename_prefix=f"phase3_latest_{self.phase3_session_id}",
+            filename_pattern="{filename_prefix}_{global_step}.pt",
+            global_step_transform=_global_step_transform,
+        )
+        self.latest_checkpoint = latest_checkpoint
+
+        trainer.add_event_handler(
+            Events.EPOCH_COMPLETED(every=self.config.checkpoint_interval), latest_checkpoint
+        )
+        evaluator.add_event_handler(Events.COMPLETED, val_best_checkpoint)
+
+    # ── Public run ─────────────────────────────────────────────────────────────
+
+    def run(self, max_epochs: int | None = None) -> None:
+        """Run standalone flow matching training (uses Ignite internally)."""
+        print(f"Starting Phase 3 (flow matching predictor) session: {self.session_id}")
+        trainer = PretrainEngine(lambda engine, batch: self._train_step(engine, batch), self.config)
+        self.evaluator = PretrainEngine(lambda engine, batch: self._val_step(engine, batch), self.config)
+        self._attach_handlers(trainer, self.evaluator)
+        epochs = max_epochs or int(self.config.get_num_epochs())
+        trainer.run(self.train_loader, max_epochs=epochs)
+        if self.wandb_logger:
+            self.wandb_logger.finish()
+
+
+# ── Convenience function ───────────────────────────────────────────────────────
+
+
+def train_flow_matching(
+    config: Config,
+    pretrained_checkpoint_path: str | Path,
+    wandb_project: str | None = None,
+    max_epochs: int | None = None,
+) -> Tuple[EMAModel[MotionHistoryEncoder], EMAModel[FlowMatchingPredictor], Path]:
+    """Train the flow matching predictor while reusing a pretrained encoder checkpoint.
+
+    Returns:
+        ema_encoder:   Frozen EMA encoder (for use in inference or further training).
+        ema_predictor: Trained EMA predictor.
+        checkpoint_path: Path to the best-val checkpoint saved to disk.
+    """
+    trainer = FlowMatchingTrainer(
+        config=config,
+        pretrained_checkpoint_path=pretrained_checkpoint_path,
+        wandb_project=wandb_project,
+    )
+    trainer.run(max_epochs=max_epochs)
+    checkpoint_path = trainer.val_best_checkpoint.last_checkpoint
+    checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else Path()
+    return trainer.ema_encoder, trainer.ema_predictor, checkpoint_path
+
+
+__all__ = ["FlowMatchingTrainer", "train_flow_matching"]
 
 
 # ========== models/pretrain_trainer.py ==========
@@ -4395,8 +5523,10 @@ class PretrainTrainer(_BaseTrainer):
         self.use_amp = self.device.type == "cuda"
         self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
-        self.scaler: torch.amp.grad_scaler.GradScaler = torch.amp.grad_scaler.GradScaler(
-            self.device.type, enabled=self.use_amp
+        self.scaler = (
+            torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler")
+            else torch.cuda.amp.GradScaler(enabled=self.use_amp)
         )
 
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config)
@@ -4665,7 +5795,7 @@ class PretrainTrainer(_BaseTrainer):
                 return
             batch_count = engine.state.iteration // self.accumulation_steps
             engine.scale_metrics(
-                ["val_loss", "val_decoder_loss", "val_feet_miss_rate"],
+                ["val_loss", "val_decoder_loss", "val_probe_loss"],
                 1.0 / batch_count if batch_count > 0 else 1.0,
             )
             self.wandb_logger.log(
@@ -4673,12 +5803,7 @@ class PretrainTrainer(_BaseTrainer):
                     [
                         "val_loss",
                         "val_decoder_loss",
-                        "val_feet_miss_rate",
-                        "loss",
-                        "mask_loss",
-                        "context_loss",
-                        "probe_loss",
-                        "decoder_loss",
+                        "val_probe_loss",
                     ],
                     prefix="val/",
                 ),
@@ -4692,7 +5817,7 @@ class PretrainTrainer(_BaseTrainer):
             best_val_loss = float(engine.get_metric("best_val_loss", float("inf")))
             if val_loss < best_val_loss:
                 engine.set_metrics([("best_val_loss", val_loss)])
-                self.wandb_logger.log({"val/best_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
+                self.wandb_logger.log({"val/best_val_loss": val_loss}, step=int(trainer.get_metric("global_step", 0)))
             eval_loss = float(engine.get_metric("val_decoder_loss", float("inf")))
             best_eval_loss = float(engine.get_metric("best_eval_loss", float("inf")))
             if eval_loss < best_eval_loss:
@@ -4702,11 +5827,13 @@ class PretrainTrainer(_BaseTrainer):
     def _track_batch_loss(self, evaluator: PretrainEngine) -> None:
         @evaluator.on(Events.ITERATION_COMPLETED(every=self.accumulation_steps))
         def _handler(engine: PretrainEngine) -> None:
+            # Ignite stores process_function return dict in state.output, not state.metrics
+            output = engine.state.output if isinstance(engine.state.output, dict) else {}
             engine.csa_op_metrics(
                 [
-                    ("val_loss", engine.get_metric("loss", 0.0)),
-                    ("val_decoder_loss", engine.get_metric("decoder_loss", 0.0)),
-                    ("val_feet_miss_rate", engine.get_metric("feet_miss_rate", 0.0)),
+                    ("val_loss", float(output.get("val_loss", 0.0))),
+                    ("val_decoder_loss", float(output.get("val_decoder_loss", 0.0))),
+                    ("val_probe_loss", float(output.get("val_probe_loss", 0.0))),
                 ],
                 1.0,
             )
@@ -4737,7 +5864,7 @@ class PretrainTrainer(_BaseTrainer):
             n_saved=1,
             filename_prefix=f"pretrain_best_val_{self.pretraining_session_id}",
             filename_pattern="{filename_prefix}_{global_step}.pt",
-            score_function=lambda engine: -float(engine.state.metrics["loss"]),
+            score_function=lambda engine: -float(engine.state.metrics["val_loss"]),
             score_name="val_loss",
             global_step_transform=global_step_transform,
         )
@@ -4747,7 +5874,7 @@ class PretrainTrainer(_BaseTrainer):
             DiskSaver(self.config.checkpoint_dir, create_dir=True, require_empty=False),
             n_saved=1,
             filename_prefix=f"pretrain_best_eval_{self.pretraining_session_id}",
-            score_function=lambda engine: -float(engine.state.metrics["decoder_loss"]),
+            score_function=lambda engine: -float(engine.state.metrics["val_decoder_loss"]),
             score_name="eval_loss",
             filename_pattern="{filename_prefix}_{global_step}.pt",
             global_step_transform=global_step_transform,
@@ -4837,7 +5964,6 @@ from ignite.handlers import (
     Checkpoint,
     DiskSaver,
 )
-from torch.amp.grad_scaler import GradScaler
 
 # [internal import removed]  from utils.config import Config
 # [internal import removed]  from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, _BaseTrainer, estimate_time_remaining
@@ -4885,7 +6011,11 @@ class FinetuneTrainer(_BaseTrainer):
         self.device = torch.device(config.device) if torch.cuda.is_available() else torch.device("cpu")
         self.use_amp = self.device.type == "cuda"
         self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
-        self.scaler = GradScaler(self.device.type, enabled=self.use_amp)
+        self.scaler = (
+            torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler")
+            else torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        )
 
         self.session_id = datetime.now(timezone(timedelta(hours=6))).strftime("%Y%m%d_%H%M%S")
         self.finetuning_session_id = self.session_id

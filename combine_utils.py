@@ -28,7 +28,7 @@ from typing import Any, Dict, Generic, List, Optional, Tuple, TypeVar, Union, ca
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.amp.grad_scaler import GradScaler
+# GradScaler is dynamically selected in trainer classes
 from torch.utils.data import DataLoader, Dataset
 import numpy as np
 
@@ -98,11 +98,13 @@ FILE_ORDER = [
     "text_encoder.py",
     "dataset.py",
     "visualization.py",
+    "pipeline.py",
     "wandb_logger.py",
     "models/__init__.py",
     "models/motion_history_encoder.py",
     "models/flow_matching_predictor.py",
     "models/_base_trainer.py",
+    "models/flow_matching_trainer.py",
     "models/pretrain_trainer.py",
     "models/finetune_trainer.py",
 ]

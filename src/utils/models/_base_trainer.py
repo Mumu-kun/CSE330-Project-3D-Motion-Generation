@@ -22,7 +22,7 @@ from scipy import interpolate as Interp
 
 from utils.config import Config
 from utils.dataset import create_dataloader
-from utils.motion_utils import x68_to_positions, x271_to_x68
+from utils.motion_utils import Features, x72_to_positions, x271_to_x72
 from utils.wandb_logger import WandbLogger
 
 T = TypeVar("T", bound=nn.Module)
@@ -295,36 +295,48 @@ class _BaseTrainer:
         y_frames = motion[:, 1:, :].flatten(0, 1)
 
         decoded_flat = decoded.flatten(0, 1)
-        decoded_denorm = self.normalizer.denormalize_x68(decoded_flat)
+        decoded_denorm = self.normalizer.denormalize_x72(decoded_flat)
 
-        y_68d = x271_to_x68(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
-        y_68d = self.normalizer.denormalize_x68(y_68d)
+        y_72d = x271_to_x72(y_frames, self.normalizer, prev_positions=prev_positions, prev_x271=prev_frames)
+        y_72d_denorm = self.normalizer.denormalize_x72(y_72d)
 
-        dec_positions = x68_to_positions(
-            decoded_denorm,
+        dec_positions = x72_to_positions(
+            decoded_flat,
             self.normalizer,
             prev_x271=prev_frames,
             prev_positions=prev_positions,
         )
 
-        loss_root_y = F.mse_loss(decoded_denorm[:, :1], y_68d[:, :1], reduction="mean")
-        loss_root_xz = F.mse_loss(decoded_denorm[:, 1:3], y_68d[:, 1:3], reduction="mean")
-        loss_yaw = F.mse_loss(decoded_denorm[:, 3:5], y_68d[:, 3:5], reduction="mean")
-        loss_vel = F.smooth_l1_loss(decoded_denorm[:, 5:], y_68d[:, 5:], reduction="mean")
+        loss_root_y = F.mse_loss(decoded_denorm[:, :1], y_72d_denorm[:, :1], reduction="mean")
+        loss_root_xz = F.mse_loss(decoded_denorm[:, 1:3], y_72d_denorm[:, 1:3], reduction="mean")
+        loss_yaw = F.mse_loss(decoded_denorm[:, 3:5], y_72d_denorm[:, 3:5], reduction="mean")
+        loss_ric = F.mse_loss(decoded_denorm[:, 5:68], y_72d_denorm[:, 5:68], reduction="mean")
+        loss_contact = F.binary_cross_entropy_with_logits(
+            decoded_flat[:, 68:72], y_frames[:, Features.CONTACTS], reduction="mean"
+        )
         loss_joint = F.mse_loss(dec_positions, joints[:, 1:, :].flatten(0, 1), reduction="mean")
 
-        decoder_loss = 1 * loss_root_y + 0.2 * loss_root_xz + 1.0 * loss_yaw + 0.5 * loss_vel
-
-        engine.set_metrics(
-            [
-                ("decoder_loss", decoder_loss.detach().item()),
-                ("loss_root_y", loss_root_y.detach().item()),
-                ("loss_root_xz", loss_root_xz.detach().item()),
-                ("loss_yaw", loss_yaw.detach().item()),
-                ("loss_vel", loss_vel.detach().item()),
-                ("loss_joint", loss_joint.detach().item()),
-            ],
+        decoder_loss = (
+            1.0 * loss_root_y
+            + 1.0 * loss_root_xz
+            + 1.0 * loss_yaw
+            + 1.0 * loss_ric
+            + 0.5 * loss_contact
+            + 1.0 * loss_joint
         )
+
+        if engine is not None:
+            engine.set_metrics(
+                [
+                    ("decoder_loss", decoder_loss.detach().item()),
+                    ("loss_root_y", loss_root_y.detach().item()),
+                    ("loss_root_xz", loss_root_xz.detach().item()),
+                    ("loss_yaw", loss_yaw.detach().item()),
+                    ("loss_ric", loss_ric.detach().item()),
+                    ("loss_contact", loss_contact.detach().item()),
+                    ("loss_joint", loss_joint.detach().item()),
+                ],
+            )
 
         return {"decoder_loss": decoder_loss}
 

@@ -90,7 +90,7 @@ class AdaLN(nn.Module):
       - gate is applied AFTER the operation as a residual scale
     """
 
-    def __init__(self, d_model: int, d_cond: int):
+    def __init__(self, d_model: int, d_cond: int, init_gate_bias: float = 0.0):
         super().__init__()
 
         # No learnable affine params — AdaLN supplies them externally
@@ -103,6 +103,8 @@ class AdaLN(nn.Module):
         self.proj = nn.Linear(d_cond, 3 * d_model)
         nn.init.zeros_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
+        if init_gate_bias != 0.0:
+            nn.init.constant_(self.proj.bias[2 * d_model:], init_gate_bias)
 
     def forward(
         self,
@@ -258,3 +260,7 @@ from utils.models._base_trainer import (
     estimate_time_remaining,
     _find_latest_checkpoint,
 )
+
+# Expose model classes for package import
+from utils.models.motion_history_encoder import MotionHistoryEncoder
+from utils.models.flow_matching_predictor import FlowMatchingPredictor, LatentDecoder

@@ -1,0 +1,67 @@
+# Master Implementation Plan: Model Architecture, Conditioning & Loss Optimization
+
+This plan collects all audited fixes into a single executable roadmap. **All codebase files have been reverted to baseline**, leaving `src/phase3.ipynb` ready for test execution. You can execute this plan whenever you are ready after running your notebook diagnostic suite.
+
+---
+
+## Roadmap Overview
+
+```mermaid
+graph TD
+    A["Baseline Diagnostics (Notebook)"] --> B["Phase A: Gating Calibration"]
+    A --> C["Phase B: Channel Loss Equalization"]
+    A --> D["Phase C: Conditioning & CFG Scale Fix"]
+    B --> E["Phase D: Retraining & Re-measurement"]
+    C --> E
+    D --> E
+```
+
+---
+
+## Detailed Proposed Changes
+
+### Phase A: Gating Mechanism Calibration
+
+#### 1A. Condition Residual Injection Gate Scaling
+- **Target File:** [`utils/models/flow_matching_predictor.py`](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/src/utils/models/flow_matching_predictor.py#L135-L239)
+- **Problem:** `gate_proj` bias drifts to $\approx 0.0$ ($\text{sigmoid}(0) = 0.500$), injecting $70.2\%$ condition magnitude relative to hidden states at Layer 0.
+- **Fix:** Add learnable scaling parameter `cond_scale = nn.Parameter(torch.tensor(0.1))` to `PredictorSelfAttention` and modulate injection:
+  $$\text{hidden\_states} = \text{hidden\_states} + (\text{cond\_scale} \cdot \text{gate}) \cdot \text{masked\_cond}$$
+
+#### 1B. AdaLN Cross-Attention Output Gate Initialization
+- **Target Files:** [`utils/models/__init__.py`](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/src/utils/models/__init__.py#L90-L106) & [`utils/models/flow_matching_predictor.py`](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/src/utils/models/flow_matching_predictor.py#L199)
+- **Problem:** `AdaLN` zero-init leaves `cross_attn_gate` stuck at $< 0.09$, throttling backpropagation gradient flow into cross-attention down to $4.5\% - 7.0\%$.
+- **Fix:** Add `init_gate_bias: float = 0.0` parameter to `AdaLN.__init__()` and instantiate `self.adaln_cross_attn = AdaLN(..., init_gate_bias=0.5)` so cross-attention is active from step 0.
+
+---
+
+### Phase B: Channel-Variance Loss Equalization
+
+#### 2A. Inverse Latent Channel Standard Deviation Loss Reweighting
+- **Target File:** [`utils/models/flow_matching_trainer.py`](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/src/utils/models/flow_matching_trainer.py#L510-L520)
+- **Problem:** Unweighted MSE penalizes low-variance channels (subtle joint rotations) with $23\%$ higher unnormalized loss than high-variance channels, creating erratic gradient updates.
+- **Fix:** Weight per-channel MSE loss inversely to latent channel standard deviation $\sigma_c$:
+  $$\mathcal{L}_{\text{reweighted}} = \frac{1}{B \cdot T \cdot H} \sum_{b, t, c} w_c \cdot (\hat{v}_{b,t,c} - v_{b,t,c})^2 \quad \text{where } w_c = \frac{1 / (\sigma_c + \epsilon)}{\frac{1}{H} \sum_k 1/(\sigma_k + \epsilon)}$$
+
+---
+
+### Phase C: Conditioning Signal & CFG Sequence Alignment
+
+#### 3A. Text Projection Embedding Scale Balance
+- **Target File:** [`utils/models/flow_matching_predictor.py`](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/src/utils/models/flow_matching_predictor.py#L285)
+- **Problem:** Sinusoidal timestep embedding norm ($\mathbf{emb}_{\text{time}} \approx 33.1$) is **$12.65\times$ larger** than linear text projection norm ($\mathbf{proj}_{\text{text}} \approx 2.6$). In $\mathbf{cond}_{\text{adaln}} = \mathbf{emb}_{\text{time}} + \mathbf{proj}_{\text{text}}$, text guidance is $92.1\%$ drowned out by the timestep signal.
+- **Fix:** Scale `text_proj` initialization gain or add a scaling factor to ensure text projection norm balances timestep embedding norm ($\approx 1:1$).
+
+#### 3B. CFG Sequence Token Dropout Alignment
+- **Target File:** [`utils/models/flow_matching_trainer.py`](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/src/utils/models/flow_matching_trainer.py#L324-L327)
+- **Problem:** CFG dropout repeats a single learned 1D vector across sequence tokens for unconditional text embeddings, creating a spatially flat token sequence that distorts the Guidance Direction Vector $(v_{\text{cond}} - v_{\text{uncond}})$.
+- **Fix:** Update `_NullTextEmbedding` to support sequence dimension $(1, S, D)$ or apply token-specific null projection.
+
+---
+
+## Verification Plan
+
+### Automated Testing
+1. Re-run `TEST 2B` to `TEST 9` in `src/phase3.ipynb` to establish clean baseline.
+2. After applying fixes, verify checkpoint state_dict compatibility (or train a fresh session with updated keys).
+3. Execute `scratch/run_direct_diagnostics.py` to confirm gradient ratios, text conditioning balance ratio ($> 50\%$), and loss convergence.

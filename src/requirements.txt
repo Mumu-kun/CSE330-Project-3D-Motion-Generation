@@ -1,24 +1,31 @@
-# Core ML dependencies
-torch
-torchvision
-numpy
-scipy
-transformers
+# ==========================
+# Core ML (PyTorch CUDA 12.1)
+# Install with:
+# pip install -r src/requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+# ==========================
+torch==2.6.0
+torchvision==0.21.0
+
+# Core scientific stack
+numpy>=1.26,<3.0
+scipy>=1.13
+
+# Hugging Face
+transformers>=4.52
+regex
+
+# Optimization
 AdamWClip
 
 # Data processing
-pandas
+pandas>=2.2
 
 # Visualization
-matplotlib
-plotly
-imageio[ffmpeg]
-seaborn
+matplotlib>=3.9
+plotly>=5.24
+imageio[ffmpeg]>=2.36
 
 # Utilities
-tqdm
-pytorch-ignite
-cattrs
-
-# Text Encoding
-regex
+tqdm>=4.67
+pytorch-ignite>=0.5
+cattrs>=24.1

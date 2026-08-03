@@ -136,8 +136,10 @@ class PretrainTrainer(_BaseTrainer):
         self.use_amp = self.device.type == "cuda"
         self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
 
-        self.scaler: torch.amp.grad_scaler.GradScaler = torch.amp.grad_scaler.GradScaler(
-            self.device.type, enabled=self.use_amp
+        self.scaler = (
+            torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler")
+            else torch.cuda.amp.GradScaler(enabled=self.use_amp)
         )
 
         self.encoder: MotionHistoryEncoder = MotionHistoryEncoder(config)

@@ -22,10 +22,10 @@ from typing import Any, Optional
 
 @dataclass
 class FlowMatchingPredictorConfig:
-    hidden_size: int = 256
-    intermediate_size: int = 768
-    num_hidden_layers: int = 4
-    num_attention_heads: int = 8
+    hidden_size: int = 512
+    intermediate_size: int = 1536
+    num_hidden_layers: int = 6
+    num_attention_heads: int = 16
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     attention_bias: bool = True
@@ -34,6 +34,7 @@ class FlowMatchingPredictorConfig:
     track_dimensionality: int = 3
     global_cond_dim: int = 512  # CLIP embedding: 512D
     head_dim: Optional[int] = None
+    use_self_attn_rope: bool = True
 
     def __post_init__(self) -> None:
         if self.head_dim is None:
@@ -138,6 +139,9 @@ class Config:
     joint_dim: int = 3
     max_motion_length: int = 200
     fps: int = 20
+    # Number of history frames fed to the encoder as context for Phase 3.
+    # Must be > 0; sequences shorter than this are zero-padded at the front.
+    history_length: int = 40
 
     # --- Sub-configs ---
     encoder_config: MotionHistoryEncoderConfig = field(default_factory=MotionHistoryEncoderConfig)

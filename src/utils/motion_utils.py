@@ -134,6 +134,24 @@ class Features:
     D68_JOINTS_VEL = slice(5, 68)
     D68_YAW_SINCOS = slice(3, 5)
 
+    D72_ROOT_Y = slice(0, 1)
+    D72_ROOT_VX = slice(1, 2)
+    D72_ROOT_VZ = slice(2, 3)
+    D72_YAW_SIN = slice(3, 4)
+    D72_YAW_COS = slice(4, 5)
+    D72_JOINTS_RIC = slice(5, 68)
+    D72_CONTACTS = slice(68, 72)
+    D72_YAW_SINCOS = slice(3, 5)
+
+    D75_ROOT_Y = D72_ROOT_Y
+    D75_ROOT_VX = D72_ROOT_VX
+    D75_ROOT_VZ = D72_ROOT_VZ
+    D75_YAW_SIN = D72_YAW_SIN
+    D75_YAW_COS = D72_YAW_COS
+    D75_JOINTS_RIC = D72_JOINTS_RIC
+    D75_CONTACTS = D72_CONTACTS
+    D75_YAW_SINCOS = D72_YAW_SINCOS
+
     @staticmethod
     def joint_mask(collection: list[str | int], sl: slice) -> torch.Tensor:
         """Returns a (271,) mask for the specified collection."""
@@ -544,6 +562,28 @@ class FeatureNormalizer:
             ],
             dim=0,
         )
+        self._mean_72d = torch.cat(
+            [
+                mean[Features.ROOT_Y],
+                mean[Features.ROOT_VX],
+                mean[Features.ROOT_VZ],
+                torch.zeros(2),
+                mean[Features.JOINT_RIC],
+                torch.zeros(4),
+            ],
+            dim=0,
+        )
+        self._std_72d = torch.cat(
+            [
+                std[Features.ROOT_Y],
+                std[Features.ROOT_VX],
+                std[Features.ROOT_VZ],
+                torch.ones(2),
+                std[Features.JOINT_RIC],
+                torch.ones(4),
+            ],
+            dim=0,
+        )
         # Precompute derived stats for 263D
         # 263D layout: [
         #   root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
@@ -587,6 +627,8 @@ class FeatureNormalizer:
             self.std = self.std.to(x.device)
             self._mean_68d = self._mean_68d.to(x.device)
             self._std_68d = self._std_68d.to(x.device)
+            self._mean_72d = self._mean_72d.to(x.device)
+            self._std_72d = self._std_72d.to(x.device)
             self._mean_263 = self._mean_263.to(x.device)
             self._std_263 = self._std_263.to(x.device)
 
@@ -613,6 +655,25 @@ class FeatureNormalizer:
         assert x68.shape[-1] == 68
         self._sync(x68)
         return x68 * self._std_68d + self._mean_68d
+
+    def normalize_x72(self, x72: torch.Tensor) -> torch.Tensor:
+        """Normalize a 72D (~75D) predictor/decoder state."""
+        assert x72.shape[-1] in (72, 75, 68)
+        self._sync(x72)
+        mean = self._mean_72d if x72.shape[-1] == 72 else (self._mean_68d if x72.shape[-1] == 68 else self._mean_72d)
+        std = self._std_72d if x72.shape[-1] == 72 else (self._std_68d if x72.shape[-1] == 68 else self._std_72d)
+        return (x72 - mean) / std
+
+    def denormalize_x72(self, x72: torch.Tensor) -> torch.Tensor:
+        """Denormalize a 72D (~75D) predictor/decoder state to original scale."""
+        assert x72.shape[-1] in (72, 75, 68)
+        self._sync(x72)
+        mean = self._mean_72d if x72.shape[-1] == 72 else (self._mean_68d if x72.shape[-1] == 68 else self._mean_72d)
+        std = self._std_72d if x72.shape[-1] == 72 else (self._std_68d if x72.shape[-1] == 68 else self._std_72d)
+        return x72 * std + mean
+
+    normalize_x75 = normalize_x72
+    denormalize_x75 = denormalize_x72
 
     def normalize_x263(self, x263: torch.Tensor) -> torch.Tensor:
         """Normalize a 263D evaluator feature vector."""
@@ -717,21 +778,21 @@ def x271_to_positions(
 
 
 # ============================================================================
-# x271 <-> x68 Conversion
+# x271 <-> x72 / x75 / x68 Conversion
 # ============================================================================
 
 
-def x271_to_x68(
+def x271_to_x72(
     x271: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_positions: Optional[torch.Tensor] = None,
     prev_x271: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Convert normalized 271D -> reduced 68D predictor state.
+    Convert normalized 271D -> reduced 72D (~75D) predictor/decoder state.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
-    Output is in the same normalized space as the predictor expects.
+    72D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_ric(63) + contacts(4)]
+    Output is in the same normalized space as the predictor/decoder expects.
     """
     assert x271.shape[-1] == 271
     raw = normalizer.denormalize(x271)
@@ -745,41 +806,46 @@ def x271_to_x68(
         raw[..., Features.ROOT_ROT6D],
         None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
     )
-    joint_vel = raw[..., Features.JOINT_VEL]
+    joint_ric = raw[..., Features.JOINT_RIC]
+    contacts = raw[..., Features.CONTACTS]
 
-    x68 = torch.cat([root_y, root_vx, root_vz, delta_yaw_sin_cos, joint_vel], dim=-1)
-    x68 = normalizer.normalize_x68(x68)
+    x72 = torch.cat([root_y, root_vx, root_vz, delta_yaw_sin_cos, joint_ric, contacts], dim=-1)
+    x72 = normalizer.normalize_x72(x72)
 
-    return x68
+    return x72
 
 
-def x68_to_positions(
-    x68: torch.Tensor,
+x271_to_x75 = x271_to_x72
+x271_to_x68 = x271_to_x72
+
+
+def x72_to_positions(
+    x72: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_x271: torch.Tensor,
     prev_positions: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
-    Reconstruct global joint positions from denormalized 68D predictor output.
+    Reconstruct global joint positions from 72D (~75D) decoder output.
 
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
+    72D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_ric(63) + contacts(4)]
     prev_x271: normalized 271D feature vector for previous frame
     """
-    B = x68.shape[0]
+    B = x72.shape[0]
 
-    x68_denorm = normalizer.denormalize_x68(x68)
+    x72_denorm = normalizer.denormalize_x72(x72)
     prev_x271_raw = normalizer.denormalize(prev_x271)
 
-    root_y = x68_denorm[:, Features.D68_ROOT_Y]
-    root_vx = x68_denorm[:, Features.D68_ROOT_VX]
-    root_vz = x68_denorm[:, Features.D68_ROOT_VZ]
+    root_y = x72_denorm[:, Features.D72_ROOT_Y]
+    root_vx = x72_denorm[:, Features.D72_ROOT_VX]
+    root_vz = x72_denorm[:, Features.D72_ROOT_VZ]
 
-    prev_root_pos = prev_positions[:, 0] if prev_positions is not None else torch.zeros(B, 3, device=x68.device, dtype=x68.dtype)
+    prev_root_pos = prev_positions[:, 0] if prev_positions is not None else torch.zeros(B, 3, device=x72.device, dtype=x72.dtype)
     root_x = prev_root_pos[:, 0:1] + root_vx
     root_z = prev_root_pos[:, 2:3] + root_vz
     root_pos = torch.cat([root_x, root_y, root_z], dim=-1)
 
-    delta_yaw_sin_cos = x68_denorm[:, Features.D68_YAW_SINCOS]
+    delta_yaw_sin_cos = x72_denorm[:, Features.D72_YAW_SINCOS]
     prev_root_rot_6d = prev_x271_raw[:, Features.ROOT_ROT6D]
     prev_yaw = root_rot6d_to_yaw(prev_root_rot_6d)
     delta_yaw = sin_cos_to_yaw(delta_yaw_sin_cos)
@@ -787,84 +853,20 @@ def x68_to_positions(
     root_quat = yaw_to_root_rot6d(yaw)
     root_quat = cont6d_to_quaternion(root_quat)
 
-    joint_vel = x68_denorm[:, Features.D68_JOINTS_VEL].reshape(B, 21, 3)
-
-    if prev_positions is not None:
-        prev_root_quat = cont6d_to_quaternion(prev_root_rot_6d)
-        prev_ric_full = _compute_ric(prev_positions, prev_root_quat)
-        prev_ric = prev_ric_full[:, 1:]
-    else:
-        prev_ric = torch.zeros(B, 21, 3, device=x68.device, dtype=x68.dtype)
-    joint_ric = prev_ric + joint_vel
+    # Direct RIC positions for 21 non-root joints (NO frame-to-frame velocity accumulation!)
+    joint_ric = x72_denorm[:, Features.D72_JOINTS_RIC].reshape(B, 21, 3)
 
     global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric)
     new_joint_pos = root_pos.unsqueeze(1) + global_joints
     return torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
 
 
-# ============================================================================
-# x271 <-> x263 Conversion (legacy evaluator format)
-# ============================================================================
+x75_to_positions = x72_to_positions
+x68_to_positions = x72_to_positions
 
 
-def x271_to_x263(
-    x271: torch.Tensor,  # (B, 271) normalized
-    normalizer: FeatureNormalizer,
-    prev_x271: Optional[torch.Tensor] = None,  # (B, 271) normalized — previous frame for delta-yaw computation
-) -> torch.Tensor:
-    """
-    Convert normalized 271D -> legacy 263D evaluator layout.
-
-    263D layout: [
-        root_rotvel(1) + root_vel(2) + root_y(1) + joint_ric(63) + joint_rot(126) + joint_vel(66) + contacts(4)
-    ]
-    """
-    assert x271.shape[-1] == 271
-    raw = normalizer.denormalize(x271)
-    raw_prev = normalizer.denormalize(prev_x271) if prev_x271 is not None else None
-
-    root_rot_vel = compute_root_delta_yaw(
-        raw[..., Features.ROOT_ROT6D],
-        None if raw_prev is None else raw_prev[..., Features.ROOT_ROT6D],
-    )
-    root_block = torch.cat([root_rot_vel, raw[..., 1:3], raw[..., 0:1]], dim=-1)
-
-    x263 = torch.cat(
-        [
-            root_block,  # 4D
-            raw[..., Features.JOINT_RIC],  # 63D
-            raw[..., Features.JOINT_ROT6D],  # 126D
-            raw[..., Features.VEL],  # 66D
-            raw[..., Features.CONTACTS],  # 4D
-        ],
-        dim=-1,
-    )
-
-    return normalizer.normalize_x263(x263)
-
-
-def x271_seq_to_x263(
-    x271_seq: torch.Tensor,  # (T, 271) or (B, T, 271) normalized
-    normalizer: FeatureNormalizer,
-) -> torch.Tensor:
-    """Convert a normalized 271D motion sequence to the legacy 263D evaluator layout."""
-    if x271_seq.ndim == 2:
-        frames, prev = [], None
-        for frame in x271_seq:
-            frames.append(x271_to_x263(frame.unsqueeze(0), normalizer, prev))
-            prev = frame.unsqueeze(0)
-        return torch.cat(frames, dim=0)
-
-    return torch.stack([x271_seq_to_x263(x271_seq[i], normalizer) for i in range(x271_seq.shape[0])])
-
-
-# ============================================================================
-# x68 <-> x271 and x68 <-> x263 Cross-Conversions
-# ============================================================================
-
-
-def x68_to_x271(
-    x68: torch.Tensor,
+def x72_to_x271(
+    x72: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_x271: torch.Tensor,
     prev_positions: Optional[torch.Tensor] = None,
@@ -872,20 +874,19 @@ def x68_to_x271(
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
     """
-    Convert denormalized 68D predictor output -> normalized 271D feature frame.
-
-    Simple path: x68 -> positions (via x68_to_positions), then positions + prev_positions -> x271
-    (via positions_to_x271). No expensive round-trip through x271_to_positions.
-
-    68D layout: [root_y(1) + root_vx(1) + root_vz(1) + delta_yaw_sin(1) + delta_yaw_cos(1) + joint_vel(63)]
+    Convert denormalized 72D predictor output -> normalized 271D feature frame.
     """
-    positions = x68_to_positions(x68, normalizer, prev_x271, prev_positions)
+    positions = x72_to_positions(x72, normalizer, prev_x271, prev_positions)
     x271, _ = positions_to_x271(positions, prev_positions, normalizer, dataset_type, feet_thre)
     return x271
 
 
-def x68_to_x263(
-    x68: torch.Tensor,
+x75_to_x271 = x72_to_x271
+x68_to_x271 = x72_to_x271
+
+
+def x72_to_x263(
+    x72: torch.Tensor,
     normalizer: FeatureNormalizer,
     prev_x271: torch.Tensor,
     prev_positions: Optional[torch.Tensor] = None,
@@ -893,10 +894,12 @@ def x68_to_x263(
     feet_thre: float = 0.002,
 ) -> torch.Tensor:
     """
-    Convert denormalized 68D predictor output -> 263D evaluator layout.
-
-    Route: x68 -> positions -> x271 -> x263
+    Convert 72D predictor output -> 263D evaluator layout.
     """
-    x271 = x68_to_x271(x68, normalizer, prev_x271, prev_positions, dataset_type, feet_thre)
+    x271 = x72_to_x271(x72, normalizer, prev_x271, prev_positions, dataset_type, feet_thre)
     prev_x271_raw = normalizer.denormalize(prev_x271)
     return x271_to_x263(x271, normalizer, prev_x271_raw[:, Features.ROOT_ROT6D])
+
+
+x75_to_x263 = x72_to_x263
+x68_to_x263 = x72_to_x263

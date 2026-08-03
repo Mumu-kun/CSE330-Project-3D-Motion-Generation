@@ -22,7 +22,6 @@ from ignite.handlers import (
     Checkpoint,
     DiskSaver,
 )
-from torch.amp.grad_scaler import GradScaler
 
 from utils.config import Config
 from utils.models import CheckpointMetadata, EMAModel, PretrainEngine, _BaseTrainer, estimate_time_remaining
@@ -70,7 +69,11 @@ class FinetuneTrainer(_BaseTrainer):
         self.device = torch.device(config.device) if torch.cuda.is_available() else torch.device("cpu")
         self.use_amp = self.device.type == "cuda"
         self.amp_dtype = torch.bfloat16 if self.use_amp and torch.cuda.is_bf16_supported() else torch.float16
-        self.scaler = GradScaler(self.device.type, enabled=self.use_amp)
+        self.scaler = (
+            torch.amp.GradScaler(self.device.type, enabled=self.use_amp)
+            if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler")
+            else torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        )
 
         self.session_id = datetime.now(timezone(timedelta(hours=6))).strftime("%Y%m%d_%H%M%S")
         self.finetuning_session_id = self.session_id

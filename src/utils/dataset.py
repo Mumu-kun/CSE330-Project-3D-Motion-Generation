@@ -183,13 +183,19 @@ class Text2MotionDataset(Dataset):
     This is the ONLY version that works - replace everything else
     """
 
-    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]:
+    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]:
         """
         Returns a single sample from the dataset.
         GUARANTEES: All returned tensors have shape (max_motion_length, features)
 
         NOTE: Returns RAW (unnormalized) features. Normalization should be done
         externally using FeatureNormalizer before passing to models.
+
+        history_motion: (history_length, 271) RAW features from the frames
+        immediately preceding the target window.  Zero-padded at the front when
+        fewer than history_length frames are available before the target start.
+        Used exclusively by Phase 3 (FlowMatchingPredictor) as the encoder
+        conditioning context; ignored by pretrain and decoder trainers.
         """
         idx = self.pointer + item
         data = self.data_dict[self.name_list[idx]]
@@ -216,9 +222,10 @@ class Text2MotionDataset(Dataset):
         # ===== PAD OR TRUNCATE TO MAX_MOTION_LENGTH =====
         target_len = self.current_horizon
         current_len = original_length
+        history_length = self.config.history_length
 
         if current_len < target_len:
-            # Pad with zeros
+            # ── Short sequence: pad target, no history available ──────────────
             pad_size = target_len - current_len
             motion = torch.cat(
                 [
@@ -245,10 +252,38 @@ class Text2MotionDataset(Dataset):
                 ],
                 dim=0,
             )
+            # No frames precede the target window — history is all zeros
+            history_motion = torch.zeros(history_length, motion.shape[1], dtype=motion.dtype)
+            history_valid_length = 0
+
         elif current_len > target_len:
             start_idx = random.randint(0, current_len - self.current_horizon)
+
+            # ── History: frames strictly before start_idx ─────────────────────
+            hist_end   = start_idx
+            hist_start = max(0, start_idx - history_length)
+            hist_slice = motion[hist_start:hist_end]            # (≤ history_length, 271)
+            history_valid_length = hist_slice.shape[0]
+
+            if hist_slice.shape[0] < history_length:
+                # Zero-pad at the front so history is always (history_length, 271)
+                pad_h = torch.zeros(
+                    history_length - hist_slice.shape[0],
+                    motion.shape[1],
+                    dtype=motion.dtype,
+                )
+                history_motion = torch.cat([pad_h, hist_slice], dim=0)
+            else:
+                history_motion = hist_slice
+
+            # ── Target window ─────────────────────────────────────────────────
             motion = motion[start_idx : start_idx + self.current_horizon]
             joints = joints[start_idx : start_idx + self.current_horizon]
+
+        else:
+            # current_len == target_len: no room for history
+            history_motion = torch.zeros(history_length, motion.shape[1], dtype=motion.dtype)
+            history_valid_length = 0
 
         valid_length = min(current_len, target_len)
 
@@ -287,11 +322,12 @@ class Text2MotionDataset(Dataset):
             )
 
         # text_embedding shape: (1, 512) - pooled CLIP embedding
-        # motion shape: (target_len, 271) - full 271D features (used as both motion and history_features)
+        # motion shape:         (target_len, 271)   - target window; used for z1 (decoder + predictor target)
+        # history_motion shape: (history_length, 271) - frames strictly preceding motion; used for track_features
         # valid_length is the number of real frames before zero-padding, capped at target_len.
         sample_id = self.name_list[idx]
 
-        return caption, motion, joints, valid_length, text_embedding, sample_id, tokens
+        return caption, motion, joints, history_motion, valid_length, text_embedding, sample_id, tokens, history_valid_length
 
     def reset_min_len(self, length: int | None = None):
         if length is None:
@@ -324,42 +360,52 @@ CLIP_EMBED_DIM = 512
 
 
 def text2motion_collate_fn(
-    batch: List[Tuple[str, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]],
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str], int]],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
     Expects each sample to be a tuple:
-      - caption: str
-      - motion: (max_T, 271) torch.Tensor - full 271D features
-      - joints: (max_T, J, 3) torch.Tensor
-      - length: int number of valid frames before padding, capped at the returned horizon
-    - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
-    - sample_id: str sample identifier
+      - caption:        str
+      - motion:         (target_len, 271) torch.Tensor - target window, RAW 271D features
+      - joints:         (target_len, J, 3) torch.Tensor
+      - history_motion: (history_length, 271) torch.Tensor - frames preceding motion,
+                        zero-padded at front when not enough history; RAW features.
+                        Used only by FlowMatchingTrainer (Phase 3).
+      - length:         int - valid frames in motion before padding, capped at target_len
+      - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
+      - sample_id:      str
+      - tokens:         list[str]
+      - history_valid_length: int - exact count of real non-zero history frames
     """
     # Lists of items
-    captions = [b[0] for b in batch]
-    motions_list = [b[1] for b in batch]
-    joints_list = [b[2] for b in batch]
-    lengths = [b[3] for b in batch]
-    text_embs_list = [b[4] for b in batch]
-    sample_ids = [b[5] for b in batch]
-    tokens_list = [b[6] for b in batch]
+    captions         = [b[0] for b in batch]
+    motions_list     = [b[1] for b in batch]
+    joints_list      = [b[2] for b in batch]
+    history_list     = [b[3] for b in batch]
+    lengths          = [b[4] for b in batch]
+    text_embs_list   = [b[5] for b in batch]
+    sample_ids       = [b[6] for b in batch]
+    tokens_list      = [b[7] for b in batch]
+    hist_lengths     = [b[8] for b in batch]
 
     # Stack tensors directly
-    motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 271)
-    joints_batch = torch.stack(joints_list, dim=0)  # (B, T, J, 3)
-    length_batch = torch.tensor(lengths, dtype=torch.long)  # (B,)
-
-    text_emb_batch = torch.stack(text_embs_list, dim=0)  # (B, 1, 512)
+    motion_batch       = torch.stack(motions_list,   dim=0)  # (B, T, 271)
+    joints_batch       = torch.stack(joints_list,    dim=0)  # (B, T, J, 3)
+    history_batch      = torch.stack(history_list,   dim=0)  # (B, history_length, 271)
+    length_batch       = torch.tensor(lengths, dtype=torch.long)  # (B,)
+    text_emb_batch     = torch.stack(text_embs_list, dim=0)  # (B, 1, 512)
+    hist_length_batch  = torch.tensor(hist_lengths, dtype=torch.long)  # (B,)
 
     return {
-        "captions": captions,
-        "sample_ids": sample_ids,
-        "motion": motion_batch,
-        "joints": joints_batch,
-        "lengths": length_batch,
-        "text_clip": text_emb_batch,
-        "tokens": tokens_list,
+        "captions":             captions,
+        "sample_ids":           sample_ids,
+        "motion":               motion_batch,        # target window
+        "history_motion":       history_batch,      # context window preceding target
+        "joints":               joints_batch,
+        "lengths":              length_batch,
+        "text_clip":            text_emb_batch,
+        "tokens":               tokens_list,
+        "history_valid_length": hist_length_batch,
     }
 
 

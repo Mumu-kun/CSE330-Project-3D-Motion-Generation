@@ -5,7 +5,7 @@ from torch import nn
 
 from utils.config import Config, FlowMatchingPredictorConfig
 from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
-from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
+from utils.motion_utils import FeatureNormalizer, positions_to_x271, x72_to_positions
 
 
 class SinusoidalEmbedder(nn.Module):
@@ -68,6 +68,10 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         self.kv_cache = TemporalLayerCache()
         self._init_weights()
 
+    def clear_cache(self) -> None:
+        self.kv_cache.key = None
+        self.kv_cache.value = None
+
     def _init_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
 
@@ -83,6 +87,7 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         encoder_hidden_states: torch.Tensor,  # (B, M, H_enc)
         _encoder_cache: Optional[TemporalLayerCache] = None,
         output_attentions: bool = False,
+        attn_mask: Optional[torch.Tensor] = None,
     ):
         batch_size, seq_len, _ = hidden_states.shape
 
@@ -98,18 +103,11 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         key = encoder_cache.key
         value = encoder_cache.value
 
-        cos, sin = self._build_rope(
-            seq_len=seq_len,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
-        )
-        query = self._apply_rope(query, cos, sin)
-
         attn_output = nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=None,
+            attn_mask=attn_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=False,
         )
@@ -120,37 +118,30 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
             attn_weights = self.attn_weights(query, key, value)
             return attn_output, attn_weights
 
-        return attn_output
+        return attn_output, None
 
 
-class PredictorSelfAttention(nn.Module):
-    def __init__(self, config: Config) -> None:
-        super().__init__()
+class PredictorSelfAttention(TemporalRoPEAttention):
+    def __init__(self, config: Config, use_self_attn_rope: Optional[bool] = None) -> None:
+        super().__init__(config.predictor_config)
         pred_config = config.predictor_config
-
-        self.q_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
-        self.k_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
-        self.v_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
-        self.out_proj = nn.Linear(pred_config.hidden_size, pred_config.hidden_size, bias=pred_config.attention_bias)
+        self.config = config
+        self.use_self_attn_rope = (
+            use_self_attn_rope
+            if use_self_attn_rope is not None
+            else getattr(pred_config, "use_self_attn_rope", True)
+        )
 
         self.encoder_cond_proj = nn.Linear(config.encoder_config.hidden_size, pred_config.hidden_size, bias=True)
         self.gate_proj = nn.Linear(3 * pred_config.hidden_size, 1, bias=True)
-
-        self.num_heads = pred_config.num_attention_heads
-        self.head_dim = pred_config.hidden_size // pred_config.num_attention_heads
-        self.hidden_size = pred_config.hidden_size
-        self.attention_dropout = pred_config.attention_dropout
+        self.cond_scale = nn.Parameter(torch.tensor(0.1))
 
         self._init_weights()
 
     def _init_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
         nn.init.zeros_(self.gate_proj.weight)
-        nn.init.zeros_(self.gate_proj.bias)
-
-    def _reshape_heads(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, seq_len, _ = x.shape
-        return x.view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        nn.init.constant_(self.gate_proj.bias, -3.0)  # sigmoid(-3) ≈ 0.047
 
     def attn_weights(self, query: torch.Tensor, key: torch.Tensor) -> torch.Tensor:
         attn_weights = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
@@ -168,6 +159,15 @@ class PredictorSelfAttention(nn.Module):
         query = self._reshape_heads(self.q_proj(hidden_states))
         key = self._reshape_heads(self.k_proj(hidden_states))
         value = self._reshape_heads(self.v_proj(hidden_states))
+
+        if self.use_self_attn_rope:
+            cos, sin = self._build_rope(
+                seq_len=seq_len,
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+            query = self._apply_rope(query, cos, sin)
+            key = self._apply_rope(key, cos, sin)
 
         attn_output = nn.functional.scaled_dot_product_attention(
             query,
@@ -194,17 +194,20 @@ class PredictorLayer(nn.Module):
 
         pred_config = config.predictor_config
 
-        self.adaln_self_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_self_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size)
 
         self.self_attn = PredictorSelfAttention(config)
 
-        self.adaln_cross_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_cross_attn = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size, init_gate_bias=-2.0)
 
         self.cross_attn = PredictorRopeCrossAttention(config)
 
-        self.adaln_mlp = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size * 2)
+        self.adaln_mlp = AdaLN(d_model=pred_config.hidden_size, d_cond=pred_config.hidden_size)
 
         self.mlp = PredictorMLP(pred_config)
+
+    def clear_cache(self) -> None:
+        self.cross_attn.clear_cache()
 
     def forward(
         self,
@@ -212,25 +215,37 @@ class PredictorLayer(nn.Module):
         encoder_hidden_states: torch.Tensor,
         adaln_cond: torch.Tensor,
         output_attentions: bool = False,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        history_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         B, N, H = hidden_states.shape
-        masked_cond_raw = encoder_hidden_states[:, -N:, :]
+        hist_source = history_states if history_states is not None else encoder_hidden_states
+        T_hist = hist_source.shape[1]
+        
+        if T_hist < N:
+            # Edge-repetition padding at front to preserve temporal magnitude continuity (Path A)
+            pad_len = N - T_hist
+            pad = hist_source[:, :1, :].expand(-1, pad_len, -1)
+            masked_cond_raw = torch.cat([pad, hist_source], dim=1)
+        else:
+            # Slice the last N frames
+            masked_cond_raw = hist_source[:, -N:, :]
 
         masked_cond = self.self_attn.encoder_cond_proj(masked_cond_raw)
         gate_input = torch.cat([masked_cond, adaln_cond.unsqueeze(1).expand(-1, N, -1), hidden_states], dim=-1)
-        gate = 1 + 0.5 * torch.tanh(self.self_attn.gate_proj(gate_input))
+        gate = torch.sigmoid(self.self_attn.gate_proj(gate_input))
 
-        hidden_states = hidden_states + gate * masked_cond
+        hidden_states = hidden_states + (self.self_attn.cond_scale * gate) * masked_cond
 
         residual = hidden_states
         hidden_states, self_attn_gate = self.adaln_self_attn(hidden_states, adaln_cond)
-        hidden_states, self_attn_weights = self.self_attn(hidden_states, output_attentions=False)
+        hidden_states, self_attn_weights = self.self_attn(hidden_states, masked_cond, output_attentions=output_attentions)
         hidden_states = residual + self_attn_gate * hidden_states
 
         residual = hidden_states
         hidden_states, cross_attn_gate = self.adaln_cross_attn(hidden_states, adaln_cond)
         hidden_states, cross_attn_weights = self.cross_attn(
-            hidden_states, encoder_hidden_states, output_attentions=output_attentions
+            hidden_states, encoder_hidden_states, output_attentions=output_attentions, attn_mask=key_padding_mask
         )
         hidden_states = residual + cross_attn_gate * hidden_states
 
@@ -254,6 +269,15 @@ class FlowMatchingPredictor(nn.Module):
         super().__init__()
         self.config = config
         pred_config = config.predictor_config
+        if isinstance(pred_config, dict):
+            from utils.config import FlowMatchingPredictorConfig
+
+            pred_config = FlowMatchingPredictorConfig(**pred_config)
+            config.predictor_config = pred_config
+        if isinstance(config.encoder_config, dict):
+            from utils.config import MotionHistoryEncoderConfig
+
+            config.encoder_config = MotionHistoryEncoderConfig(**config.encoder_config)
 
         self.text_proj = nn.Linear(config.text_embedding_dim, pred_config.hidden_size, bias=True)
 
@@ -267,7 +291,7 @@ class FlowMatchingPredictor(nn.Module):
         self.latent_out_proj = nn.Linear(pred_config.hidden_size, config.encoder_config.hidden_size, bias=True)
         # Output prediction head
         self.output_adaln = nn.Sequential(
-            nn.Linear(pred_config.hidden_size * 2, config.encoder_config.hidden_size * 2, bias=True),
+            nn.Linear(pred_config.hidden_size, config.encoder_config.hidden_size * 2, bias=True),
             nn.SiLU(),
             nn.Linear(config.encoder_config.hidden_size * 2, config.encoder_config.hidden_size * 2, bias=True),
         )
@@ -277,6 +301,12 @@ class FlowMatchingPredictor(nn.Module):
     def _initialize_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
 
+    def clear_cache(self) -> None:
+        for layer in self.layers:
+            layer.clear_cache()
+        if hasattr(self, "_last_track_features"):
+            del self._last_track_features
+
     def forward(
         self,
         noisy_states: torch.Tensor,
@@ -284,6 +314,8 @@ class FlowMatchingPredictor(nn.Module):
         track_features: torch.Tensor,
         text_embedding: torch.Tensor,
         output_attentions: bool = False,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        history_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> tuple[torch.Tensor, Optional[List[torch.Tensor]], Optional[List[torch.Tensor]]]:
         """
@@ -293,16 +325,20 @@ class FlowMatchingPredictor(nn.Module):
             track_features: [B, M+N, H_enc]
             text_embedding: [B, D]
             output_attentions: bool
+            key_padding_mask: Optional[torch.Tensor] of shape (B, 1, 1, S_cond) or boolean mask
+            history_states: Optional[torch.Tensor] of shape (B, T_hist, H_enc)
         Returns:
-            flow_prediction: [B, N, H_enc]
             all_cross_attns: List of attention weights from each layer if output_attentions is True, else None
         """
+        # Clear/reset KV cache if training or if track_features changes to avoid cross-batch leaking/graph errors
+        if self.training or not hasattr(self, "_last_track_features") or self._last_track_features is not track_features:
+            self.clear_cache()
+            self._last_track_features = track_features
+
         B, N, H = noisy_states.shape
 
-        text_cond = self.text_proj(text_embedding)  # [B, H_pred]
         time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)  # [B, H_pred]
-
-        adaln_cond = torch.cat([text_cond, time_cond], dim=-1)  # [B, 2*H_pred]
+        adaln_cond = time_cond + self.text_proj(text_embedding)  # [B, H_pred]
 
         all_self_attns: list[torch.Tensor] = []
         all_cross_attns: list[torch.Tensor] = []
@@ -314,9 +350,11 @@ class FlowMatchingPredictor(nn.Module):
 
             hidden_states, self_attn_weights, cross_attn_weights = layer(
                 hidden_states,
-                track_features,
+                encoder_hidden_states=track_features,
                 adaln_cond=adaln_cond,
                 output_attentions=output_attentions,
+                key_padding_mask=key_padding_mask,
+                history_states=history_states,
             )
 
             if output_attentions:
@@ -395,7 +433,13 @@ class LatentDecoder(nn.Module):
             nn.Linear(2 * H, 2 * H),
             nn.GELU(),
             nn.Linear(2 * H, 63),
-        )  # 21 joint_ric_vel * 3
+        )  # 21 joint direct RIC positions * 3
+
+        self.contact_head = nn.Sequential(
+            nn.Linear(H, H // 2),
+            nn.GELU(),
+            nn.Linear(H // 2, 4),
+        )  # 4 foot contact logits
 
         self._initialize_weights()
 
@@ -405,7 +449,7 @@ class LatentDecoder(nn.Module):
     def forward(self, latent: torch.Tensor) -> torch.Tensor:
         """
         latent: (B, H_encoder) - the latent representation from the predictor
-        output: (B, 68) - the predicted reduced features (root_y, root_xz_vel, delta_yaw sin, cos, joint_ric_vel * 3)
+        output: (B, 72) - the predicted reduced features (root_y, root_xz_vel, delta_yaw sin, cos, joint_ric * 3, foot_contacts)
         """
         x = self.down_proj(latent)
         x = self.blocks(x)
@@ -415,9 +459,10 @@ class LatentDecoder(nn.Module):
         root_y = self.root_head_y(x)  # (..., 1) - root_y
         yaw = self.yaw_head(x)  # (..., 2) - delta_yaw sin, cos
         yaw = nn.functional.normalize(yaw, dim=-1)  # normalize to unit vector
-        ric = self.ric_head(x)  # (..., 63) - 21 joint_ric_vel * 3
+        ric = self.ric_head(x)  # (..., 63) - 21 joint direct RIC positions
+        contacts = self.contact_head(x)  # (..., 4) - foot contact logits
 
-        return torch.cat([root_y, root_xz, yaw, ric], dim=-1)
+        return torch.cat([root_y, root_xz, yaw, ric, contacts], dim=-1)
 
     def decode(
         self, latent: torch.Tensor, prev_pos: torch.Tensor, prev_frame: torch.Tensor, normalizer: FeatureNormalizer
@@ -433,7 +478,7 @@ class LatentDecoder(nn.Module):
 
         pred = self.forward(latent)
 
-        new_pos = x68_to_positions(
+        new_pos = x72_to_positions(
             pred,
             normalizer,
             prev_frame,

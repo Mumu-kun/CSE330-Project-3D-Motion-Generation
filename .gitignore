@@ -10,8 +10,6 @@ venv/
 *.code-workspace
 .idea/
 .kilocode
-.github
-.agents
 
 # Jupyter
 .ipynb_checkpoints/
@@ -21,10 +19,17 @@ venv/
 Thumbs.db
 
 # Data & models
-# *.npy
-*.npz
+dataset/
+dataset/humanml3d/
+checkpoints/
+*.ckpt
 *.pth
 *.pt
+*.safetensors
+*.bin
+*.onnx
+# *.npy
+*.npz
 
 # Outputs
 output/
@@ -34,11 +39,3 @@ results/
 # External
 momask-codes/
 *_cache/
-sample_data*
-tests/dataset/humanml3d-subset-mini*
-*tmp*
-*.log
-src/evaluator/Comp_v6_KLD005/*
-src/evaluator/glove/*
-src/evaluator/text_mot_match/*
-.kilo*
