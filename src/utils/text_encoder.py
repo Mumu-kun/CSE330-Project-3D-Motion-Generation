@@ -27,7 +27,10 @@ class CLIPEncoder(torch.nn.Module):
 
         print(f"Loading CLIP model '{model_name}'...")
         self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
-        self.model = CLIPTextModel.from_pretrained(model_name)
+        try:
+            self.model = CLIPTextModel.from_pretrained(model_name, use_safetensors=True)
+        except Exception:
+            self.model = CLIPTextModel.from_pretrained(model_name)
         self.model.eval()
 
         # Freeze CLIP parameters
