@@ -62,3 +62,8 @@ Both models were evaluated on the held-out validation batch ($B=128, T_{\text{ta
 * **Active Checkpoints Maintained**:
   * `checkpoints/phase3/predictor/phase3_predictor_latest_20260802_205537.pt` (Epoch 2000, Best baseline MSE 1.15, CosSim 0.51).
   * `checkpoints/phase3/predictor/phase3_predictor_best_val_20260828_022718.pt` (Converted from Kaggle zip to .pt).
+
+---
+
+## 6. Detailed Audit Documents
+* See [flow_matching_audit_and_sampling_analysis.md](file:///d:/ml_project/CSE330-Project-3D-Motion-Generation/docs/flow_matching_audit_and_sampling_analysis.md) for the complete empirical benchmark on `t_sampling_power = 0.0`, timestep discretization schedules, ODE solvers (Euler vs Midpoint vs Heun), and CFG calibration.

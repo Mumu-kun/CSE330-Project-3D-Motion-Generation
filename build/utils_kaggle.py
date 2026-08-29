@@ -2535,6 +2535,33 @@ import torch
 # [internal import removed]  from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
 
 
+def temporal_gaussian_smooth(positions: torch.Tensor, sigma: float = 1.2) -> torch.Tensor:
+    """Smooth joint positions along the temporal dimension using a 1D Gaussian filter.
+
+    Args:
+        positions: (horizon, 22, 3) tensor of joint positions.
+        sigma: Standard deviation of Gaussian filter in frames.
+
+    Returns:
+        smoothed_positions: (horizon, 22, 3) tensor of smoothed joint positions.
+    """
+    if sigma <= 0.0 or positions.shape[0] < 5:
+        return positions
+    radius = int(round(2.0 * sigma))
+    kernel_size = 2 * radius + 1
+    x = torch.arange(-radius, radius + 1, dtype=torch.float32, device=positions.device)
+    kernel = torch.exp(-0.5 * (x / sigma) ** 2)
+    kernel = kernel / kernel.sum()
+
+    T, J, D = positions.shape
+    # Reshape to (1, J*D, T) for 1D depthwise convolution
+    feat = positions.permute(1, 2, 0).reshape(1, J * D, T)
+    weight = kernel.view(1, 1, kernel_size).expand(J * D, 1, -1)
+    pad_feat = torch.nn.functional.pad(feat, (radius, radius), mode="replicate")
+    smoothed = torch.nn.functional.conv1d(pad_feat, weight, groups=J * D)
+    return smoothed.view(J, D, T).permute(2, 0, 1)
+
+
 @torch.no_grad()
 def generate_motion_from_prompt(
     text_prompt: str,
@@ -2547,10 +2574,14 @@ def generate_motion_from_prompt(
     clip_encoder: Any,
     device: torch.device | str = "cuda",
     num_inference_steps: int = 20,
-    time_schedule_power: float = 3.0,
+    time_schedule_power: float = 1.0,
     guidance_scale: float = 2.5,
     horizon: int = 80,
     history_valid_length: Optional[Union[int, torch.Tensor]] = None,
+    solver: str = "midpoint",
+    velocity_scale: float = 1.0,
+    smooth_output: bool = True,
+    smooth_sigma: float = 1.2,
 ) -> np.ndarray:
     """Generate joint positions by integrating flow matching ODE in latent space.
 
@@ -2564,11 +2595,15 @@ def generate_motion_from_prompt(
         normalizer: FeatureNormalizer instance for raw feature normalization.
         clip_encoder: CLIP text sequence encoder.
         device: Device to execute generation on.
-        num_inference_steps: Number of Euler integration steps.
-        time_schedule_power: Power parameter for ODE time discretization schedule.
-        guidance_scale: Classifier-Free Guidance (CFG) scale.
+        num_inference_steps: Number of integration steps.
+        time_schedule_power: Power parameter for ODE time discretization schedule (1.0 = Uniform/Linear).
+        guidance_scale: Classifier-Free Guidance (CFG) scale (2.5 recommended).
         horizon: Target horizon sequence length (default 80 frames).
         history_valid_length: Exact count of non-padded history frames. Derived if None.
+        solver: ODE solver to use ('midpoint' 2nd-order RK2 or 'euler' 1st-order).
+        velocity_scale: Scaling factor for velocity vector to restore ground truth kinematic energy (default 1.15).
+        smooth_output: Whether to apply temporal Gaussian smoothing to joint positions.
+        smooth_sigma: Gaussian smoothing standard deviation in frames (default 1.2).
 
     Returns:
         generated_positions: (horizon, 22, 3) numpy array of generated joint positions.
@@ -2623,41 +2658,53 @@ def generate_motion_from_prompt(
 
     # Step 5: Integrate flow ODE from t=0 to t=1
     s = torch.linspace(0.0, 1.0, num_inference_steps + 1, device=device)
-    tau = 1.0 - (1.0 - s).pow(time_schedule_power)
+    tau = s if time_schedule_power == 1.0 else 1.0 - (1.0 - s).pow(time_schedule_power)
 
-    for step in range(num_inference_steps):
-        t_start = tau[step].expand(1)
-        t_end = tau[step + 1]
-        dt = t_end - t_start
+    # Prepare conditioned & unconditioned embeddings
+    combined_cond = torch.cat([text_seq, track_features], dim=1)  # (1, S + T_hist, 512)
+    text_pooled = text_seq.mean(dim=1)  # (1, 512)
 
-        # Conditioned branch: Concatenate text sequence and history context
-        combined_cond = torch.cat([text_seq, track_features], dim=1)  # (1, S + T_hist, 512)
-        text_pooled = text_seq.mean(dim=1)  # (1, 512)
+    null_emb = predictor_trainer.null_text_embedding(1).to(dtype=text_seq.dtype)  # (1, 512)
+    null_seq = null_emb.unsqueeze(1).expand(-1, text_seq.shape[1], -1)  # (1, S, 512)
+    combined_uncond = torch.cat([null_seq, track_features], dim=1)  # (1, S + T_hist, 512)
+    null_pooled = null_seq.mean(dim=1)  # (1, 512)
 
-        v_cond, _, _ = predictor(
-            noisy_states=z_t,
-            timesteps=t_start,
+    def eval_velocity(z_curr: torch.Tensor, t_curr: torch.Tensor) -> torch.Tensor:
+        v_c, _, _ = predictor(
+            noisy_states=z_curr,
+            timesteps=t_curr,
             track_features=combined_cond,
             text_embedding=text_pooled,
             key_padding_mask=key_padding_mask,
+            history_states=track_features,
         )
+        if guidance_scale > 1.0:
+            v_u, _, _ = predictor(
+                noisy_states=z_curr,
+                timesteps=t_curr,
+                track_features=combined_uncond,
+                text_embedding=null_pooled,
+                key_padding_mask=key_padding_mask,
+                history_states=track_features,
+            )
+            v_eff = v_u + guidance_scale * (v_c - v_u)
+        else:
+            v_eff = v_c
+        return v_eff * velocity_scale
 
-        # Unconditioned branch: Concatenate null sequence and history context
-        null_emb = predictor_trainer.null_text_embedding(1).to(dtype=text_seq.dtype)  # (1, 512)
-        null_seq = null_emb.unsqueeze(1).expand(-1, text_seq.shape[1], -1)  # (1, S, 512)
-        combined_uncond = torch.cat([null_seq, track_features], dim=1)  # (1, S + T_hist, 512)
-        null_pooled = null_seq.mean(dim=1)  # (1, 512)
+    for step in range(num_inference_steps):
+        t_start = tau[step].expand(1)
+        dt = (tau[step + 1] - tau[step]).item()
 
-        v_uncond, _, _ = predictor(
-            noisy_states=z_t,
-            timesteps=t_start,
-            track_features=combined_uncond,
-            text_embedding=null_pooled,
-            key_padding_mask=key_padding_mask,
-        )
-
-        v_t = v_uncond + guidance_scale * (v_cond - v_uncond)
-        z_t = z_t + v_t * dt
+        if solver == "midpoint":
+            v1 = eval_velocity(z_t, t_start)
+            t_mid = (tau[step] + 0.5 * dt).expand(1)
+            z_mid = z_t + 0.5 * dt * v1
+            v_mid = eval_velocity(z_mid, t_mid)
+            z_t = z_t + v_mid * dt
+        else:
+            v1 = eval_velocity(z_t, t_start)
+            z_t = z_t + v1 * dt
 
     # Final integrated latent in normalized space
     z1_pred_norm = z_t  # (1, T_target, H_enc)
@@ -2688,7 +2735,11 @@ def generate_motion_from_prompt(
         current_frame = new_frame
         generated_positions.append(new_pos[0].cpu())
 
-    return torch.stack(generated_positions, dim=0).numpy()
+    positions_tensor = torch.stack(generated_positions, dim=0)  # (horizon, 22, 3)
+    if smooth_output:
+        positions_tensor = temporal_gaussian_smooth(positions_tensor, sigma=smooth_sigma)
+
+    return positions_tensor.cpu().numpy()
 
 
 # ========== wandb_logger.py ==========
