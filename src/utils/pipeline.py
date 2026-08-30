@@ -7,7 +7,7 @@ from typing import Any, Optional, Union
 import numpy as np
 import torch
 
-from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
+from utils.motion_utils import FeatureNormalizer, enforce_rigid_bone_lengths, positions_to_x271, x68_to_positions
 
 
 def temporal_gaussian_smooth(positions: torch.Tensor, sigma: float = 1.2) -> torch.Tensor:
@@ -57,6 +57,7 @@ def generate_motion_from_prompt(
     velocity_scale: float = 1.0,
     smooth_output: bool = True,
     smooth_sigma: float = 1.2,
+    enforce_rigid_bones: bool = True,
 ) -> np.ndarray:
     """Generate joint positions by integrating flow matching ODE in latent space.
 
@@ -211,6 +212,8 @@ def generate_motion_from_prompt(
         generated_positions.append(new_pos[0].cpu())
 
     positions_tensor = torch.stack(generated_positions, dim=0)  # (horizon, 22, 3)
+    if enforce_rigid_bones:
+        positions_tensor = enforce_rigid_bone_lengths(positions_tensor, initial_joints[0].cpu())
     if smooth_output:
         positions_tensor = temporal_gaussian_smooth(positions_tensor, sigma=smooth_sigma)
 

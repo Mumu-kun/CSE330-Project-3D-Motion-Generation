@@ -819,6 +819,60 @@ x271_to_x75 = x271_to_x72
 x271_to_x68 = x271_to_x72
 
 
+def enforce_rigid_bone_lengths(
+    positions: torch.Tensor,
+    ref_joints: torch.Tensor,
+    kinematic_chain: Optional[List[List[int]]] = None,
+) -> torch.Tensor:
+    """
+    Enforce constant, rigid bone lengths along the kinematic tree matching the reference skeleton.
+    Preserves 100% of predicted joint directions and angles while strictly eliminating bone stretching/shrinking.
+
+    Args:
+        positions: (22, 3), (T, 22, 3), or (B, T, 22, 3) predicted joint positions.
+        ref_joints: (22, 3) or (B, 22, 3) reference skeleton (e.g. from seed frame).
+        kinematic_chain: Optional list of kinematic chains. Defaults to T2M_KINEMATIC_CHAIN.
+
+    Returns:
+        positions_rigid: Tensor of the same shape with exact reference bone lengths.
+    """
+    if kinematic_chain is None:
+        kinematic_chain = T2M_KINEMATIC_CHAIN
+
+    orig_shape = positions.shape
+    if positions.ndim == 2:  # (22, 3)
+        pos = positions.unsqueeze(0).unsqueeze(0)
+    elif positions.ndim == 3:
+        if positions.shape[1] == 22 and positions.shape[2] == 3:  # (T, 22, 3) or (B, 22, 3)
+            pos = positions.unsqueeze(0)  # (1, N, 22, 3)
+        else:
+            raise ValueError(f"Unexpected positions shape: {positions.shape}")
+    elif positions.ndim == 4:  # (B, T, 22, 3)
+        pos = positions
+    else:
+        raise ValueError(f"Positions must be 2D, 3D, or 4D, got {positions.shape}")
+
+    if ref_joints.ndim == 2:
+        ref = ref_joints.unsqueeze(0)
+    elif ref_joints.ndim == 3:
+        ref = ref_joints if ref_joints.shape[0] == pos.shape[0] else ref_joints[0:1]
+    else:
+        ref = ref_joints.reshape(-1, 22, 3)[0:1]
+
+    out = pos.clone()
+    for chain in kinematic_chain:
+        for i in range(len(chain) - 1):
+            p_idx, c_idx = chain[i], chain[i + 1]
+            ref_len = (ref[:, c_idx] - ref[:, p_idx]).norm(dim=-1, keepdim=True).unsqueeze(1)
+            ref_len = torch.clamp(ref_len, min=1e-4)
+            delta = out[:, :, c_idx] - out[:, :, p_idx]
+            dist = delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            direction = delta / dist
+            out[:, :, c_idx] = out[:, :, p_idx] + direction * ref_len
+
+    return out.reshape(orig_shape)
+
+
 def x72_to_positions(
     x72: torch.Tensor,
     normalizer: FeatureNormalizer,
@@ -858,7 +912,12 @@ def x72_to_positions(
 
     global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric)
     new_joint_pos = root_pos.unsqueeze(1) + global_joints
-    return torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
+    positions = torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
+
+    if prev_positions is not None:
+        positions = enforce_rigid_bone_lengths(positions, prev_positions)
+
+    return positions
 
 
 x75_to_positions = x72_to_positions

@@ -2,6 +2,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from utils.config import Config, FlowMatchingPredictorConfig
 from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
@@ -58,9 +59,10 @@ class PredictorMLP(GatedMLP):
 
 
 class PredictorRopeCrossAttention(TemporalRoPEAttention):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, text_bias: Optional[float] = None) -> None:
         super().__init__(config.predictor_config)
         self.config = config
+        self.text_bias = text_bias if text_bias is not None else getattr(config.predictor_config, "text_prior_bias", 0.8)
 
         self.k_proj = nn.Linear(config.encoder_config.hidden_size, config.predictor_config.hidden_size, bias=True)
         self.v_proj = nn.Linear(config.encoder_config.hidden_size, config.predictor_config.hidden_size, bias=True)
@@ -75,9 +77,11 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
     def _init_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
 
-    def attn_weights(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
-        attn_weights = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+    def attn_weights(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
+        if attn_mask is not None:
+            attn_scores = attn_scores + attn_mask
+        attn_weights = torch.softmax(attn_scores, dim=-1)
 
         return attn_weights
 
@@ -103,11 +107,26 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         key = encoder_cache.key
         value = encoder_cache.value
 
+        # Build float additive attention mask with text prior bias
+        Total_Keys = key.shape[-2]
+        T_hist = getattr(self.config, "history_length", 40)
+        S_text = max(0, Total_Keys - T_hist)
+
+        float_mask = torch.zeros((1, 1, 1, Total_Keys), device=query.device, dtype=query.dtype)
+        if S_text > 0 and self.text_bias != 0.0:
+            float_mask[..., :S_text] = self.text_bias
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                float_mask = float_mask.masked_fill(~attn_mask, float("-inf"))
+            else:
+                float_mask = float_mask + attn_mask
+
         attn_output = nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=attn_mask,
+            attn_mask=float_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=False,
         )
@@ -115,7 +134,7 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
 
         if output_attentions:
-            attn_weights = self.attn_weights(query, key, value)
+            attn_weights = self.attn_weights(query, key, value, attn_mask=float_mask)
             return attn_output, attn_weights
 
         return attn_output, None
@@ -151,7 +170,7 @@ class PredictorSelfAttention(TemporalRoPEAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        masked_cond: torch.Tensor,
+        masked_cond: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len, _ = hidden_states.shape
@@ -218,28 +237,9 @@ class PredictorLayer(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         history_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        B, N, H = hidden_states.shape
-        hist_source = history_states if history_states is not None else encoder_hidden_states
-        T_hist = hist_source.shape[1]
-        
-        if T_hist < N:
-            # Edge-repetition padding at front to preserve temporal magnitude continuity (Path A)
-            pad_len = N - T_hist
-            pad = hist_source[:, :1, :].expand(-1, pad_len, -1)
-            masked_cond_raw = torch.cat([pad, hist_source], dim=1)
-        else:
-            # Slice the last N frames
-            masked_cond_raw = hist_source[:, -N:, :]
-
-        masked_cond = self.self_attn.encoder_cond_proj(masked_cond_raw)
-        gate_input = torch.cat([masked_cond, adaln_cond.unsqueeze(1).expand(-1, N, -1), hidden_states], dim=-1)
-        gate = torch.sigmoid(self.self_attn.gate_proj(gate_input))
-
-        hidden_states = hidden_states + (self.self_attn.cond_scale * gate) * masked_cond
-
         residual = hidden_states
         hidden_states, self_attn_gate = self.adaln_self_attn(hidden_states, adaln_cond)
-        hidden_states, self_attn_weights = self.self_attn(hidden_states, masked_cond, output_attentions=output_attentions)
+        hidden_states, self_attn_weights = self.self_attn(hidden_states, output_attentions=output_attentions)
         hidden_states = residual + self_attn_gate * hidden_states
 
         residual = hidden_states
@@ -338,7 +338,13 @@ class FlowMatchingPredictor(nn.Module):
         B, N, H = noisy_states.shape
 
         time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)  # [B, H_pred]
-        adaln_cond = time_cond + self.text_proj(text_embedding)  # [B, H_pred]
+        text_cond = self.text_proj(text_embedding)  # [B, H_pred]
+
+        # Equalize time and text conditioning power (50% time / 50% text)
+        time_norm = F.normalize(time_cond, dim=-1, eps=1e-6)
+        text_norm = F.normalize(text_cond, dim=-1, eps=1e-6)
+        norm_scale = float(self.config.predictor_config.hidden_size ** 0.5)
+        adaln_cond = norm_scale * (0.5 * time_norm + 0.5 * text_norm)
 
         all_self_attns: list[torch.Tensor] = []
         all_cross_attns: list[torch.Tensor] = []

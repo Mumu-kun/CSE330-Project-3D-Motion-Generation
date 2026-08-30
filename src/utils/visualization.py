@@ -186,6 +186,7 @@ def visualize_motion(
     probe: bool = False,
     backend: str = "matplotlib",
     show_forward_vector: bool = False,
+    follow_root: bool = False,
 ) -> Any:
     """
     Visualize motion from joint positions.
@@ -201,13 +202,20 @@ def visualize_motion(
         probe: If True, print camera + scene state
         backend: Visualization backend - only "matplotlib" is supported
         show_forward_vector: If True, draw forward direction vector from root joint
+        follow_root: If True, center camera view on root joint; if False, camera stays fixed so motion traverses the room
     """
     if backend != "matplotlib":
         print(f"Backend '{backend}' is not supported. Using matplotlib.")
     fps = fps / skip_frames
     motion_subsampled = joint_positions[::skip_frames]
     html = plot_3d_motion(
-        motion_subsampled, radius=radius, fps=fps, title=title, probe=probe, show_forward_vector=show_forward_vector
+        motion_subsampled,
+        radius=radius,
+        fps=fps,
+        title=title,
+        probe=probe,
+        show_forward_vector=show_forward_vector,
+        follow_root=follow_root,
     )
     return html
 

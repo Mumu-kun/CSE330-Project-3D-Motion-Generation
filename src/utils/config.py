@@ -35,6 +35,7 @@ class FlowMatchingPredictorConfig:
     global_cond_dim: int = 512  # CLIP embedding: 512D
     head_dim: Optional[int] = None
     use_self_attn_rope: bool = True
+    text_prior_bias: float = 0.8
 
     def __post_init__(self) -> None:
         if self.head_dim is None:

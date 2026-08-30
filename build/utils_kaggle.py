@@ -1146,6 +1146,60 @@ x271_to_x75 = x271_to_x72
 x271_to_x68 = x271_to_x72
 
 
+def enforce_rigid_bone_lengths(
+    positions: torch.Tensor,
+    ref_joints: torch.Tensor,
+    kinematic_chain: Optional[List[List[int]]] = None,
+) -> torch.Tensor:
+    """
+    Enforce constant, rigid bone lengths along the kinematic tree matching the reference skeleton.
+    Preserves 100% of predicted joint directions and angles while strictly eliminating bone stretching/shrinking.
+
+    Args:
+        positions: (22, 3), (T, 22, 3), or (B, T, 22, 3) predicted joint positions.
+        ref_joints: (22, 3) or (B, 22, 3) reference skeleton (e.g. from seed frame).
+        kinematic_chain: Optional list of kinematic chains. Defaults to T2M_KINEMATIC_CHAIN.
+
+    Returns:
+        positions_rigid: Tensor of the same shape with exact reference bone lengths.
+    """
+    if kinematic_chain is None:
+        kinematic_chain = T2M_KINEMATIC_CHAIN
+
+    orig_shape = positions.shape
+    if positions.ndim == 2:  # (22, 3)
+        pos = positions.unsqueeze(0).unsqueeze(0)
+    elif positions.ndim == 3:
+        if positions.shape[1] == 22 and positions.shape[2] == 3:  # (T, 22, 3) or (B, 22, 3)
+            pos = positions.unsqueeze(0)  # (1, N, 22, 3)
+        else:
+            raise ValueError(f"Unexpected positions shape: {positions.shape}")
+    elif positions.ndim == 4:  # (B, T, 22, 3)
+        pos = positions
+    else:
+        raise ValueError(f"Positions must be 2D, 3D, or 4D, got {positions.shape}")
+
+    if ref_joints.ndim == 2:
+        ref = ref_joints.unsqueeze(0)
+    elif ref_joints.ndim == 3:
+        ref = ref_joints if ref_joints.shape[0] == pos.shape[0] else ref_joints[0:1]
+    else:
+        ref = ref_joints.reshape(-1, 22, 3)[0:1]
+
+    out = pos.clone()
+    for chain in kinematic_chain:
+        for i in range(len(chain) - 1):
+            p_idx, c_idx = chain[i], chain[i + 1]
+            ref_len = (ref[:, c_idx] - ref[:, p_idx]).norm(dim=-1, keepdim=True).unsqueeze(1)
+            ref_len = torch.clamp(ref_len, min=1e-4)
+            delta = out[:, :, c_idx] - out[:, :, p_idx]
+            dist = delta.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+            direction = delta / dist
+            out[:, :, c_idx] = out[:, :, p_idx] + direction * ref_len
+
+    return out.reshape(orig_shape)
+
+
 def x72_to_positions(
     x72: torch.Tensor,
     normalizer: FeatureNormalizer,
@@ -1185,7 +1239,12 @@ def x72_to_positions(
 
     global_joints = qrot(qinv(root_quat.unsqueeze(1).expand(-1, 21, -1)), joint_ric)
     new_joint_pos = root_pos.unsqueeze(1) + global_joints
-    return torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
+    positions = torch.cat([root_pos.unsqueeze(1), new_joint_pos], dim=1)
+
+    if prev_positions is not None:
+        positions = enforce_rigid_bone_lengths(positions, prev_positions)
+
+    return positions
 
 
 x75_to_positions = x72_to_positions
@@ -1271,6 +1330,7 @@ class FlowMatchingPredictorConfig:
     global_cond_dim: int = 512  # CLIP embedding: 512D
     head_dim: Optional[int] = None
     use_self_attn_rope: bool = True
+    text_prior_bias: float = 0.8
 
     def __post_init__(self) -> None:
         if self.head_dim is None:
@@ -2323,6 +2383,7 @@ def visualize_motion(
     probe: bool = False,
     backend: str = "matplotlib",
     show_forward_vector: bool = False,
+    follow_root: bool = False,
 ) -> Any:
     """
     Visualize motion from joint positions.
@@ -2338,13 +2399,20 @@ def visualize_motion(
         probe: If True, print camera + scene state
         backend: Visualization backend - only "matplotlib" is supported
         show_forward_vector: If True, draw forward direction vector from root joint
+        follow_root: If True, center camera view on root joint; if False, camera stays fixed so motion traverses the room
     """
     if backend != "matplotlib":
         print(f"Backend '{backend}' is not supported. Using matplotlib.")
     fps = fps / skip_frames
     motion_subsampled = joint_positions[::skip_frames]
     html = plot_3d_motion(
-        motion_subsampled, radius=radius, fps=fps, title=title, probe=probe, show_forward_vector=show_forward_vector
+        motion_subsampled,
+        radius=radius,
+        fps=fps,
+        title=title,
+        probe=probe,
+        show_forward_vector=show_forward_vector,
+        follow_root=follow_root,
     )
     return html
 
@@ -2532,7 +2600,7 @@ from typing import Any, Optional, Union
 import numpy as np
 import torch
 
-# [internal import removed]  from utils.motion_utils import FeatureNormalizer, positions_to_x271, x68_to_positions
+# [internal import removed]  from utils.motion_utils import FeatureNormalizer, enforce_rigid_bone_lengths, positions_to_x271, x68_to_positions
 
 
 def temporal_gaussian_smooth(positions: torch.Tensor, sigma: float = 1.2) -> torch.Tensor:
@@ -2582,6 +2650,7 @@ def generate_motion_from_prompt(
     velocity_scale: float = 1.0,
     smooth_output: bool = True,
     smooth_sigma: float = 1.2,
+    enforce_rigid_bones: bool = True,
 ) -> np.ndarray:
     """Generate joint positions by integrating flow matching ODE in latent space.
 
@@ -2736,6 +2805,8 @@ def generate_motion_from_prompt(
         generated_positions.append(new_pos[0].cpu())
 
     positions_tensor = torch.stack(generated_positions, dim=0)  # (horizon, 22, 3)
+    if enforce_rigid_bones:
+        positions_tensor = enforce_rigid_bone_lengths(positions_tensor, initial_joints[0].cpu())
     if smooth_output:
         positions_tensor = temporal_gaussian_smooth(positions_tensor, sigma=smooth_sigma)
 
@@ -3648,6 +3719,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 # [internal import removed]  from utils.config import Config, FlowMatchingPredictorConfig
 # [internal import removed]  from utils.models import AdaLN, GatedMLP, TemporalLayerCache, TemporalRoPEAttention, init_weights
@@ -3704,9 +3776,10 @@ class PredictorMLP(GatedMLP):
 
 
 class PredictorRopeCrossAttention(TemporalRoPEAttention):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, text_bias: Optional[float] = None) -> None:
         super().__init__(config.predictor_config)
         self.config = config
+        self.text_bias = text_bias if text_bias is not None else getattr(config.predictor_config, "text_prior_bias", 0.8)
 
         self.k_proj = nn.Linear(config.encoder_config.hidden_size, config.predictor_config.hidden_size, bias=True)
         self.v_proj = nn.Linear(config.encoder_config.hidden_size, config.predictor_config.hidden_size, bias=True)
@@ -3721,9 +3794,11 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
     def _init_weights(self) -> None:
         init_weights(self, linear_init="xavier_normal")
 
-    def attn_weights(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
-        attn_weights = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
-        attn_weights = torch.softmax(attn_weights, dim=-1)
+    def attn_weights(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        attn_scores = torch.matmul(query, key.transpose(-2, -1)) / (self.head_dim**0.5)
+        if attn_mask is not None:
+            attn_scores = attn_scores + attn_mask
+        attn_weights = torch.softmax(attn_scores, dim=-1)
 
         return attn_weights
 
@@ -3749,11 +3824,26 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         key = encoder_cache.key
         value = encoder_cache.value
 
+        # Build float additive attention mask with text prior bias
+        Total_Keys = key.shape[-2]
+        T_hist = getattr(self.config, "history_length", 40)
+        S_text = max(0, Total_Keys - T_hist)
+
+        float_mask = torch.zeros((1, 1, 1, Total_Keys), device=query.device, dtype=query.dtype)
+        if S_text > 0 and self.text_bias != 0.0:
+            float_mask[..., :S_text] = self.text_bias
+
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                float_mask = float_mask.masked_fill(~attn_mask, float("-inf"))
+            else:
+                float_mask = float_mask + attn_mask
+
         attn_output = nn.functional.scaled_dot_product_attention(
             query,
             key,
             value,
-            attn_mask=attn_mask,
+            attn_mask=float_mask,
             dropout_p=self.attention_dropout if self.training else 0.0,
             is_causal=False,
         )
@@ -3761,7 +3851,7 @@ class PredictorRopeCrossAttention(TemporalRoPEAttention):
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.hidden_size)
 
         if output_attentions:
-            attn_weights = self.attn_weights(query, key, value)
+            attn_weights = self.attn_weights(query, key, value, attn_mask=float_mask)
             return attn_output, attn_weights
 
         return attn_output, None
@@ -3797,7 +3887,7 @@ class PredictorSelfAttention(TemporalRoPEAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        masked_cond: torch.Tensor,
+        masked_cond: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         batch_size, seq_len, _ = hidden_states.shape
@@ -3864,28 +3954,9 @@ class PredictorLayer(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         history_states: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
-        B, N, H = hidden_states.shape
-        hist_source = history_states if history_states is not None else encoder_hidden_states
-        T_hist = hist_source.shape[1]
-        
-        if T_hist < N:
-            # Edge-repetition padding at front to preserve temporal magnitude continuity (Path A)
-            pad_len = N - T_hist
-            pad = hist_source[:, :1, :].expand(-1, pad_len, -1)
-            masked_cond_raw = torch.cat([pad, hist_source], dim=1)
-        else:
-            # Slice the last N frames
-            masked_cond_raw = hist_source[:, -N:, :]
-
-        masked_cond = self.self_attn.encoder_cond_proj(masked_cond_raw)
-        gate_input = torch.cat([masked_cond, adaln_cond.unsqueeze(1).expand(-1, N, -1), hidden_states], dim=-1)
-        gate = torch.sigmoid(self.self_attn.gate_proj(gate_input))
-
-        hidden_states = hidden_states + (self.self_attn.cond_scale * gate) * masked_cond
-
         residual = hidden_states
         hidden_states, self_attn_gate = self.adaln_self_attn(hidden_states, adaln_cond)
-        hidden_states, self_attn_weights = self.self_attn(hidden_states, masked_cond, output_attentions=output_attentions)
+        hidden_states, self_attn_weights = self.self_attn(hidden_states, output_attentions=output_attentions)
         hidden_states = residual + self_attn_gate * hidden_states
 
         residual = hidden_states
@@ -3984,7 +4055,13 @@ class FlowMatchingPredictor(nn.Module):
         B, N, H = noisy_states.shape
 
         time_cond = self.time_embedder(timesteps.squeeze(-1) if timesteps.dim() > 1 else timesteps)  # [B, H_pred]
-        adaln_cond = time_cond + self.text_proj(text_embedding)  # [B, H_pred]
+        text_cond = self.text_proj(text_embedding)  # [B, H_pred]
+
+        # Equalize time and text conditioning power (50% time / 50% text)
+        time_norm = F.normalize(time_cond, dim=-1, eps=1e-6)
+        text_norm = F.normalize(text_cond, dim=-1, eps=1e-6)
+        norm_scale = float(self.config.predictor_config.hidden_size ** 0.5)
+        adaln_cond = norm_scale * (0.5 * time_norm + 0.5 * text_norm)
 
         all_self_attns: list[torch.Tensor] = []
         all_cross_attns: list[torch.Tensor] = []
