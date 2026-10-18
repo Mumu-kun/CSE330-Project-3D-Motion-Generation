@@ -19,16 +19,25 @@ venv/
 Thumbs.db
 
 # Data & models
-# *.npy
-*.npz
+dataset/
+dataset/humanml3d/
+checkpoints/
+*.ckpt
 *.pth
 *.pt
+*.safetensors
+*.bin
+*.onnx
+# *.npy
+*.npz
 
 # Outputs
 output/
 outputs/
 results/
+*.log
 
 # External
 momask-codes/
 *_cache/
+.cache/

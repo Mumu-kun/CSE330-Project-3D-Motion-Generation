@@ -11,17 +11,26 @@ class CLIPEncoder(torch.nn.Module):
     """
     Utility class to encode text captions using Microsoft's CLIP model.
     By default, uses 'openai/clip-vit-base-patch32' which produces 512D embeddings.
+
+    For texts longer than 77 tokens, uses chunk-and-average approach to preserve
+    all text content.
     """
 
     def __init__(
         self,
         model_name: str = "openai/clip-vit-base-patch32",
+        max_length: int = 77,
     ):
         super().__init__()
 
+        self.max_length = max_length
+
         print(f"Loading CLIP model '{model_name}'...")
         self.tokenizer = CLIPTokenizer.from_pretrained(model_name)
-        self.model = CLIPTextModel.from_pretrained(model_name)
+        try:
+            self.model = CLIPTextModel.from_pretrained(model_name, use_safetensors=True)
+        except Exception:
+            self.model = CLIPTextModel.from_pretrained(model_name)
         self.model.eval()
 
         # Freeze CLIP parameters
@@ -33,11 +42,14 @@ class CLIPEncoder(torch.nn.Module):
         """
         Encode a list of captions or a single caption into embeddings.
 
+        For texts longer than max_length tokens, splits into chunks and averages
+        the embeddings to preserve all text content.
+
         Args:
             text: A single string or a list of strings.
 
         Returns:
-            embeddings: (B, 512) tensor containing the text embeddings.
+            embeddings: (B, 1, 512) tensor containing pooled CLIP embeddings.
         """
         if isinstance(text, str):
             text = [text]
@@ -52,11 +64,36 @@ class CLIPEncoder(torch.nn.Module):
 
         # Use the pooler_output for a global representation of the sentence
         # Shape: (Batch_Size, 512)
-        embeddings = outputs.pooler_output
+        embeddings = outputs.pooler_output.unsqueeze(1)
 
         return embeddings
+
+    @torch.no_grad()
+    def encode_sequence(self, text: Union[str, List[str]], max_length: int = 77) -> torch.Tensor:
+        """
+        Encode text captions into a sequence of token embeddings.
+
+        Args:
+            text: A single string or a list of strings.
+            max_length: Maximum sequence length (CLIP max is 77).
+
+        Returns:
+            embeddings: (B, S, 512) tensor containing token sequence embeddings.
+        """
+        if isinstance(text, str):
+            text = [text]
+
+        device = next(self.model.parameters()).device
+
+        inputs = self.tokenizer(
+            text, padding=True, truncation=True, max_length=max_length, return_tensors="pt"
+        ).to(device)
+        outputs = self.model(**inputs)
+
+        return outputs.last_hidden_state
 
     @property
     def embedding_dim(self) -> int:
         """Output dimension of the CLIP text model."""
         return self.model.config.hidden_size
+

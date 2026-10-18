@@ -4,16 +4,18 @@ Dataset loading and Text2Motion dataset implementation.
 Handles loading HumanML3D dataset with text-motion pairs.
 """
 
-import torch
-import numpy as np
-from os.path import join as pjoin
 import random
-from tqdm import tqdm
-from torch.utils.data import Dataset, DataLoader
+from os.path import join as pjoin
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
-from config import Config
-from .motion_utils import get_feature_vec_subset
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+from utils.config import Config
+from utils.motion_utils import FeatureNormalizer
 
 
 class Text2MotionDataset(Dataset):
@@ -30,16 +32,13 @@ class Text2MotionDataset(Dataset):
         mean: np.ndarray,
         std: np.ndarray,
         split: str = "train",
-        feature_dims: tuple[slice, ...] | None = None,
     ):
         self.config = config
-        self.feature_dims = (
-            feature_dims if feature_dims is not None else config.feature_dims
-        )
         self.max_length = 20
         self.pointer = 0
         self.max_motion_length = config.max_motion_length
-        min_motion_len = 40 if config.dataset_name == "t2m" else 24
+        self.current_horizon = config.max_motion_length
+        min_motion_len = 40
 
         # Derive paths from config.dataset_path
         motion_dir = config.dataset_path / "new_joint_vecs"
@@ -65,9 +64,7 @@ class Text2MotionDataset(Dataset):
 
                 text_data = []
                 flag = False
-                with open(
-                    pjoin(str(text_dir), name + ".txt"), "r", encoding="utf-8"
-                ) as f:
+                with open(pjoin(str(text_dir), name + ".txt"), "r", encoding="utf-8") as f:
                     for line in f.readlines():
                         text_dict: Dict[str, Optional[Any]] = {}
                         line_split = line.strip().split("#")
@@ -86,21 +83,11 @@ class Text2MotionDataset(Dataset):
                         else:
                             try:
                                 n_motion = motion[int(f_tag * 20) : int(to_tag * 20)]
-                                if (len(n_motion)) < min_motion_len or (
-                                    len(n_motion) >= 200
-                                ):
+                                if (len(n_motion)) < min_motion_len or (len(n_motion) >= 200):
                                     continue
-                                new_name = (
-                                    random.choice("ABCDEFGHIJKLMNOPQRSTUVW")
-                                    + "_"
-                                    + name
-                                )
+                                new_name = random.choice("ABCDEFGHIJKLMNOPQRSTUVW") + "_" + name
                                 while new_name in data_dict:
-                                    new_name = (
-                                        random.choice("ABCDEFGHIJKLMNOPQRSTUVW")
-                                        + "_"
-                                        + name
-                                    )
+                                    new_name = random.choice("ABCDEFGHIJKLMNOPQRSTUVW") + "_" + name
                                 n_joints = joints[int(f_tag * 20) : int(to_tag * 20)]
                                 data_dict[new_name] = {
                                     "motion": n_motion,
@@ -123,16 +110,17 @@ class Text2MotionDataset(Dataset):
                     }
                     new_name_list.append(name)
                     length_list.append(len(motion))
-            except Exception as e:
+            except Exception:
                 pass
 
-        name_list, length_list = new_name_list, length_list
+        name_length_pairs = list(zip(new_name_list, length_list))
+        name_length_pairs.sort(key=lambda x: x[1])  # Sort by length
 
+        self.name_list = [pair[0] for pair in name_length_pairs]
+        self.length_arr = np.array([pair[1] for pair in name_length_pairs])
+        self.data_dict = data_dict
         self.mean = torch.from_numpy(mean).float()
         self.std = torch.from_numpy(std).float()
-        self.length_arr = np.array(length_list)
-        self.data_dict = data_dict
-        self.name_list = name_list
 
         # --- Text Embedding Caching ---
         self.text_cache_path = config.dataset_path / "text_embeddings_cache.pt"
@@ -140,7 +128,7 @@ class Text2MotionDataset(Dataset):
 
         if self.text_cache_path.exists():
             print(f"Loading text embedding cache from {self.text_cache_path}...")
-            self.text_cache = torch.load(self.text_cache_path)
+            self.text_cache = torch.load(self.text_cache_path, weights_only=False)
 
         # Collect all unique captions
         all_captions = set()
@@ -157,19 +145,17 @@ class Text2MotionDataset(Dataset):
             )
 
             # LAZY IMPORT: Only import when needed
-            from .text_encoder import CLIPEncoder
+            from utils.text_encoder import CLIPEncoder
 
             # Initialize CLIP Encoder only if needed (to save VRAM if cached)
             clip_encoder = CLIPEncoder(model_name="openai/clip-vit-base-patch32")
             clip_encoder.to(config.device)
 
             batch_size = 32
-            for i in tqdm(
-                range(0, len(missing_captions), batch_size), desc="Encoding Texts"
-            ):
+            for i in tqdm(range(0, len(missing_captions), batch_size), desc="Encoding Texts"):
                 batch_caps = missing_captions[i : i + batch_size]
                 with torch.no_grad():
-                    # (B, 512)
+                    # (B, 1, 512) - pooled CLIP embeddings
                     embeddings = clip_encoder(batch_caps).cpu()
 
                 for cap, emb in zip(batch_caps, embeddings):
@@ -185,8 +171,9 @@ class Text2MotionDataset(Dataset):
         else:
             print("All text embeddings are cached.")
 
-    def inv_transform(self, data):
-        return data * self.std + self.mean
+    def get_normalizer(self) -> FeatureNormalizer:
+        """Get a FeatureNormalizer instance for normalizing/denormalizing features."""
+        return FeatureNormalizer(mean=self.mean.clone(), std=self.std.clone())
 
     def __len__(self):
         return len(self.data_dict) - self.pointer
@@ -196,16 +183,25 @@ class Text2MotionDataset(Dataset):
     This is the ONLY version that works - replace everything else
     """
 
-    def __getitem__(self, item):
+    def __getitem__(self, item) -> Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str]]:
         """
         Returns a single sample from the dataset.
         GUARANTEES: All returned tensors have shape (max_motion_length, features)
+
+        NOTE: Returns RAW (unnormalized) features. Normalization should be done
+        externally using FeatureNormalizer before passing to models.
+
+        history_motion: (history_length, 271) RAW features from the frames
+        immediately preceding the target window.  Zero-padded at the front when
+        fewer than history_length frames are available before the target start.
+        Used exclusively by Phase 3 (FlowMatchingPredictor) as the encoder
+        conditioning context; ignored by pretrain and decoder trainers.
         """
         idx = self.pointer + item
         data = self.data_dict[self.name_list[idx]]
 
         # Get raw data from dict
-        motion = data["motion"]  # numpy array (T, 263)
+        motion = data["motion"]  # numpy array (T, 271)
         joints = data["joints"]  # numpy array (T, 22, 3)
         original_length = data["length"]  # int, original number of frames
         text_list = data["text"]  # list of text dicts
@@ -213,43 +209,23 @@ class Text2MotionDataset(Dataset):
         # Choose random text
         text_data = random.choice(text_list)
         caption = text_data["caption"]
+        tokens: list[str] = text_data["tokens"]
 
         # ===== CONVERT TO TENSORS =====
-        motion = torch.from_numpy(motion.copy()).float()  # (T, 263)
+        motion = torch.from_numpy(motion.copy()).float()  # (T, 271) - RAW features
         joints = torch.from_numpy(joints.copy()).float()  # (T, 22, 3)
 
-        # ===== NORMALIZE =====
-        motion = (motion - self.mean) / self.std
-
-        # ===== DETERMINE TARGET LENGTH =====
-        # The m_length modification logic from config
-        m_length = original_length
-        if self.config.unit_length < 10:
-            coin2 = np.random.choice(["single", "single", "double"])
-        else:
-            coin2 = "single"
-
-        if coin2 == "double":
-            m_length = (
-                m_length // self.config.unit_length - 1
-            ) * self.config.unit_length
-        else:
-            m_length = (m_length // self.config.unit_length) * self.config.unit_length
-
-        # Clamp to actual available data
-        m_length = min(m_length, len(motion))
-        m_length = max(1, m_length)  # At least 1 frame
-
-        # ===== TRUNCATE TO TARGET LENGTH =====
-        motion = motion[:m_length]
-        joints = joints[:m_length]
+        # ===== NO NORMALIZATION HERE =====
+        # Normalization is handled externally via FeatureNormalizer
+        # motion = (motion - self.mean) / self.std  # REMOVED
 
         # ===== PAD OR TRUNCATE TO MAX_MOTION_LENGTH =====
-        target_len = self.max_motion_length
-        current_len = len(motion)
+        target_len = self.current_horizon
+        current_len = original_length
+        history_length = self.config.history_length
 
         if current_len < target_len:
-            # Pad with zeros
+            # ── Short sequence: pad target, no history available ──────────────
             pad_size = target_len - current_len
             motion = torch.cat(
                 [
@@ -276,34 +252,40 @@ class Text2MotionDataset(Dataset):
                 ],
                 dim=0,
             )
+            # No frames precede the target window — history is all zeros
+            history_motion = torch.zeros(history_length, motion.shape[1], dtype=motion.dtype)
+            history_valid_length = 0
+
         elif current_len > target_len:
-            # Truncate
-            motion = motion[:target_len]
-            joints = joints[:target_len]
+            start_idx = random.randint(0, current_len - self.current_horizon)
 
-        # ===== FINAL SANITY CHECK =====
-        assert (
-            motion.shape[0] == target_len
-        ), f"Motion shape[0]={motion.shape[0]}, expected {target_len}"
-        assert (
-            motion.shape[1] == 263
-        ), f"Motion shape[1]={motion.shape[1]}, expected 263"
-        assert (
-            joints.shape[0] == target_len
-        ), f"Joints shape[0]={joints.shape[0]}, expected {target_len}"
+            # ── History: frames strictly before start_idx ─────────────────────
+            hist_end   = start_idx
+            hist_start = max(0, start_idx - history_length)
+            hist_slice = motion[hist_start:hist_end]            # (≤ history_length, 271)
+            history_valid_length = hist_slice.shape[0]
 
-        # ===== EXTRACT FEATURES =====
-        history_features = get_feature_vec_subset(motion, self.feature_dims)
+            if hist_slice.shape[0] < history_length:
+                # Zero-pad at the front so history is always (history_length, 271)
+                pad_h = torch.zeros(
+                    history_length - hist_slice.shape[0],
+                    motion.shape[1],
+                    dtype=motion.dtype,
+                )
+                history_motion = torch.cat([pad_h, hist_slice], dim=0)
+            else:
+                history_motion = hist_slice
 
-        # Ensure it's a tensor
-        if isinstance(history_features, np.ndarray):
-            history_features = torch.from_numpy(history_features).float()
+            # ── Target window ─────────────────────────────────────────────────
+            motion = motion[start_idx : start_idx + self.current_horizon]
+            joints = joints[start_idx : start_idx + self.current_horizon]
+
         else:
-            history_features = history_features.float()
+            # current_len == target_len: no room for history
+            history_motion = torch.zeros(history_length, motion.shape[1], dtype=motion.dtype)
+            history_valid_length = 0
 
-        assert (
-            history_features.shape[0] == target_len
-        ), f"history_features shape[0]={history_features.shape[0]}, expected {target_len}"
+        valid_length = min(current_len, target_len)
 
         # ===== GET TEXT EMBEDDING =====
         text_embedding = self.text_cache[caption]
@@ -312,69 +294,118 @@ class Text2MotionDataset(Dataset):
         else:
             text_embedding = text_embedding.float()
 
-        return caption, history_features, motion, joints, m_length, text_embedding
+        # Normalize to strict shape: (1, 512)
+        if text_embedding.ndim == 1:
+            if text_embedding.shape[0] != CLIP_EMBED_DIM:
+                raise ValueError(
+                    f"Invalid 1D text embedding shape {tuple(text_embedding.shape)} for caption '{caption}'. "
+                    f"Expected ({CLIP_EMBED_DIM},)."
+                )
+            text_embedding = text_embedding.unsqueeze(0)
+        elif text_embedding.ndim == 2:
+            if text_embedding.shape == (1, CLIP_EMBED_DIM):
+                pass
+            elif text_embedding.shape == (CLIP_MAX_SEQ_LEN, CLIP_EMBED_DIM):
+                raise ValueError(
+                    "Detected legacy CLIP sequence embedding shape (77, 512) in text cache. "
+                    "Regenerate text_embeddings_cache.pt using pooled CLIP outputs (1, 512)."
+                )
+            else:
+                raise ValueError(
+                    f"Invalid 2D text embedding shape {tuple(text_embedding.shape)} for caption '{caption}'. "
+                    f"Expected (1, {CLIP_EMBED_DIM})."
+                )
+        else:
+            raise ValueError(
+                f"Invalid text embedding rank {text_embedding.ndim} for caption '{caption}'. "
+                "Expected rank 2 with shape (1, 512)."
+            )
 
-    def reset_min_len(self, length):
+        # text_embedding shape: (1, 512) - pooled CLIP embedding
+        # motion shape:         (target_len, 271)   - target window; used for z1 (decoder + predictor target)
+        # history_motion shape: (history_length, 271) - frames strictly preceding motion; used for track_features
+        # valid_length is the number of real frames before zero-padding, capped at target_len.
+        sample_id = self.name_list[idx]
+
+        return caption, motion, joints, history_motion, valid_length, text_embedding, sample_id, tokens, history_valid_length
+
+    def reset_min_len(self, length: int | None = None):
+        if length is None:
+            self.pointer = 0
+            return
         assert length <= self.max_motion_length
         self.pointer = np.searchsorted(self.length_arr, length)
-        print("Pointer Pointing at %d" % self.pointer)
+        # print("Pointer Pointing at %d" % self.pointer)
+
+    def set_horizon(self, horizon: int | None = None):
+        """
+        Set the horizon for the dataset.
+        If horizon is None, use the default horizon.
+        If horizon is an integer, set the horizon to that value.
+        Dynamic horizon update with filtering.
+        """
+        if horizon is None:
+            self.current_horizon = self.max_motion_length
+            self.reset_min_len()  # Reset pointer to start
+            return
+
+        assert 1 <= horizon <= self.max_motion_length
+        self.current_horizon = horizon
+        self.reset_min_len(horizon)  # Auto-filter
 
 
-from typing import List, Dict, Any
+# CLIP constants
+CLIP_MAX_SEQ_LEN = 77
+CLIP_EMBED_DIM = 512
 
 
 def text2motion_collate_fn(
-    batch: List[
-        Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor]
-    ],
+    batch: List[Tuple[str, torch.Tensor, torch.Tensor, torch.Tensor, int, torch.Tensor, str, list[str], int]],
 ) -> Dict[str, Any]:
     """
     Collate function for Text2MotionDataset.
     Expects each sample to be a tuple:
-      - caption: str
-      - history_features: (max_T, C_in = 137) torch.Tensor
-      - motion: (max_T, 263) torch.Tensor
-      - joints: (max_T, J, 3) torch.Tensor
-      - length: int
-      - text_embedding: (512,) torch.Tensor
+      - caption:        str
+      - motion:         (target_len, 271) torch.Tensor - target window, RAW 271D features
+      - joints:         (target_len, J, 3) torch.Tensor
+      - history_motion: (history_length, 271) torch.Tensor - frames preceding motion,
+                        zero-padded at front when not enough history; RAW features.
+                        Used only by FlowMatchingTrainer (Phase 3).
+      - length:         int - valid frames in motion before padding, capped at target_len
+      - text_embedding: (1, 512) torch.Tensor - pooled CLIP embeddings
+      - sample_id:      str
+      - tokens:         list[str]
+      - history_valid_length: int - exact count of real non-zero history frames
     """
     # Lists of items
-    captions = [b[0] for b in batch]
-    cond_feats_list = [b[1] for b in batch]  # each (T, C_in)
-    motions_list = [b[2] for b in batch]
-    joints_list = [b[3] for b in batch]
-    lengths = [b[4] for b in batch]
-    text_embs_list = [b[5] for b in batch]
-
-    # Helper to ensure all are tensors
-    def to_tensor(x):
-        if isinstance(x, np.ndarray):
-            return torch.from_numpy(x).float()
-        elif isinstance(x, torch.Tensor):
-            return x.float()
-        else:
-            return torch.tensor(x).float()
-
-    # Convert all to tensors (redundant safety check)
-    cond_feats_list = [to_tensor(x) for x in cond_feats_list]
-    motions_list = [to_tensor(x) for x in motions_list]
-    joints_list = [to_tensor(x) for x in joints_list]
-    text_embs_list = [to_tensor(x) for x in text_embs_list]
+    captions         = [b[0] for b in batch]
+    motions_list     = [b[1] for b in batch]
+    joints_list      = [b[2] for b in batch]
+    history_list     = [b[3] for b in batch]
+    lengths          = [b[4] for b in batch]
+    text_embs_list   = [b[5] for b in batch]
+    sample_ids       = [b[6] for b in batch]
+    tokens_list      = [b[7] for b in batch]
+    hist_lengths     = [b[8] for b in batch]
 
     # Stack tensors directly
-    cond_feature_batch = torch.stack(cond_feats_list, dim=0)  # (B, T, C_in)
-    motion_batch = torch.stack(motions_list, dim=0)  # (B, T, 263)
-    joints_batch = torch.stack(joints_list, dim=0)  # (B, T, J, 3)
-    length_batch = torch.tensor(lengths, dtype=torch.long)  # (B,)
-    text_emb_batch = torch.stack(text_embs_list, dim=0)  # (B, 512)
+    motion_batch       = torch.stack(motions_list,   dim=0)  # (B, T, 271)
+    joints_batch       = torch.stack(joints_list,    dim=0)  # (B, T, J, 3)
+    history_batch      = torch.stack(history_list,   dim=0)  # (B, history_length, 271)
+    length_batch       = torch.tensor(lengths, dtype=torch.long)  # (B,)
+    text_emb_batch     = torch.stack(text_embs_list, dim=0)  # (B, 1, 512)
+    hist_length_batch  = torch.tensor(hist_lengths, dtype=torch.long)  # (B,)
 
     return {
-        "captions": captions,
-        "history_features": cond_feature_batch,
-        "motion": motion_batch,
-        "joints": joints_batch,
-        "lengths": length_batch,
-        "text_clip": text_emb_batch,
+        "captions":             captions,
+        "sample_ids":           sample_ids,
+        "motion":               motion_batch,        # target window
+        "history_motion":       history_batch,      # context window preceding target
+        "joints":               joints_batch,
+        "lengths":              length_batch,
+        "text_clip":            text_emb_batch,
+        "tokens":               tokens_list,
+        "history_valid_length": hist_length_batch,
     }
 
 
@@ -382,7 +413,7 @@ def create_dataloader(
     config: Config,
     split: str = "train",
     shuffle: bool = True,
-) -> DataLoader:
+) -> Tuple[DataLoader, FeatureNormalizer]:
     """
     Create DataLoader for Text2MotionDataset.
 
@@ -394,7 +425,9 @@ def create_dataloader(
         shuffle: Whether to shuffle data
 
     Returns:
-        DataLoader instance
+        Tuple of (DataLoader instance, FeatureNormalizer instance)
+        - DataLoader provides RAW (unnormalized) features
+        - FeatureNormalizer should be used to normalize features before passing to models
     """
     mean_path = config.dataset_path / "Mean.npy"
     std_path = config.dataset_path / "Std.npy"
@@ -408,17 +441,24 @@ def create_dataloader(
     mean = np.load(mean_path)
     std = np.load(std_path)
 
-    dataset_obj = Text2MotionDataset(
-        config, mean, std, split, feature_dims=config.feature_dims
+    dataset_obj = Text2MotionDataset(config, mean, std, split)
+
+    # Create FeatureNormalizer for external normalization
+    normalizer = FeatureNormalizer(
+        mean=torch.from_numpy(mean).float(),
+        std=torch.from_numpy(std).float(),
     )
-    return DataLoader(
+
+    dataloader = DataLoader(
         dataset_obj,
         batch_size=config.batch_size,
         shuffle=shuffle,
-        num_workers=0,  # CRITICAL: Must be 0 to avoid serialization issues
+        num_workers=config.num_workers,
         pin_memory=config.pin_memory,
         collate_fn=text2motion_collate_fn,
     )
+
+    return dataloader, normalizer
 
 
 def load_sample(dataset_path: Path, file_id: str) -> Dict[str, Optional[Any]]:
@@ -431,7 +471,7 @@ def load_sample(dataset_path: Path, file_id: str) -> Dict[str, Optional[Any]]:
 
     Returns:
         Dictionary with keys:
-        - 'features': Feature vectors (nframe, 263) from new_joint_vecs
+        - 'features': Feature vectors (nframe, 271) from new_joint_vecs
         - 'joints': Joint positions (nframe, 22, 3) from new_joints
         - 'text': Text description from texts folder
         - 'file_id': Sample ID

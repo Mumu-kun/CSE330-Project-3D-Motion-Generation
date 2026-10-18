@@ -48,6 +48,7 @@ def generate_cloud_notebook():
     build_dir = script_dir / "build"
     source_notebook = source_dir / "pipeline.ipynb"
     output_notebook = build_dir / "notebook.ipynb"
+    header_notebook = build_dir / "header.ipynb"
 
     # Files to include in cloud notebook
     support_files = {
@@ -61,10 +62,7 @@ def generate_cloud_notebook():
         "utils/dataset.py": source_dir / "utils" / "dataset.py",
         "utils/motion_utils.py": source_dir / "utils" / "motion_utils.py",
         "utils/visualization.py": source_dir / "utils" / "visualization.py",
-        "utils/bvh_utils.py": source_dir / "utils" / "bvh_utils.py",
-        "utils/metrics.py": source_dir / "utils" / "metrics.py",
         "utils/quaternion.py": source_dir / "utils" / "quaternion.py",
-        "utils/skeleton.py": source_dir / "utils" / "skeleton.py",
         "utils/train_utils.py": source_dir / "utils" / "train_utils.py",
         "utils/text_encoder.py": source_dir / "utils" / "text_encoder.py",
         "utils/wandb_logger.py": source_dir / "utils" / "wandb_logger.py",
@@ -128,7 +126,7 @@ def generate_cloud_notebook():
             "    \n",
             "    # Copy dataset\n",
             '    print("Copying dataset...")\n',
-            "    !apt -qq install rclone && rclone copy /kaggle/input/ /kaggle/working/dataset/ --transfers 16 --checkers 16 --progress --ignore-existing -q\n",
+            "    !apt -qq install rclone && rclone copy /kaggle/input/datasets/mustafamuhaimin/ /kaggle/working/dataset/ --transfers 16 --checkers 16 --progress --ignore-existing -q\n",
             "    \n",
             '    print("Setup Complete!")\n',
             "else:\n",
@@ -163,7 +161,15 @@ def generate_cloud_notebook():
         "source": setup_source,
     }
 
-    nb["cells"] = [setup_markdown, setup_code] + nb["cells"]
+    prev_cells = nb.get("cells", [])
+
+    nb["cells"] = [setup_markdown, setup_code]
+
+    build_dir.mkdir(parents=True, exist_ok=True)
+    with open(header_notebook, "w", encoding="utf-8") as f:
+        json.dump(nb, f, indent=1)
+
+    nb["cells"] = [setup_markdown, setup_code] + prev_cells
 
     # 6. Save the bundled notebook
     build_dir.mkdir(parents=True, exist_ok=True)
